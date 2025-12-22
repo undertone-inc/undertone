@@ -1,0 +1,1524 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  View,
+  StyleSheet,
+  TouchableOpacity,
+  TouchableWithoutFeedback,
+  Keyboard,
+  Text,
+  TextInput,
+  Platform,
+  FlatList,
+  Modal,
+  ScrollView,
+  Alert,
+  Dimensions,
+} from 'react-native';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import * as SecureStore from 'expo-secure-store';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
+const STORAGE_KEY = 'io_catalog_v1';
+const KITLOG_STORAGE_KEY = 'io_kitlog_v1';
+
+// Keep enough room to show most/all categories without scrolling,
+// but still scroll safely if the list grows.
+const SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.8);
+
+// Default KitLog categories (used only if KitLog hasn't been opened yet)
+const DEFAULT_KITLOG_CATEGORIES = [
+  'Prep & Skin',
+  'Base',
+  'Cheeks',
+  'Brows',
+  'Eyes',
+  'Lashes',
+  'Lips',
+  'Tools',
+  'Hygiene & Disposables',
+  'Body / FX / Extras',
+];
+
+const FALLBACK_CATEGORY_NAME = 'Base';
+
+// How the bottom bars sit when the keyboard is CLOSED
+// (match spacing on KitLog)
+const CLOSED_BOTTOM_PADDING = 12;
+
+// Extra space ABOVE the keyboard when it’s OPEN
+const KEYBOARD_GAP = 0;
+
+// Modal gets a bit more lift than the main screen.
+const MODAL_CLOSED_BOTTOM_PADDING = 56;
+
+// When typing in the client editor, keep the add-product bar slightly above the keyboard.
+const MODAL_KEYBOARD_GAP = 12;
+
+type Season4 = 'spring' | 'summer' | 'autumn' | 'winter';
+type Undertone = 'cool' | 'warm' | 'neutral' | 'olive' | 'unknown';
+
+// Category is driven by KitLog (dynamic), so store it as a string (category name).
+type PlanCategory = string;
+
+type ClientProduct = {
+  id: string;
+  category: PlanCategory;
+  name: string;
+  shade?: string;
+  notes?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type ClientRecord = {
+  id: string;
+  displayName: string;
+  undertone: Undertone;
+  season: Season4 | null;
+  trialDate?: string; // YYYY-MM-DD
+  finalDate?: string; // YYYY-MM-DD
+  notes?: string;
+  products: ClientProduct[];
+  createdAt: number;
+  updatedAt: number;
+};
+
+type CatalogData = {
+  version: 1;
+  clients: ClientRecord[];
+};
+
+const EMPTY_CATALOG: CatalogData = { version: 1, clients: [] };
+
+type CatalogScreenProps = {
+  navigation: any;
+  route: any;
+  email?: string | null;
+};
+
+function uid(prefix: string) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function seasonLabel(s: Season4 | null): string {
+  if (!s) return '—';
+  if (s === 'spring') return 'Spring';
+  if (s === 'summer') return 'Summer';
+  if (s === 'autumn') return 'Autumn';
+  return 'Winter';
+}
+
+function undertoneLabel(u: Undertone): string {
+  if (u === 'cool') return 'Cool';
+  if (u === 'warm') return 'Warm';
+  if (u === 'neutral') return 'Neutral';
+  if (u === 'olive') return 'Olive';
+  return '—';
+}
+
+function categoryLabel(c: PlanCategory): string {
+  const t = (c || '').toString().trim();
+  return t || '—';
+}
+
+function formatShortDate(ts: number): string {
+  try {
+    return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  } catch {
+    return '';
+  }
+}
+
+function normalizeDateString(raw: any): string {
+  if (typeof raw === 'string') return raw.trim();
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    try {
+      // Persist as YYYY-MM-DD for readability and stable sorting.
+      return new Date(raw).toISOString().slice(0, 10);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function formatDateInput(raw: string): string {
+  // Accept digits only and format as YYYY-MM-DD while typing.
+  const digits = (raw || '').replace(/\D/g, '').slice(0, 8);
+  if (digits.length <= 4) return digits;
+  if (digits.length <= 6) return `${digits.slice(0, 4)}-${digits.slice(4)}`;
+  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6)}`;
+}
+
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const UPCOMING_WINDOW_DAYS = 3;
+
+function parseYMDToUtcStartMs(ymd: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((ymd || '').trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
+  if (mo < 0 || mo > 11 || d < 1 || d > 31) return null;
+  return Date.UTC(y, mo, d);
+}
+
+function daysUntilUtcStart(targetUtcStart: number, todayUtcStart: number): number {
+  return Math.floor((targetUtcStart - todayUtcStart) / DAY_MS);
+}
+
+function nextUpcomingUtcStartForClient(c: ClientRecord, todayUtcStart: number, windowDays: number): number | null {
+  const candidates: number[] = [];
+
+  const trial = (c.trialDate || '').trim();
+  const final = (c.finalDate || '').trim();
+
+  for (const dateStr of [trial, final]) {
+    if (!dateStr) continue;
+    const utc = parseYMDToUtcStartMs(dateStr);
+    if (utc === null) continue;
+    const days = daysUntilUtcStart(utc, todayUtcStart);
+    if (days >= 0 && days <= windowDays) candidates.push(utc);
+  }
+
+  if (candidates.length === 0) return null;
+  return Math.min(...candidates);
+}
+
+function isClientUpcoming(c: ClientRecord, todayUtcStart: number, windowDays: number): boolean {
+  return nextUpcomingUtcStartForClient(c, todayUtcStart, windowDays) !== null;
+}
+
+function clientMatchesQuery(c: ClientRecord, q: string): boolean {
+  const needle = (q || '').trim().toLowerCase();
+  if (!needle) return true;
+
+  const name = (c.displayName || '').toLowerCase();
+  const notes = (c.notes || '').toLowerCase();
+  const undertone = undertoneLabel(c.undertone).toLowerCase();
+  const season = seasonLabel(c.season).toLowerCase();
+  const products = (c.products || [])
+    .map((p) => `${categoryLabel(p.category)} ${p.name || ''} ${p.shade || ''} ${p.notes || ''}`.toLowerCase())
+    .join(' ');
+  const dates = `${c.trialDate || ''} ${c.finalDate || ''}`.toLowerCase();
+
+  return [name, notes, undertone, season, dates, products].some((s) => s.includes(needle));
+}
+
+
+function blankClient(): ClientRecord {
+  const now = Date.now();
+  return {
+    id: uid('client'),
+    displayName: '',
+    undertone: 'unknown',
+    season: null,
+    trialDate: '',
+    finalDate: '',
+    notes: '',
+    products: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function isBlankClient(c: ClientRecord): boolean {
+  const nameEmpty = !c.displayName.trim();
+  const notesEmpty = !(c.notes || '').trim();
+  const noProducts = !Array.isArray(c.products) || c.products.length === 0;
+  const noMatch = c.undertone === 'unknown' && !c.season;
+  const datesEmpty = !(c.trialDate || '').trim() && !(c.finalDate || '').trim();
+  return nameEmpty && notesEmpty && noProducts && noMatch && datesEmpty;
+}
+
+// Backwards compatibility:
+// Earlier versions stored a small fixed set of category *codes*.
+// We now store the category *name* from KitLog.
+const LEGACY_CATEGORY_CODES: Record<string, string> = {
+  prep: 'Prep & Skin',
+  base: 'Base',
+  conceal: 'Base',
+  cheek: 'Cheeks',
+  brow: 'Brows',
+  eye: 'Eyes',
+  lashes: 'Lashes',
+  lip: 'Lips',
+  tools: 'Tools',
+  hygiene: 'Hygiene & Disposables',
+  bodyfx: 'Body / FX / Extras',
+  other: 'Body / FX / Extras',
+};
+
+function normalizeCategory(raw: any): PlanCategory {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return FALLBACK_CATEGORY_NAME;
+
+    // Only map exact legacy codes.
+    const legacyMapped = (LEGACY_CATEGORY_CODES as any)[trimmed];
+    if (typeof legacyMapped === 'string') return legacyMapped;
+
+    return trimmed;
+  }
+  return FALLBACK_CATEGORY_NAME;
+}
+
+function normalizeData(input: any): CatalogData {
+  const base: CatalogData = { version: 1, clients: [] };
+
+  try {
+    const clientsRaw = Array.isArray(input?.clients) ? input.clients : null;
+    if (!clientsRaw) return base;
+
+    const normalized: ClientRecord[] = clientsRaw
+      .map((c: any) => {
+        if (!c) return null;
+        const id = typeof c.id === 'string' ? c.id : uid('client');
+        const displayName = typeof c.displayName === 'string' ? c.displayName : '';
+        const undertone: Undertone =
+          c.undertone === 'cool' || c.undertone === 'warm' || c.undertone === 'neutral' || c.undertone === 'olive'
+            ? c.undertone
+            : 'unknown';
+        const season: Season4 | null =
+          c.season === 'spring' || c.season === 'summer' || c.season === 'autumn' || c.season === 'winter'
+            ? c.season
+            : null;
+
+        const createdAt = typeof c.createdAt === 'number' ? c.createdAt : Date.now();
+        const updatedAt = typeof c.updatedAt === 'number' ? c.updatedAt : createdAt;
+
+        const productsRaw = Array.isArray(c.products) ? c.products : [];
+        const products: ClientProduct[] = productsRaw
+          .map((p: any) => {
+            if (!p) return null;
+            const pid = typeof p.id === 'string' ? p.id : uid('prod');
+            const category = normalizeCategory(p.category);
+            const name = typeof p.name === 'string' ? p.name : '';
+            const created = typeof p.createdAt === 'number' ? p.createdAt : Date.now();
+            const updated = typeof p.updatedAt === 'number' ? p.updatedAt : created;
+            return {
+              id: pid,
+              category,
+              name,
+              shade: typeof p.shade === 'string' ? p.shade : '',
+              notes: typeof p.notes === 'string' ? p.notes : '',
+              createdAt: created,
+              updatedAt: updated,
+            } as ClientProduct;
+          })
+          .filter(Boolean) as ClientProduct[];
+
+        return {
+          id,
+          displayName,
+          undertone,
+          season,
+          trialDate: normalizeDateString((c as any)?.trialDate),
+          finalDate: normalizeDateString((c as any)?.finalDate),
+          notes: typeof c.notes === 'string' ? c.notes : '',
+          products,
+          createdAt,
+          updatedAt,
+        } as ClientRecord;
+      })
+      .filter(Boolean) as ClientRecord[];
+
+    return { version: 1, clients: normalized };
+  } catch {
+    return base;
+  }
+}
+
+const Catalog: React.FC<CatalogScreenProps> = ({ navigation }) => {
+  const [hydrated, setHydrated] = useState(false);
+  const [data, setData] = useState<CatalogData>({ version: 1, clients: [] });
+  const persistTimer = useRef<any>(null);
+
+  const [search, setSearch] = useState('');
+  const [newClientText, setNewClientText] = useState('');
+
+  // Client editor modal state
+  const [draft, setDraft] = useState<ClientRecord | null>(null);
+  const [isDraftNew, setIsDraftNew] = useState(false);
+  const [newProductText, setNewProductText] = useState('');
+  const [kitlogCategories, setKitlogCategories] = useState<string[]>(DEFAULT_KITLOG_CATEGORIES);
+  const [newProductCategory, setNewProductCategory] = useState<PlanCategory>(FALLBACK_CATEGORY_NAME);
+  const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  // keyboard spacer (modal)
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const showSub = Keyboard.addListener(showEvent as any, (e: any) => {
+      setKeyboardHeight(e?.endCoordinates?.height ?? 0);
+    });
+    const hideSub = Keyboard.addListener(hideEvent as any, () => setKeyboardHeight(0));
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  async function refreshKitlogCategories() {
+    try {
+      const raw = await SecureStore.getItemAsync(KITLOG_STORAGE_KEY);
+      if (!raw) {
+        setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
+        setNewProductCategory((prev) => {
+          if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
+          if (DEFAULT_KITLOG_CATEGORIES.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
+          return DEFAULT_KITLOG_CATEGORIES[0] || FALLBACK_CATEGORY_NAME;
+        });
+        return;
+      }
+
+      const parsed = JSON.parse(raw);
+      const catsRaw = Array.isArray(parsed?.categories) ? parsed.categories : [];
+      const names = catsRaw
+        .map((c: any) => (typeof c?.name === 'string' ? c.name.trim() : ''))
+        .filter(Boolean) as string[];
+
+      // Deduplicate while preserving order.
+      const uniq: string[] = [];
+      for (const n of names) {
+        if (!uniq.includes(n)) uniq.push(n);
+      }
+
+      const finalList = uniq.length > 0 ? uniq : DEFAULT_KITLOG_CATEGORIES;
+      setKitlogCategories(finalList);
+      setNewProductCategory((prev) => {
+        if (finalList.includes(prev)) return prev;
+        if (finalList.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
+        return finalList[0] || FALLBACK_CATEGORY_NAME;
+      });
+    } catch {
+      setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
+      setNewProductCategory((prev) => {
+        if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
+        if (DEFAULT_KITLOG_CATEGORIES.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
+        return DEFAULT_KITLOG_CATEGORIES[0] || FALLBACK_CATEGORY_NAME;
+      });
+    }
+  }
+
+  // Keep categories in sync with KitLog (on open + on focus)
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!alive) return;
+      await refreshKitlogCategories();
+    })();
+
+    const unsub = navigation?.addListener?.('focus', () => {
+      refreshKitlogCategories();
+    });
+
+    return () => {
+      alive = false;
+      if (typeof unsub === 'function') unsub();
+    };
+  }, [navigation]);
+
+  // Load catalog
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const raw = await SecureStore.getItemAsync(STORAGE_KEY);
+        const parsed = raw ? normalizeData(JSON.parse(raw)) : EMPTY_CATALOG;
+        if (alive) {
+          setData(parsed);
+          setHydrated(true);
+        }
+      } catch {
+        if (alive) {
+          setData(EMPTY_CATALOG);
+          setHydrated(true);
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Persist catalog (debounced)
+  useEffect(() => {
+    if (!hydrated) return;
+    if (persistTimer.current) clearTimeout(persistTimer.current);
+    persistTimer.current = setTimeout(async () => {
+      try {
+        await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(data));
+      } catch {
+        // ignore
+      }
+    }, 250);
+    return () => {
+      if (persistTimer.current) clearTimeout(persistTimer.current);
+    };
+  }, [data, hydrated]);
+
+  const now = new Date();
+  const todayUtcStart = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  const query = search.trim().toLowerCase();
+  const searchActive = query.length > 0;
+
+  const sortedClients = useMemo(() => {
+    return [...data.clients].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  }, [data.clients]);
+
+  const upcomingAll = useMemo(() => {
+    const scored = sortedClients
+      .map((c) => ({ c, next: nextUpcomingUtcStartForClient(c, todayUtcStart, UPCOMING_WINDOW_DAYS) }))
+      .filter((x) => x.next !== null) as Array<{ c: ClientRecord; next: number }>;
+
+    scored.sort((a, b) => {
+      const diff = a.next - b.next;
+      if (diff !== 0) return diff;
+      return (b.c.updatedAt ?? 0) - (a.c.updatedAt ?? 0);
+    });
+
+    return scored.map((x) => x.c);
+  }, [sortedClients, todayUtcStart]);
+
+  const nonUpcomingAll = useMemo(() => {
+    return sortedClients.filter((c) => !isClientUpcoming(c, todayUtcStart, UPCOMING_WINDOW_DAYS));
+  }, [sortedClients, todayUtcStart]);
+
+  const upcomingVisible = useMemo(() => {
+    if (!searchActive) return upcomingAll;
+    return upcomingAll.filter((c) => clientMatchesQuery(c, query));
+  }, [upcomingAll, query, searchActive]);
+
+  const nonUpcomingVisible = useMemo(() => {
+    if (!searchActive) return nonUpcomingAll;
+    return nonUpcomingAll.filter((c) => clientMatchesQuery(c, query));
+  }, [nonUpcomingAll, query, searchActive]);
+
+  const hasUpcoming = upcomingAll.length > 0;
+  const upcomingTotal = upcomingAll.length;
+  const upcomingShowing = upcomingVisible.length;
+  const clientsTotal = nonUpcomingAll.length;
+  const clientsShowing = nonUpcomingVisible.length;
+
+  const upcomingMeta = searchActive ? `${upcomingShowing} / ${upcomingTotal}` : `${upcomingTotal}`;
+  const clientsMeta = searchActive ? `${clientsShowing} / ${clientsTotal}` : `${clientsTotal}`;
+
+  type RowItem =
+    | { kind: 'client'; key: string; client: ClientRecord }
+    | { kind: 'sectionHeader'; key: string; title: string; meta: string };
+
+  const rows = useMemo<RowItem[]>(() => {
+    if (!hasUpcoming) {
+      return nonUpcomingVisible.map((c) => ({ kind: 'client' as const, key: `c_${c.id}`, client: c }));
+    }
+
+    if (upcomingVisible.length === 0 && nonUpcomingVisible.length === 0) {
+      return [];
+    }
+
+    return [
+      ...upcomingVisible.map((c) => ({ kind: 'client' as const, key: `u_${c.id}`, client: c })),
+      { kind: 'sectionHeader' as const, key: 'hdr_clients', title: 'Clients', meta: clientsMeta },
+      ...nonUpcomingVisible.map((c) => ({ kind: 'client' as const, key: `c_${c.id}`, client: c })),
+    ];
+  }, [hasUpcoming, upcomingVisible, nonUpcomingVisible, clientsMeta]);
+
+
+  const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
+  const modalBottomPadding = keyboardHeight > 0 ? keyboardHeight + MODAL_KEYBOARD_GAP : MODAL_CLOSED_BOTTOM_PADDING;
+
+  function addClientFromBar() {
+    const name = newClientText.trim();
+    if (!name) return;
+    Keyboard.dismiss();
+
+    const now = Date.now();
+    const c = blankClient();
+    c.displayName = name;
+    c.updatedAt = now;
+
+    setDraft(c);
+    setIsDraftNew(true);
+    setNewProductText('');
+    setNewProductCategory(
+      kitlogCategories.includes(FALLBACK_CATEGORY_NAME) ? FALLBACK_CATEGORY_NAME : kitlogCategories[0] || FALLBACK_CATEGORY_NAME
+    );
+    setNewClientText('');
+  }
+
+  function openClient(id: string) {
+    Keyboard.dismiss();
+    const found = data.clients.find((c) => c.id === id);
+    if (!found) return;
+    // deep-ish copy so edits don't mutate list until we save
+    const copy: ClientRecord = {
+      ...found,
+      products: Array.isArray(found.products) ? found.products.map((p) => ({ ...p })) : [],
+    };
+    setDraft(copy);
+    setIsDraftNew(false);
+    setNewProductText('');
+    setNewProductCategory(
+      kitlogCategories.includes(FALLBACK_CATEGORY_NAME) ? FALLBACK_CATEGORY_NAME : kitlogCategories[0] || FALLBACK_CATEGORY_NAME
+    );
+  }
+
+  function upsertClient(next: ClientRecord) {
+    setData((prev) => {
+      const exists = prev.clients.some((c) => c.id === next.id);
+      const clients = exists
+        ? prev.clients.map((c) => (c.id === next.id ? next : c))
+        : [next, ...prev.clients];
+      return { ...prev, clients };
+    });
+  }
+
+  function closeClient() {
+    if (!draft) return;
+    const cleaned: ClientRecord = {
+      ...draft,
+      displayName: (draft.displayName || '').trim(),
+      trialDate: formatDateInput((draft.trialDate || '').trim()),
+      finalDate: formatDateInput((draft.finalDate || '').trim()),
+      notes: (draft.notes || '').trim(),
+      products: Array.isArray(draft.products)
+        ? draft.products
+            .map((p) => ({
+              ...p,
+              name: (p.name || '').trim(),
+              shade: (p.shade || '').trim(),
+              notes: (p.notes || '').trim(),
+            }))
+            .filter((p) => !!p.name)
+        : [],
+      updatedAt: Date.now(),
+    };
+
+    if (isDraftNew && isBlankClient(cleaned)) {
+      setDraft(null);
+      setIsDraftNew(false);
+      return;
+    }
+
+    upsertClient(cleaned);
+    setDraft(null);
+    setIsDraftNew(false);
+  }
+
+  function deleteClient() {
+    if (!draft) return;
+    Alert.alert('Delete client', 'This removes the client from your catalog.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          setData((prev) => ({ ...prev, clients: prev.clients.filter((c) => c.id !== draft.id) }));
+          setDraft(null);
+          setIsDraftNew(false);
+        },
+      },
+    ]);
+  }
+
+  function setDraftUndertone(u: Undertone) {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return { ...prev, undertone: prev.undertone === u ? 'unknown' : u, updatedAt: Date.now() };
+    });
+  }
+
+  function setDraftSeason(s: Season4) {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return { ...prev, season: prev.season === s ? null : s, updatedAt: Date.now() };
+    });
+  }
+
+  function addProduct() {
+    const trimmed = newProductText.trim();
+    if (!draft || !trimmed) return;
+    const now = Date.now();
+
+    const prod: ClientProduct = {
+      id: uid('prod'),
+      category: newProductCategory,
+      name: trimmed,
+      shade: '',
+      notes: '',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        products: [...(prev.products || []), prod],
+        updatedAt: now,
+      };
+    });
+    setNewProductText('');
+  }
+
+  function removeProduct(id: string) {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        products: (prev.products || []).filter((p) => p.id !== id),
+        updatedAt: Date.now(),
+      };
+    });
+  }
+
+  async function openCategoryPicker() {
+    Keyboard.dismiss();
+    await refreshKitlogCategories();
+    setCategoryPickerOpen(true);
+  }
+
+  const topTitle = hasUpcoming ? 'Upcoming' : 'Clients';
+  const topMeta = hasUpcoming ? upcomingMeta : clientsMeta;
+
+  return (
+    <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+      <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+        <View style={[styles.container, { paddingBottom: bottomPadding }]}>
+          {/* Top bar: Search */}
+          <View style={styles.topBar}>
+            <View style={styles.searchPill}>
+              <Ionicons name="search-outline" size={16} color="#111111" style={{ marginRight: 8 }} />
+              <TextInput
+                style={styles.searchInput}
+                value={search}
+                onChangeText={setSearch}
+                placeholder="Search clients"
+                placeholderTextColor="#999999"
+                returnKeyType="search"
+              />
+              {!!search.trim() && (
+                <TouchableOpacity
+                  style={styles.clearBtn}
+                  onPress={() => setSearch('')}
+                  accessibilityRole="button"
+                >
+                  <Ionicons name="close" size={18} color="#9ca3af" />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <TouchableOpacity style={styles.accountChip} onPress={() => navigation.navigate('Upload')}>
+              <Text style={styles.accountChipText}>Upload</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Header (match KitLog) */}
+          <View style={styles.listHeaderWrap}>
+            <View style={styles.listHeaderRow}>
+              <Text style={styles.listHeaderTitle}>{topTitle}</Text>
+              <Text style={styles.listHeaderMeta}>{topMeta}</Text>
+            </View>
+            <View style={[styles.hairline, styles.listHeaderDivider]} />
+          </View>
+
+          {/* List */}
+          <FlatList
+            data={rows}
+            keyExtractor={(item) => item.key}
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingTop: 0, paddingBottom: 10 }}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            ListEmptyComponent={
+              searchActive ? (
+                <View style={styles.emptyPad}>
+                  <Text style={styles.emptyPadText}>No clients found.</Text>
+                </View>
+              ) : (
+                <View style={{ height: 0 }} />
+              )
+            }
+            renderItem={({ item }) => {
+              if (item.kind === 'sectionHeader') {
+                return (
+                  <View style={styles.listHeaderWrap}>
+                    <View style={styles.listHeaderRow}>
+                      <Text style={styles.listHeaderTitle}>{item.title}</Text>
+                      <Text style={styles.listHeaderMeta}>{item.meta}</Text>
+                    </View>
+                    <View style={[styles.hairline, styles.listHeaderDivider]} />
+                  </View>
+                );
+              }
+
+              const c = item.client;
+              const title = c.displayName?.trim() ? c.displayName.trim() : 'Untitled client';
+              const undertone = undertoneLabel(c.undertone);
+              const season = seasonLabel(c.season);
+              const updated = c.updatedAt ? formatShortDate(c.updatedAt) : '';
+              const planCount = Array.isArray(c.products) ? c.products.length : 0;
+              const planLabel = planCount === 1 ? '1 product' : `${planCount} products`;
+
+              return (
+                <TouchableOpacity
+                  style={styles.clientCard}
+                  activeOpacity={0.9}
+                  onPress={() => openClient(c.id)}
+                  accessibilityRole="button"
+                >
+                  <View style={styles.cardTopRow}>
+                    <Text style={styles.clientName} numberOfLines={1}>
+                      {title}
+                    </Text>
+                    {!!updated ? <Text style={styles.clientMeta}>{updated}</Text> : null}
+                  </View>
+
+                  <View style={styles.chipRow}>
+                    <View style={styles.smallChip}>
+                      <Text style={styles.smallChipText}>{undertone}</Text>
+                    </View>
+                    <View style={styles.smallChip}>
+                      <Text style={styles.smallChipText}>{season}</Text>
+                    </View>
+                    <View style={styles.smallChip}>
+                      <Text style={styles.smallChipText}>{planLabel}</Text>
+                    </View>
+                  </View>
+                </TouchableOpacity>
+              );
+            }}
+          />
+
+          {/* Bottom bar: add client */}
+          <View style={styles.inputBar}>
+            <View style={styles.inputContainer}>
+              <TextInput
+                style={styles.textInput}
+                value={newClientText}
+                onChangeText={setNewClientText}
+                placeholder="Add client…"
+                placeholderTextColor="#999999"
+                returnKeyType="done"
+                onSubmitEditing={addClientFromBar}
+                blurOnSubmit={false}
+              />
+
+              <TouchableOpacity style={styles.iconButton} onPress={addClientFromBar} accessibilityRole="button">
+                <Ionicons name="add" size={20} color="#ffffff" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+
+        {/* Client editor */}
+        <Modal
+          visible={!!draft}
+          animationType="slide"
+          presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
+          onRequestClose={closeClient}
+        >
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+            <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
+              <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
+                <View style={styles.modalHeader}>
+                  <TouchableOpacity style={styles.modalBack} onPress={closeClient} accessibilityRole="button">
+                    <Ionicons name="chevron-back" size={20} color="#111111" />
+                    <Text style={styles.modalBackText}>Catalog</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity style={styles.modalDelete} onPress={deleteClient} accessibilityRole="button">
+                    <Ionicons name="trash-outline" size={18} color="#9ca3af" />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView
+                  style={{ flex: 1 }}
+                  contentContainerStyle={{
+                    paddingTop: 14,
+                    paddingBottom: 24,
+                  }}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}
+                >
+                  <View style={styles.editorCard}>
+                    <Text style={styles.sectionTitle}>Client</Text>
+
+                    <TextInput
+                      value={draft?.displayName ?? ''}
+                      onChangeText={(v) => setDraft((prev) => (prev ? { ...prev, displayName: v, updatedAt: Date.now() } : prev))}
+                      placeholder="Name"
+                      placeholderTextColor="#9ca3af"
+                      style={styles.nameInput}
+                      autoCorrect={false}
+                      returnKeyType="done"
+                    />
+
+                    <View style={styles.dateRow}>
+                      <View style={[styles.dateField, { marginRight: 10 }]}>
+                        <Text style={styles.dateLabel}>Trial date</Text>
+                        <TextInput
+                          value={draft?.trialDate ?? ''}
+                          onChangeText={(v) =>
+                            setDraft((prev) => (prev ? { ...prev, trialDate: formatDateInput(v), updatedAt: Date.now() } : prev))
+                          }
+                          placeholder="YYYY-MM-DD"
+                          placeholderTextColor="#9ca3af"
+                          style={styles.dateInput}
+                          autoCorrect={false}
+                          keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                          maxLength={10}
+                          returnKeyType="done"
+                        />
+                      </View>
+
+                      <View style={styles.dateField}>
+                        <Text style={styles.dateLabel}>Final date</Text>
+                        <TextInput
+                          value={draft?.finalDate ?? ''}
+                          onChangeText={(v) =>
+                            setDraft((prev) => (prev ? { ...prev, finalDate: formatDateInput(v), updatedAt: Date.now() } : prev))
+                          }
+                          placeholder="YYYY-MM-DD"
+                          placeholderTextColor="#9ca3af"
+                          style={styles.dateInput}
+                          autoCorrect={false}
+                          keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                          maxLength={10}
+                          returnKeyType="done"
+                        />
+                      </View>
+                    </View>
+
+
+                    <TextInput
+                      value={draft?.notes ?? ''}
+                      onChangeText={(v) => setDraft((prev) => (prev ? { ...prev, notes: v, updatedAt: Date.now() } : prev))}
+                      placeholder="Notes (optional)"
+                      placeholderTextColor="#9ca3af"
+                      style={[styles.notesInput]}
+                      multiline
+                    />
+                  </View>
+
+                  <View style={styles.editorCard}>
+                    <Text style={styles.sectionTitle}>Match</Text>
+
+                    <Text style={styles.fieldLabel}>Undertone</Text>
+                    <View style={styles.pillRow}>
+                      {(['cool', 'warm', 'neutral', 'olive'] as Undertone[]).map((u) => {
+                        const on = (draft?.undertone ?? 'unknown') === u;
+                        return (
+                          <TouchableOpacity
+                            key={u}
+                            style={[styles.pillBtn, on ? styles.pillBtnOn : null]}
+                            onPress={() => setDraftUndertone(u)}
+                            activeOpacity={0.9}
+                          >
+                            <Text style={[styles.pillBtnText, on ? styles.pillBtnTextOn : null]}>{undertoneLabel(u)}</Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+
+                    <Text style={[styles.fieldLabel, { marginTop: 10 }]}>Season</Text>
+                    <View style={styles.pillRow}>
+                      {(['spring', 'summer', 'autumn', 'winter'] as Season4[]).map((s) => {
+                        const on = (draft?.season ?? null) === s;
+                        return (
+                          <TouchableOpacity
+                            key={s}
+                            style={[styles.pillBtn, on ? styles.pillBtnOn : null]}
+                            onPress={() => setDraftSeason(s)}
+                            activeOpacity={0.9}
+                          >
+                            <Text style={[styles.pillBtnText, on ? styles.pillBtnTextOn : null]}>{seasonLabel(s)}</Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  </View>
+
+                  <View style={styles.editorCard}>
+                    <View style={styles.productsHeader}>
+                      <Text style={styles.sectionTitle}>Products</Text>
+                      <Text style={styles.productsMeta}>{(draft?.products || []).length}</Text>
+                    </View>
+
+                    {(draft?.products || []).length === 0 ? (
+                      <Text style={styles.productsEmpty}>No products yet.</Text>
+                    ) : (
+                      <View style={styles.productsList}>
+                        {(draft?.products || []).map((p, idx) => {
+                          const isLast = idx === (draft?.products || []).length - 1;
+                          return (
+                            <View key={p.id}>
+                              <View style={styles.productRow}>
+                                <View style={{ flex: 1, paddingRight: 10 }}>
+                                  <Text style={styles.productName} numberOfLines={2}>
+                                    {p.name}
+                                  </Text>
+                                  <Text style={styles.productMeta} numberOfLines={1}>
+                                    {categoryLabel(p.category)}
+                                  </Text>
+                                </View>
+                                <TouchableOpacity
+                                  style={styles.rowIcon}
+                                  onPress={() => removeProduct(p.id)}
+                                  accessibilityRole="button"
+                                >
+                                  <Ionicons name="trash-outline" size={18} color="#9ca3af" />
+                                </TouchableOpacity>
+                              </View>
+                              {!isLast ? <View style={styles.hairline} /> : null}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    )}
+                  </View>
+                </ScrollView>
+
+                {/* Bottom bar (add product) */}
+                <View style={styles.inputBar}>
+                  <View style={styles.inputContainer}>
+                    <TextInput
+                      style={styles.textInput}
+                      value={newProductText}
+                      onChangeText={setNewProductText}
+                      placeholder="Add product…"
+                      placeholderTextColor="#999999"
+                      returnKeyType="done"
+                      onSubmitEditing={addProduct}
+                      blurOnSubmit={false}
+                    />
+
+                    <TouchableOpacity
+                      style={styles.categoryInline}
+                      onPress={openCategoryPicker}
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.categoryInlineText}>{categoryLabel(newProductCategory)}</Text>
+                      <Ionicons name="chevron-down" size={14} color="#6b7280" style={{ marginLeft: 6 }} />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={styles.iconButton} onPress={addProduct} accessibilityRole="button">
+                      <Ionicons name="add" size={20} color="#ffffff" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Category picker (cross-platform) */}
+                <Modal
+                  visible={categoryPickerOpen}
+                  transparent
+                  animationType="fade"
+                  onRequestClose={() => setCategoryPickerOpen(false)}
+                >
+                  <TouchableWithoutFeedback onPress={() => setCategoryPickerOpen(false)}>
+                    <View style={styles.sheetBackdrop}>
+                      <TouchableWithoutFeedback onPress={() => {}}>
+                        <View style={styles.sheetContainer}>
+                          <Text style={styles.sheetTitle}>Category</Text>
+
+                          <View style={styles.sheetList}>
+                            <ScrollView
+                              style={styles.sheetScroll}
+                              showsVerticalScrollIndicator
+                              bounces={false}
+                              keyboardShouldPersistTaps="handled"
+                            >
+                              {kitlogCategories.map((name, idx) => {
+                                const on = newProductCategory === name;
+                                const isLast = idx === kitlogCategories.length - 1;
+                                return (
+                                  <View key={name}>
+                                    <TouchableOpacity
+                                      style={styles.sheetRow}
+                                      activeOpacity={0.9}
+                                      onPress={() => {
+                                        setNewProductCategory(name);
+                                        setCategoryPickerOpen(false);
+                                      }}
+                                      accessibilityRole="button"
+                                    >
+                                      <Text style={styles.sheetRowText}>{name}</Text>
+                                      {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : null}
+                                    </TouchableOpacity>
+                                    {!isLast ? <View style={styles.sheetDivider} /> : null}
+                                  </View>
+                                );
+                              })}
+                            </ScrollView>
+                          </View>
+
+                          <TouchableOpacity
+                            style={styles.sheetCancel}
+                            activeOpacity={0.9}
+                            onPress={() => setCategoryPickerOpen(false)}
+                            accessibilityRole="button"
+                          >
+                            <Text style={styles.sheetCancelText}>Cancel</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </TouchableWithoutFeedback>
+                    </View>
+                  </TouchableWithoutFeedback>
+                </Modal>
+              </View>
+            </SafeAreaView>
+          </TouchableWithoutFeedback>
+        </Modal>
+      </SafeAreaView>
+    </TouchableWithoutFeedback>
+  );
+};
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+  },
+  container: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 16,
+  },
+
+  // Top bar
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    marginBottom: 10,
+  },
+  searchPill: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    paddingLeft: 14,
+    paddingRight: 10,
+    minHeight: 38,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 14,
+    color: '#111111',
+    paddingVertical: 0,
+    fontWeight: '400',
+  },
+  clearBtn: {
+    marginLeft: 6,
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  accountChip: {
+    marginLeft: 10,
+    paddingHorizontal: 16,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#111111',
+    backgroundColor: '#ffffff',
+    justifyContent: 'center',
+    alignItems: 'center',
+    minHeight: 38,
+  },
+  accountChipText: {
+    color: '#111111',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+
+  // List header (match KitLog)
+  listHeaderWrap: {
+    paddingTop: 18,
+    paddingLeft: 6,
+    paddingRight: 0,
+  },
+  listHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    paddingRight: 10,
+  },
+  listHeaderTitle: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  listHeaderMeta: {
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  listHeaderDivider: {
+    marginTop: 13,
+    marginBottom: 26,
+    marginRight: 10,
+    backgroundColor: '#d1d5db',
+  },
+
+  // Client cards
+  clientCard: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 18,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 12,
+  },
+  cardTopRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+  },
+  clientName: {
+    flex: 1,
+    paddingRight: 10,
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#111111',
+  },
+  clientMeta: {
+    fontSize: 12,
+    color: '#6b7280',
+    fontWeight: '500',
+  },
+  chipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    marginTop: 10,
+  },
+  smallChip: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: '#ffffff',
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  smallChipText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  previewText: {
+    marginTop: 2,
+    fontSize: 12,
+    color: '#6b7280',
+    lineHeight: 16,
+  },
+
+  // Empty list (search only)
+  emptyPad: {
+    paddingHorizontal: 14,
+    paddingVertical: 18,
+  },
+  emptyPadText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+
+  // Modal
+  modalSafe: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+  },
+  modalContainer: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingTop: 18,
+    backgroundColor: '#ffffff',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  modalBack: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    height: 40,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+  },
+  modalBackText: {
+    marginLeft: 6,
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  modalDelete: {
+    width: 40,
+    height: 40,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editorCard: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 18,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    marginBottom: 12,
+  },
+  sectionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111111',
+    marginBottom: 10,
+  },
+  nameInput: {
+    fontSize: 15,
+    fontWeight: '500',
+    color: '#111111',
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#e5e7eb',
+  },
+  dateRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+  },
+  dateField: {
+    flex: 1,
+  },
+  dateLabel: {
+    fontSize: 12,
+    color: '#6b7280',
+    fontWeight: '500',
+    marginBottom: 6,
+  },
+  dateInput: {
+    fontSize: 13,
+    color: '#111111',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+  },
+  notesInput: {
+    marginTop: 10,
+    fontSize: 13,
+    color: '#111111',
+    paddingVertical: 10,
+    minHeight: 60,
+    textAlignVertical: 'top',
+  },
+  fieldLabel: {
+    fontSize: 12,
+    color: '#6b7280',
+    fontWeight: '500',
+    marginBottom: 8,
+  },
+  pillRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  pillBtn: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginRight: 8,
+    marginBottom: 8,
+    backgroundColor: '#ffffff',
+  },
+  pillBtnOn: {
+    borderColor: '#111111',
+  },
+  pillBtnText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  pillBtnTextOn: {
+    fontWeight: '600',
+  },
+
+  // Products
+  productsHeader: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  productsMeta: {
+    fontSize: 13,
+    color: '#6b7280',
+    fontWeight: '500',
+  },
+  productsEmpty: {
+    fontSize: 13,
+    color: '#6b7280',
+  },
+  productsList: {
+    marginTop: 4,
+  },
+  productRow: {
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  productName: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  productMeta: {
+    marginTop: 4,
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  rowIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hairline: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#eef2f7',
+  },
+
+  // Bottom input (modal)
+  inputBar: {
+    paddingTop: 8,
+  },
+  inputContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 22,
+    paddingLeft: 18,
+    paddingRight: 6,
+    backgroundColor: '#ffffff',
+    minHeight: 44,
+  },
+  categoryInline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 34,
+    paddingHorizontal: 6,
+    marginRight: 6,
+  },
+  categoryInlineText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  textInput: {
+    flex: 1,
+    fontSize: 14,
+    paddingVertical: 8,
+    paddingRight: 8,
+    color: '#111111',
+    fontWeight: '400',
+  },
+  iconButton: {
+    marginLeft: 4,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#111111',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // Category picker sheet
+  sheetBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+    justifyContent: 'flex-end',
+    paddingHorizontal: 16,
+    paddingBottom: 16,
+  },
+  sheetContainer: {
+    backgroundColor: '#ffffff',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 10,
+  },
+  sheetTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#111111',
+    marginBottom: 10,
+  },
+  sheetList: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    overflow: 'hidden',
+    backgroundColor: '#ffffff',
+  },
+  sheetScroll: {
+    maxHeight: SHEET_MAX_HEIGHT,
+  },
+  sheetRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  sheetRowText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  sheetDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#eef2f7',
+  },
+  sheetCancel: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#ffffff',
+  },
+  sheetCancelText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+});
+
+export default Catalog;
