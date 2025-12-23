@@ -3,12 +3,14 @@
 // Implements:
 //   - POST /signup
 //   - POST /login
-//   - POST /reset-password   (NOTE: insecure without email verification)
-//   - GET  /me?email=...
-//   - POST /update-account-name
-//   - POST /update-email
-//   - POST /update-password
-//   - POST /start-subscription (stub)
+//   - POST /logout
+//   - POST /request-password-reset  (creates a one-time reset token)
+//   - POST /reset-password          (consumes reset token)
+//   - GET  /me                      (auth required)
+//   - POST /update-account-name     (auth required)
+//   - POST /update-email            (auth required, requires password)
+//   - POST /update-password         (auth required, requires current password)
+//   - POST /start-subscription      (stub)
 //   - GET  /healthz
 //
 // Requires Postgres + DATABASE_URL. Run: npm run db:migrate
@@ -19,6 +21,7 @@ const path = require("path");
 const dotenv = require("dotenv");
 const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 
 // Load server env vars from .env.server (preferred).
 // Falls back to .env for backwards compatibility.
@@ -36,6 +39,9 @@ app.use(express.json({ limit: "1mb" }));
 
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
+
+const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
+const RESET_TTL_MINUTES = Number(process.env.RESET_TTL_MINUTES || 30);
 
 const sslEnabled =
   String(process.env.DATABASE_SSL || "").toLowerCase() === "true" ||
@@ -62,7 +68,8 @@ function requireDb(res) {
   if (!pool) {
     res.status(500).json({
       ok: false,
-      error: "DATABASE_URL is not set. Configure Postgres (Render) and set DATABASE_URL in .env.server / Render env vars.",
+      error:
+        "DATABASE_URL is not set. Configure Postgres and set DATABASE_URL in .env.server / host env vars.",
     });
     return false;
   }
@@ -77,12 +84,96 @@ function publicUserRow(row) {
   };
 }
 
+function hashToken(token) {
+  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function getBearerToken(req) {
+  const h = String(req.headers?.authorization || "");
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? String(m[1] || "").trim() : "";
+}
+
 async function getUserByEmailNorm(emailNorm) {
   const { rows } = await pool.query(
     "SELECT id, email, email_norm, password_hash, account_name FROM users WHERE email_norm = $1 LIMIT 1",
     [emailNorm]
   );
   return rows[0] || null;
+}
+
+async function createSession(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = hashToken(token);
+
+  const ttlDays = Number.isFinite(SESSION_TTL_DAYS) && SESSION_TTL_DAYS > 0 ? SESSION_TTL_DAYS : 30;
+  const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+
+  const { rows } = await pool.query(
+    "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3) RETURNING id",
+    [userId, tokenHash, expiresAt]
+  );
+
+  return { token, sessionId: rows?.[0]?.id };
+}
+
+async function revokeOtherSessions(userId, exceptSessionId) {
+  if (!userId) return;
+
+  if (exceptSessionId) {
+    await pool.query(
+      "UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL AND id <> $2",
+      [userId, exceptSessionId]
+    );
+  } else {
+    await pool.query("UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", [userId]);
+  }
+}
+
+async function authRequired(req, res, next) {
+  if (!requireDb(res)) return;
+
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ ok: false, error: "Missing authorization token" });
+
+  try {
+    const tokenHash = hashToken(token);
+    const { rows } = await pool.query(
+      `
+      SELECT
+        s.id AS session_id,
+        s.user_id,
+        u.email,
+        u.account_name,
+        u.password_hash
+      FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.token_hash = $1
+        AND s.revoked_at IS NULL
+        AND s.expires_at > NOW()
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    const row = rows[0];
+    if (!row) return res.status(401).json({ ok: false, error: "Invalid or expired session" });
+
+    req.auth = {
+      sessionId: row.session_id,
+      user: {
+        id: row.user_id,
+        email: row.email,
+        account_name: row.account_name,
+        password_hash: row.password_hash,
+      },
+    };
+
+    return next();
+  } catch (e) {
+    console.error("authRequired error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
 }
 
 // Root
@@ -125,7 +216,9 @@ app.post("/signup", async (req, res) => {
     );
 
     const user = rows[0];
-    return res.status(201).json({ ok: true, user: publicUserRow(user) });
+    const session = await createSession(user.id);
+
+    return res.status(201).json({ ok: true, token: session.token, user: publicUserRow(user) });
   } catch (e) {
     // Unique violation on email_norm
     const msg = String(e?.message || e);
@@ -158,31 +251,122 @@ app.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ ok: false, error: "Invalid email or password" });
 
-    return res.json({ ok: true, user: publicUserRow(user) });
+    const session = await createSession(user.id);
+
+    return res.json({ ok: true, token: session.token, user: publicUserRow(user) });
   } catch (e) {
     console.error("login error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// Reset password (NOTE: insecure without email verification)
+// Logout (revoke current session)
+app.post("/logout", authRequired, async (req, res) => {
+  const sessionId = req?.auth?.sessionId;
+  if (!sessionId) return res.status(400).json({ ok: false, error: "Missing session" });
+
+  try {
+    await pool.query("UPDATE sessions SET revoked_at = NOW() WHERE id = $1", [sessionId]);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("logout error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// Request password reset (always returns ok:true to avoid user enumeration)
+app.post("/request-password-reset", async (req, res) => {
+  if (!requireDb(res)) return;
+
+  const { email } = req.body || {};
+  const { trimmed, norm } = normalizeEmail(email);
+
+  // Always respond ok:true even if invalid.
+  if (!isValidEmail(trimmed)) {
+    return res.json({ ok: true });
+  }
+
+  try {
+    const user = await getUserByEmailNorm(norm);
+
+    if (!user) {
+      // No enumeration.
+      return res.json({ ok: true });
+    }
+
+    const resetToken = crypto.randomBytes(20).toString("hex");
+    const tokenHash = hashToken(resetToken);
+
+    const ttlMinutes = Number.isFinite(RESET_TTL_MINUTES) && RESET_TTL_MINUTES > 0 ? RESET_TTL_MINUTES : 30;
+    const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+
+    await pool.query(
+      "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+      [user.id, tokenHash, expiresAt]
+    );
+
+    // In production, deliver resetToken out-of-band (email/SMS). We do NOT return it.
+    if (NODE_ENV !== "production") {
+      return res.json({ ok: true, resetToken });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("request-password-reset error:", e);
+    // Still no enumeration.
+    return res.json({ ok: true });
+  }
+});
+
+// Reset password (consumes reset token)
 app.post("/reset-password", async (req, res) => {
   if (!requireDb(res)) return;
 
-  const { email, newPassword } = req.body || {};
-  const { trimmed, norm } = normalizeEmail(email);
+  const { token, newPassword } = req.body || {};
+  const t = String(token || "").trim();
 
-  if (!isValidEmail(trimmed)) return res.status(400).json({ ok: false, error: "Invalid email" });
+  if (!t) return res.status(400).json({ ok: false, error: "Missing reset token" });
   if (typeof newPassword !== "string" || newPassword.length < 6) {
     return res.status(400).json({ ok: false, error: "New password must be at least 6 characters" });
   }
 
   try {
-    const user = await getUserByEmailNorm(norm);
-    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
+    const tokenHash = hashToken(t);
+
+    const { rows } = await pool.query(
+      `
+      SELECT id, user_id
+      FROM password_resets
+      WHERE token_hash = $1
+        AND used_at IS NULL
+        AND expires_at > NOW()
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    const pr = rows[0];
+    if (!pr) return res.status(400).json({ ok: false, error: "Invalid or expired reset token" });
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
-    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [passwordHash, user.id]);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [passwordHash, pr.user_id]);
+      await client.query("UPDATE password_resets SET used_at = NOW() WHERE id = $1", [pr.id]);
+      await client.query("UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", [pr.user_id]);
+      await client.query("COMMIT");
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        // ignore rollback errors
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
 
     return res.json({ ok: true });
   } catch (e) {
@@ -191,18 +375,10 @@ app.post("/reset-password", async (req, res) => {
   }
 });
 
-// Me (demo auth: identified by ?email=)
-app.get("/me", async (req, res) => {
-  if (!requireDb(res)) return;
-
-  const email = req.query.email;
-  const { trimmed, norm } = normalizeEmail(email);
-  if (!isValidEmail(trimmed)) return res.status(400).json({ ok: false, error: "Missing or invalid email" });
-
+// Me (auth required)
+app.get("/me", authRequired, async (req, res) => {
   try {
-    const user = await getUserByEmailNorm(norm);
-    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
-
+    const user = req?.auth?.user;
     return res.json({
       ok: true,
       user: publicUserRow(user),
@@ -217,25 +393,19 @@ app.get("/me", async (req, res) => {
   }
 });
 
-// Update account name
-app.post("/update-account-name", async (req, res) => {
-  if (!requireDb(res)) return;
+// Update account name (auth required)
+app.post("/update-account-name", authRequired, async (req, res) => {
+  const userId = req?.auth?.user?.id;
+  const name = String(req?.body?.accountName || "").trim();
 
-  const { email, accountName } = req.body || {};
-  const { trimmed, norm } = normalizeEmail(email);
-  const name = String(accountName || "").trim();
-
-  if (!isValidEmail(trimmed)) return res.status(400).json({ ok: false, error: "Missing or invalid email" });
   if (!name) return res.status(400).json({ ok: false, error: "Account name cannot be empty" });
 
   try {
-    const user = await getUserByEmailNorm(norm);
-    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
-
     const { rows } = await pool.query(
       "UPDATE users SET account_name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email, account_name",
-      [name, user.id]
+      [name, userId]
     );
+
     return res.json({ ok: true, user: publicUserRow(rows[0]) });
   } catch (e) {
     console.error("update-account-name error:", e);
@@ -243,29 +413,24 @@ app.post("/update-account-name", async (req, res) => {
   }
 });
 
-// Update email (requires password)
-app.post("/update-email", async (req, res) => {
-  if (!requireDb(res)) return;
+// Update email (auth required + confirm password)
+app.post("/update-email", authRequired, async (req, res) => {
+  const userId = req?.auth?.user?.id;
+  const currentPasswordHash = req?.auth?.user?.password_hash;
 
-  const { email, password, newEmail } = req.body || {};
-  const cur = normalizeEmail(email);
+  const { password, newEmail } = req.body || {};
   const next = normalizeEmail(newEmail);
 
-  if (!isValidEmail(cur.trimmed)) return res.status(400).json({ ok: false, error: "Missing or invalid email" });
   if (!isValidEmail(next.trimmed)) return res.status(400).json({ ok: false, error: "Missing or invalid newEmail" });
   if (typeof password !== "string" || !password) return res.status(400).json({ ok: false, error: "Missing password" });
 
   try {
-    const user = await getUserByEmailNorm(cur.norm);
-    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
-
-    const ok = await bcrypt.compare(password, user.password_hash);
+    const ok = await bcrypt.compare(password, currentPasswordHash);
     if (!ok) return res.status(401).json({ ok: false, error: "Invalid password" });
 
-    // Update with unique email_norm
     const { rows } = await pool.query(
       "UPDATE users SET email = $1, email_norm = $2, updated_at = NOW() WHERE id = $3 RETURNING id, email, account_name",
-      [next.trimmed, next.norm, user.id]
+      [next.trimmed, next.norm, userId]
     );
 
     return res.json({ ok: true, user: publicUserRow(rows[0]) });
@@ -279,14 +444,14 @@ app.post("/update-email", async (req, res) => {
   }
 });
 
-// Update password (requires current password)
-app.post("/update-password", async (req, res) => {
-  if (!requireDb(res)) return;
+// Update password (auth required)
+app.post("/update-password", authRequired, async (req, res) => {
+  const userId = req?.auth?.user?.id;
+  const sessionId = req?.auth?.sessionId;
+  const currentPasswordHash = req?.auth?.user?.password_hash;
 
-  const { email, currentPassword, newPassword } = req.body || {};
-  const cur = normalizeEmail(email);
+  const { currentPassword, newPassword } = req.body || {};
 
-  if (!isValidEmail(cur.trimmed)) return res.status(400).json({ ok: false, error: "Missing or invalid email" });
   if (typeof currentPassword !== "string" || !currentPassword) {
     return res.status(400).json({ ok: false, error: "Missing currentPassword" });
   }
@@ -295,14 +460,15 @@ app.post("/update-password", async (req, res) => {
   }
 
   try {
-    const user = await getUserByEmailNorm(cur.norm);
-    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
-
-    const ok = await bcrypt.compare(currentPassword, user.password_hash);
+    const ok = await bcrypt.compare(currentPassword, currentPasswordHash);
     if (!ok) return res.status(401).json({ ok: false, error: "Invalid current password" });
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
-    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [passwordHash, user.id]);
+
+    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [passwordHash, userId]);
+
+    // Revoke other sessions after a password change.
+    await revokeOtherSessions(userId, sessionId);
 
     return res.json({ ok: true });
   } catch (e) {
@@ -312,7 +478,7 @@ app.post("/update-password", async (req, res) => {
 });
 
 // Subscription stub (mobile stores require IAP for digital subscriptions)
-app.post("/start-subscription", async (req, res) => {
+app.post("/start-subscription", authRequired, async (req, res) => {
   const { plan } = req.body || {};
   return res.json({
     ok: true,
