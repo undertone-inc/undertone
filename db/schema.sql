@@ -51,3 +51,18 @@ CREATE TABLE IF NOT EXISTS password_resets (
 
 CREATE INDEX IF NOT EXISTS idx_password_resets_user_id ON password_resets(user_id);
 CREATE INDEX IF NOT EXISTS idx_password_resets_expires_at ON password_resets(expires_at);
+
+-- --- Face analyses (for monthly upload counts + optional history) ---
+-- NOTE: We do NOT store the raw image bytes. Only a sha256 hash (optional)
+-- and the structured analysis JSON for later reference.
+CREATE TABLE IF NOT EXISTS face_analyses (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  image_sha256 TEXT,
+  source TEXT,
+  analysis_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_face_analyses_user_id_created_at
+  ON face_analyses(user_id, created_at DESC);

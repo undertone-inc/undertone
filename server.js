@@ -11,6 +11,7 @@
 //   - POST /update-email            (auth required, requires password)
 //   - POST /update-password         (auth required, requires current password)
 //   - POST /start-subscription      (stub)
+//   - POST /analyze-face            (auth required, multipart image upload)
 //   - GET  /healthz
 //
 // Requires Postgres + DATABASE_URL. Run: npm run db:migrate
@@ -22,6 +23,7 @@ const dotenv = require("dotenv");
 const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
+const multer = require("multer");
 
 // Load server env vars from .env.server (preferred).
 // Falls back to .env for backwards compatibility.
@@ -43,6 +45,16 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
 const RESET_TTL_MINUTES = Number(process.env.RESET_TTL_MINUTES || 30);
 
+// OpenAI (server-side only)
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+const OPENAI_IMAGE_DETAIL = String(process.env.OPENAI_IMAGE_DETAIL || "high").trim();
+const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 650);
+
+// Upload constraints
+const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8);
+
+// Match server.js behavior: enable SSL in production unless explicitly disabled.
 const sslEnabled =
   String(process.env.DATABASE_SSL || "").toLowerCase() === "true" ||
   (NODE_ENV === "production" && String(process.env.DATABASE_SSL || "").toLowerCase() !== "false");
@@ -78,6 +90,7 @@ function requireDb(res) {
 
 function publicUserRow(row) {
   return {
+    id: row.id,
     email: row.email,
     accountName: row.account_name || "",
     planTier: "free",
@@ -174,6 +187,31 @@ async function authRequired(req, res, next) {
     console.error("authRequired error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
+}
+
+function startOfMonthUtc() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0, 0));
+}
+
+async function getUploadsUsedThisMonth(userId) {
+  // If the table doesn't exist yet (migration not run), default to 0.
+  try {
+    const from = startOfMonthUtc();
+    const { rows } = await pool.query(
+      "SELECT COUNT(*)::int AS c FROM face_analyses WHERE user_id = $1 AND created_at >= $2",
+      [userId, from]
+    );
+    return Number(rows?.[0]?.c || 0);
+  } catch (e) {
+    return 0;
+  }
+}
+
+const PLAN_UPLOAD_LIMITS = { free: 5, plus: 20, pro: 100 };
+function uploadLimitForPlan(planTier) {
+  const t = String(planTier || "free").toLowerCase();
+  return PLAN_UPLOAD_LIMITS[t] ?? PLAN_UPLOAD_LIMITS.free;
 }
 
 // Root
@@ -379,12 +417,18 @@ app.post("/reset-password", async (req, res) => {
 app.get("/me", authRequired, async (req, res) => {
   try {
     const user = req?.auth?.user;
+    const used = await getUploadsUsedThisMonth(user.id);
+    const limit = uploadLimitForPlan("free");
+
     return res.json({
       ok: true,
       user: publicUserRow(user),
       usage: {
-        uploadsUsedThisMonth: 0,
-        clientsUsedThisMonth: 0,
+        uploadsThisMonth: used,
+        clientsThisMonth: 0,
+      },
+      limits: {
+        uploadsPerMonth: limit,
       },
     });
   } catch (e) {
@@ -486,6 +530,221 @@ app.post("/start-subscription", authRequired, async (req, res) => {
     url: null,
     message: "Subscription checkout is not implemented on the server. Use in-app purchase on iOS/Android.",
   });
+});
+
+// ---- Face photo analysis ----
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: Math.max(1, UPLOAD_MAX_MB) * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const mt = String(file.mimetype || "");
+    if (!mt.startsWith("image/")) return cb(new Error("Only image uploads are supported"));
+    cb(null, true);
+  },
+});
+
+function extractOutputText(resp) {
+  let text = typeof resp?.output_text === "string" ? resp.output_text : "";
+  let refusal = typeof resp?.refusal === "string" ? resp.refusal : "";
+
+  const output = Array.isArray(resp?.output) ? resp.output : [];
+  for (const item of output) {
+    if (typeof item?.output_text === "string") text += item.output_text;
+    if (typeof item?.refusal === "string" && !refusal) refusal = item.refusal;
+
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const part of content) {
+      if (part?.type === "output_text" && typeof part?.text === "string") text += part.text;
+      if (part?.type === "refusal" && typeof part?.refusal === "string" && !refusal) refusal = part.refusal;
+    }
+  }
+
+  return { text: String(text || "").trim(), refusal: String(refusal || "").trim() };
+}
+
+async function callOpenAIForAnalysis({ dataUrl }) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY on server");
+  }
+
+  // Structured Outputs schema
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      undertone: { type: "string", enum: ["warm", "cool", "neutral", "olive", "unknown"] },
+      season_family: { type: "string", enum: ["spring", "summer", "autumn", "winter", "unknown"] },
+      season_subtype: { type: "string" },
+      confidence: { type: "integer" },
+      reasoning_summary: { type: "string" },
+      photo_quality: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          lighting: { type: "string", enum: ["good", "ok", "poor", "unknown"] },
+          white_balance: { type: "string", enum: ["neutral", "warm", "cool", "unknown"] },
+          face_visible: { type: "boolean" },
+          filters_detected: { type: "boolean" },
+          notes: { type: "string" },
+        },
+        required: ["lighting", "white_balance", "face_visible", "filters_detected", "notes"],
+      },
+      recommendations: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          best_neutrals: { type: "array", items: { type: "string" } },
+          accent_colors: { type: "array", items: { type: "string" } },
+          metals: { type: "array", items: { type: "string" } },
+          makeup_tips: { type: "array", items: { type: "string" } },
+          hair_color_notes: { type: "array", items: { type: "string" } },
+          avoid: { type: "array", items: { type: "string" } },
+        },
+        required: ["best_neutrals", "accent_colors", "metals", "makeup_tips", "hair_color_notes", "avoid"],
+      },
+      disclaimer: { type: "string" },
+    },
+    required: [
+      "undertone",
+      "season_family",
+      "season_subtype",
+      "confidence",
+      "reasoning_summary",
+      "photo_quality",
+      "recommendations",
+      "disclaimer",
+    ],
+  };
+
+  const payload = {
+    model: OPENAI_MODEL,
+    temperature: 0,
+    input: [
+      {
+        role: "system",
+        content:
+          "You are a color-analysis assistant. You estimate skin undertone and seasonal color palette from a face photo. " +
+          "Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, or health. " +
+          "Do NOT guess race/ethnicity or age. " +
+          "If lighting is poor, heavily filtered, or the face is not clearly visible, set undertone=unknown and season_family=unknown. " +
+          "Return JSON that matches the provided schema.",
+      },
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Analyze this face photo and return undertone + season + practical style suggestions." },
+          { type: "input_image", image_url: dataUrl, detail: OPENAI_IMAGE_DETAIL },
+        ],
+      },
+    ],
+    max_output_tokens: OPENAI_MAX_OUTPUT_TOKENS,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "undertone_face_analysis",
+        strict: true,
+        schema,
+      },
+    },
+  };
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.error?.message || data?.error || `OpenAI error HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+
+  const { text, refusal } = extractOutputText(data);
+  if (refusal) throw new Error(refusal);
+  if (!text) throw new Error("OpenAI returned no text output");
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("OpenAI returned non-JSON output");
+  }
+
+  return parsed;
+}
+
+async function insertFaceAnalysisRow({ userId, sha256, source, analysis }) {
+  try {
+    const { rows } = await pool.query(
+      "INSERT INTO face_analyses (user_id, image_sha256, source, analysis_json) VALUES ($1, $2, $3, $4::jsonb) RETURNING id",
+      [userId, sha256 || null, source || null, JSON.stringify(analysis || {})]
+    );
+    return rows?.[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+app.post("/analyze-face", authRequired, upload.single("image"), async (req, res) => {
+  try {
+    const user = req?.auth?.user;
+    const userId = user?.id;
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "Server is missing OPENAI_API_KEY" });
+    }
+
+    const used = await getUploadsUsedThisMonth(userId);
+    const limit = uploadLimitForPlan("free");
+    if (used >= limit) {
+      return res.status(402).json({ ok: false, error: "Monthly upload limit reached" });
+    }
+
+    const file = req.file;
+    if (!file?.buffer) return res.status(400).json({ ok: false, error: "Missing image file" });
+
+    const mime = String(file.mimetype || "image/jpeg");
+    const sha = crypto.createHash("sha256").update(file.buffer).digest("hex");
+    const b64 = file.buffer.toString("base64");
+    const dataUrl = `data:${mime};base64,${b64}`;
+
+    const analysis = await callOpenAIForAnalysis({ dataUrl });
+
+    const source = String(req.body?.source || "").trim();
+    const analysisId = await insertFaceAnalysisRow({ userId, sha256: sha, source, analysis });
+
+    return res.json({
+      ok: true,
+      analysisId,
+      analysis,
+      usage: { uploadsThisMonth: used + 1 },
+      limits: { uploadsPerMonth: limit },
+    });
+  } catch (e) {
+    console.error("analyze-face error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || "Server error") });
+  }
+});
+
+// Multer / upload error handler
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ ok: false, error: `Image too large. Max ${Math.max(1, UPLOAD_MAX_MB)}MB.` });
+    }
+    return res.status(400).json({ ok: false, error: err.message || "Upload error" });
+  }
+
+  if (err) {
+    const msg = String(err?.message || err);
+    return res.status(400).json({ ok: false, error: msg || "Request error" });
+  }
+
+  return next();
 });
 
 app.listen(PORT, () => {
