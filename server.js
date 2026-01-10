@@ -4,6 +4,7 @@
 //   - POST /signup
 //   - POST /login
 //   - POST /logout
+//   - POST /delete-account         (auth required)
 //   - POST /request-password-reset  (creates a one-time reset token)
 //   - POST /reset-password          (consumes reset token)
 //   - GET  /me                      (auth required)
@@ -208,9 +209,11 @@ async function getUploadsUsedThisMonth(userId) {
   }
 }
 
-const PLAN_UPLOAD_LIMITS = { free: 5, plus: 20, pro: 100 };
+const PLAN_UPLOAD_LIMITS = { free: 100, pro: 100 };
 function uploadLimitForPlan(planTier) {
   const t = String(planTier || "free").toLowerCase();
+  // "Plus" is no longer offered; treat it as "Pro" so legacy values don't reduce limits.
+  if (t === "plus") return PLAN_UPLOAD_LIMITS.pro;
   return PLAN_UPLOAD_LIMITS[t] ?? PLAN_UPLOAD_LIMITS.free;
 }
 
@@ -308,6 +311,21 @@ app.post("/logout", authRequired, async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error("logout error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// Delete account (auth required)
+app.post("/delete-account", authRequired, async (req, res) => {
+  const userId = req?.auth?.user?.id;
+  if (!userId) return res.status(400).json({ ok: false, error: "Missing user" });
+
+  try {
+    // Cascades delete: sessions, user_docs, password_resets, face_analyses, etc.
+    await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("delete-account error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
