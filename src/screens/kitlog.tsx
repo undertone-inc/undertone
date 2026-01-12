@@ -14,12 +14,13 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import * as SecureStore from 'expo-secure-store';
+import { DOC_KEYS, getString, makeScopedKey, setString } from '../localstore';
 
 type KitLogScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
+  userId?: string | number | null;
 };
 
 type ItemStatus = 'inKit' | 'low' | 'empty';
@@ -58,14 +59,15 @@ type ViewMode = 'all' | 'low' | 'empty' | 'expiring';
 type HomeAttentionMode = 'low' | 'empty' | 'expiring';
 
 
-const STORAGE_KEY = 'io_kitlog_v1';
+const STORAGE_KEY = DOC_KEYS.kitlog;
 
 // Category bar fills up as you add items (cap).
 const CATEGORY_BAR_TARGET = 12;
 
 
 // How the bar sits when keyboard is CLOSED
-const CLOSED_BOTTOM_PADDING = 12;
+// (Adds a little more breathing room above the bottom nav divider)
+const CLOSED_BOTTOM_PADDING = 28;
 
 // Extra space ABOVE the keyboard when it’s OPEN
 const KEYBOARD_GAP = 0;
@@ -203,7 +205,11 @@ function normalizeData(input: any): KitLogData {
   }
 }
 
-const KitLog: React.FC<KitLogScreenProps> = ({ navigation }) => {
+const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
+  // Scope local data per user (stable id preferred; fall back to email).
+  const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
+  const storageKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
+
   const [data, setData] = useState<KitLogData>({ version: 1, categories: defaultCategories() });
   const [hydrated, setHydrated] = useState(false);
   const persistTimer = useRef<any>(null);
@@ -236,14 +242,14 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation }) => {
       showSub.remove();
       hideSub.remove();
     };
-  }, []);
+  }, [storageKey]);
 
   // load
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync(STORAGE_KEY);
+        const raw = await getString(storageKey);
         if (!alive) return;
         if (raw) {
           const parsed = JSON.parse(raw);
@@ -267,13 +273,13 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation }) => {
 
     if (persistTimer.current) clearTimeout(persistTimer.current);
     persistTimer.current = setTimeout(() => {
-      SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(data)).catch(() => {});
+      setString(storageKey, JSON.stringify(data)).catch(() => {});
     }, 450);
 
     return () => {
       if (persistTimer.current) clearTimeout(persistTimer.current);
     };
-  }, [data, hydrated]);
+  }, [data, hydrated, storageKey]);
 
   const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
 

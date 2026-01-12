@@ -8,19 +8,22 @@ import {
   Alert,
 } from 'react-native';
 import Constants from 'expo-constants';
+import { saveToken } from '../auth';
 
 type LoginProps = {
   navigation: any;
-  onAuthSuccess?: (email: string) => void;
+  onAuthSuccess?: (token: string, email: string, id?: string | number) => void;
 };
 
 type Mode = 'login' | 'signup' | 'reset';
 
 // Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
-const API_BASE =
+// IMPORTANT: Strip trailing slashes so we never generate URLs like "//login".
+const RAW_API_BASE =
   (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
+const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
 const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
   const [mode, setMode] = useState<Mode>('login');
@@ -30,46 +33,47 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
 
   const [newPassword, setNewPassword] = useState('');
 
+  const [resetSent, setResetSent] = useState(false);
+  const [resetCode, setResetCode] = useState('');
+
   const [loading, setLoading] = useState(false);
 
   const trimmedEmail = email.trim();
 
-  const goToUpload = (authEmail: string) => {
-    if (onAuthSuccess) {
-      onAuthSuccess(authEmail);
+  const completeAuth = async (token: string, authEmail: string, id?: string | number) => {
+    try {
+      await saveToken(token);
+    } catch {
+      // If token can't be persisted, still allow session for this run.
     }
-
-    navigation.reset({
-      index: 0,
-      routes: [{ name: 'Upload' }],
-    });
+    if (onAuthSuccess) onAuthSuccess(token, authEmail, id);
   };
 
   const switchToLogin = () => {
     setMode('login');
     setPassword('');
     setNewPassword('');
+    setResetSent(false);
+    setResetCode('');
   };
 
   const switchToSignup = () => {
     setMode('signup');
     setPassword('');
     setNewPassword('');
+    setResetSent(false);
+    setResetCode('');
   };
 
   const switchToReset = () => {
     setMode('reset');
     setPassword('');
     setNewPassword('');
+    setResetSent(false);
+    setResetCode('');
   };
 
   const handleLogin = async () => {
-    if (__DEV__ && !trimmedEmail && !password) {
-      const fakeEmail = 'test@example.com';
-      goToUpload(fakeEmail);
-      return;
-    }
-
     if (!trimmedEmail || !password) {
       Alert.alert('Missing info', 'Please enter your email and password.');
       return;
@@ -98,7 +102,15 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
         return;
       }
 
-      goToUpload(trimmedEmail);
+      const token = String(data?.token || '').trim();
+      const emailFromServer = String(data?.user?.email || trimmedEmail).trim();
+      const idFromServer = data?.user?.id;
+      if (!token) {
+        Alert.alert('Login failed', 'Server did not return an auth token.');
+        return;
+      }
+
+      await completeAuth(token, emailFromServer, idFromServer);
     } catch (error) {
       console.error('Login error:', error);
       Alert.alert(
@@ -137,7 +149,15 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
         return;
       }
 
-      goToUpload(trimmedEmail);
+      const token = String(data?.token || '').trim();
+      const emailFromServer = String(data?.user?.email || trimmedEmail).trim();
+      const idFromServer = data?.user?.id;
+      if (!token) {
+        Alert.alert('Sign up failed', 'Server did not return an auth token.');
+        return;
+      }
+
+      await completeAuth(token, emailFromServer, idFromServer);
     } catch (error) {
       console.error('Signup error:', error);
       Alert.alert(
@@ -149,9 +169,48 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
     }
   };
 
+  const handleRequestReset = async () => {
+    if (!trimmedEmail) {
+      Alert.alert('Missing info', 'Please enter your email.');
+      return;
+    }
+
+    try {
+      setLoading(true);
+
+      const response = await fetch(`${API_BASE}/request-password-reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: trimmedEmail }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || data?.ok === false) {
+        Alert.alert('Reset failed', data?.error || 'Something went wrong.');
+        return;
+      }
+
+      setResetSent(true);
+
+      const devToken = String(data?.resetToken || '').trim();
+      if (devToken) {
+        setResetCode(devToken);
+        Alert.alert('Reset code (dev)', devToken);
+      } else {
+        Alert.alert('Check your email', 'If an account exists, we will send you a reset code.');
+      }
+    } catch (error) {
+      console.error('Request reset error:', error);
+      Alert.alert('Network error', 'Could not reach the server. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleResetPassword = async () => {
-    if (!trimmedEmail || !newPassword) {
-      Alert.alert('Missing info', 'Please enter your email and new password.');
+    if (!resetCode.trim() || !newPassword) {
+      Alert.alert('Missing info', 'Please enter the reset code and a new password.');
       return;
     }
 
@@ -161,32 +220,24 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
       const response = await fetch(`${API_BASE}/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmedEmail, newPassword }),
+        body: JSON.stringify({ token: resetCode.trim(), newPassword }),
       });
 
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok || data?.ok === false) {
-        const message =
-          data?.error ||
-          (response.status === 404
-            ? 'No user found with that email.'
-            : 'Something went wrong while updating your password.');
-        Alert.alert('Reset failed', message);
+        Alert.alert('Reset failed', data?.error || 'Could not update your password.');
         return;
       }
 
       Alert.alert('Password updated', 'You can now log in with your new password.');
-
-      // Keep email, clear new password, go back to login mode
+      setResetSent(false);
+      setResetCode('');
       setNewPassword('');
       setMode('login');
     } catch (error) {
       console.error('Reset password error:', error);
-      Alert.alert(
-        'Network error',
-        'Could not reach the server. Please check your connection and try again.',
-      );
+      Alert.alert('Network error', 'Could not reach the server. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -291,34 +342,81 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
         ) : (
           <>
             {/* RESET MODE */}
-            <View style={[styles.fieldGroup, { marginBottom: 16 }]}>
-              <TextInput
-                style={styles.input}
-                value={newPassword}
-                onChangeText={setNewPassword}
-                placeholder="New password"
-                secureTextEntry
-                returnKeyType="done"
-                onSubmitEditing={handleResetPassword}
-              />
-            </View>
+            {!resetSent ? (
+              <>
+                <TouchableOpacity
+                  style={[styles.button, loading && { opacity: 0.7 }]}
+                  onPress={handleRequestReset}
+                  disabled={loading}
+                >
+                  <Text style={styles.buttonText}>
+                    {loading ? 'Sending…' : 'Send reset code'}
+                  </Text>
+                </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.button, loading && { opacity: 0.7 }]}
-              onPress={handleResetPassword}
-              disabled={loading}
-            >
-              <Text style={styles.buttonText}>
-                {loading ? 'Updating…' : 'Update password'}
-              </Text>
-            </TouchableOpacity>
+                <View style={styles.resetLinksRow}>
+                  <TouchableOpacity
+                    onPress={() => setResetSent(true)}
+                    disabled={loading}
+                  >
+                    <Text style={styles.resetLink}>I already have a code</Text>
+                  </TouchableOpacity>
+                  <Text style={styles.resetLinksSeparator}>•</Text>
+                  <TouchableOpacity onPress={switchToLogin} disabled={loading}>
+                    <Text style={styles.resetLink}>Back to log in</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            ) : (
+              <>
+                <View style={[styles.fieldGroup, { marginBottom: 12 }]}>
+                  <TextInput
+                    style={styles.input}
+                    value={resetCode}
+                    onChangeText={setResetCode}
+                    placeholder="Reset code"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType="next"
+                  />
+                </View>
 
-            <View style={styles.switchRow}>
-              <Text style={styles.switchText}>Remembered your password?</Text>
-              <TouchableOpacity onPress={switchToLogin}>
-                <Text style={styles.switchLink}>Back to log in</Text>
-              </TouchableOpacity>
-            </View>
+                <View style={[styles.fieldGroup, { marginBottom: 16 }]}>
+                  <TextInput
+                    style={styles.input}
+                    value={newPassword}
+                    onChangeText={setNewPassword}
+                    placeholder="New password"
+                    secureTextEntry
+                    returnKeyType="done"
+                    onSubmitEditing={handleResetPassword}
+                  />
+                </View>
+
+                <TouchableOpacity
+                  style={[styles.button, loading && { opacity: 0.7 }]}
+                  onPress={handleResetPassword}
+                  disabled={loading}
+                >
+                  <Text style={styles.buttonText}>
+                    {loading ? 'Updating…' : 'Update password'}
+                  </Text>
+                </TouchableOpacity>
+
+                <View style={styles.resetLinksRow}>
+                  <TouchableOpacity
+                    onPress={() => setResetSent(false)}
+                    disabled={loading}
+                  >
+                    <Text style={styles.resetLink}>Back</Text>
+                  </TouchableOpacity>
+                  <Text style={styles.resetLinksSeparator}>•</Text>
+                  <TouchableOpacity onPress={switchToLogin} disabled={loading}>
+                    <Text style={styles.resetLink}>Back to log in</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
           </>
         )}
       </View>
@@ -388,6 +486,23 @@ const styles = StyleSheet.create({
   switchLink: {
     fontSize: 14,
     color: '#111111',
+    fontWeight: '500',
+  },
+  resetLinksRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+  },
+  resetLinksSeparator: {
+    marginHorizontal: 10,
+    fontSize: 14,
+    color: '#bdbdbd',
+  },
+  resetLink: {
+    fontSize: 14,
+    color: '#555555',
     fontWeight: '500',
   },
 });

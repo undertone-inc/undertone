@@ -1,25 +1,58 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
+  Text,
+  Image,
   TextInput,
   StyleSheet,
   TouchableOpacity,
   TouchableWithoutFeedback,
   Keyboard,
-  Text,
   Platform,
+  Modal,
+  Pressable,
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  Linking,
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import * as SecureStore from 'expo-secure-store';
+import Constants from 'expo-constants';
+import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { DOC_KEYS, getJson, getString, makeScopedKey, setJson } from '../localstore';
 
-const KITLOG_STORAGE_KEY = 'io_kitlog_v1';
-const CATALOG_STORAGE_KEY = 'io_catalog_v1';
+const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
+const CATALOG_STORAGE_KEY = DOC_KEYS.catalog;
+const ANALYSIS_HISTORY_KEY = DOC_KEYS.faceAnalysisHistory;
+const CHAT_HISTORY_KEY = DOC_KEYS.faceChatHistory;
+
 const EXPIRING_WINDOW_DAYS = 60;
-
 const UPCOMING_WINDOW_DAYS = 3;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Must match the selfie oval guidance in Camera.
+// Used here to crop camera captures for better undertone analysis.
+const FACE_OVAL_CENTER_Y = 0.42;
+const FACE_OVAL_RX = 0.34;
+const FACE_OVAL_RY = 0.32;
+
+// How the bar sits when keyboard is CLOSED
+// (Adds a little more breathing room above the bottom nav divider)
+const CLOSED_BOTTOM_PADDING = 28;
+
+// Extra space ABOVE the keyboard when it’s OPEN
+const KEYBOARD_GAP = 0;
+
+// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
+// IMPORTANT: Strip trailing slashes so we never generate URLs like "//analyze-face".
+const RAW_API_BASE =
+  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
+  process.env.EXPO_PUBLIC_API_BASE ??
+  'http://localhost:3000';
+const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
 function safeParseDate(value?: string): number | null {
   if (!value) return null;
@@ -52,7 +85,6 @@ function countNeedsAttentionFromRaw(raw: string | null): number {
       });
     });
 
-    // Match KitLog's "Needs attention" count (sum of the three buckets).
     return low + empty + expiring;
   } catch {
     return 0;
@@ -65,8 +97,7 @@ function safeParseCalendarDate(value?: string): number | null {
   const s = value.trim();
   if (!s) return null;
 
-  // When we store YYYY-MM-DD, parse it as a LOCAL date (not UTC) to avoid
-  // timezone shifts that can move the day earlier/later.
+  // Parse YYYY-MM-DD as LOCAL date to avoid timezone shifts.
   const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(s);
   const t = new Date(dateOnly ? `${s}T00:00:00` : s).getTime();
   return Number.isFinite(t) ? t : null;
@@ -106,31 +137,181 @@ function countUpcomingClientsFromRaw(raw: string | null): number {
   }
 }
 
+function getImageSizeAsync(uri: string): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const u = String(uri || '').trim();
+    if (!u) return resolve(null);
+
+    try {
+      Image.getSize(
+        u,
+        (width, height) => resolve({ width, height }),
+        () => resolve(null)
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function clampNum(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
 type UploadScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
+  userId?: string | number | null;
+  token?: string | null;
 };
 
-// How the bar sits when keyboard is CLOSED
-const CLOSED_BOTTOM_PADDING = 12;
+type PickedPhoto = {
+  uri: string;
+  mimeType: string;
+  fileName: string;
+  source: 'camera' | 'library';
+  width?: number;
+  height?: number;
+};
 
-// Extra space ABOVE the keyboard when it’s OPEN
-// ↓ make this smaller/bigger to tune the gap
-const KEYBOARD_GAP = 0;
+type HistoryItem = {
+  id: string;
+  createdAt: string;
+  analysis: any;
+};
 
-const Upload: React.FC<UploadScreenProps> = ({ navigation }) => {
-  const [message, setMessage] = useState('');
+type ChatRole = 'user' | 'assistant';
+
+type ChatMessage = {
+  id: string;
+  role: ChatRole;
+  text: string;
+  createdAt: string;
+};
+
+type ChatStore = Record<string, ChatMessage[]>;
+
+function makeId() {
+  return `io_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function compactList(arr: unknown, max = 10): string {
+  const a = Array.isArray(arr) ? arr : [];
+  return a
+    .map((x) => String(x || '').trim())
+    .filter(Boolean)
+    .slice(0, max)
+    .join(', ');
+}
+
+function formatAnalysisToText(analysis: any): string {
+  // Return ONLY undertone (no extra notes/recommendations).
+  const allowed = new Set(['warm', 'cool', 'neutral', 'olive']);
+  let undertone = String(analysis?.undertone || '').trim().toLowerCase();
+  if (!allowed.has(undertone)) undertone = 'neutral';
+  return `Undertone: ${undertone}`;
+}
+
+
+function formatChatTitle(item: HistoryItem): string {
+  const a = item?.analysis ?? null;
+  const undertone = String(a?.undertone || '').trim();
+
+  return undertone || 'Scan';
+}
+
+function formatChatDate(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return '';
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  } catch {
+    return '';
+  }
+}
+
+
+const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId, token }) => {
+  // Scope local data per user (stable id preferred; fall back to email).
+  const scope = useMemo(() => {
+    const stable = String(userId ?? '').trim();
+    if (stable) return stable;
+    const e = String(email ?? '').trim().toLowerCase();
+    return e || null;
+  }, [email, userId]);
+
+  const kitlogKey = useMemo(() => makeScopedKey(KITLOG_STORAGE_KEY, scope), [scope]);
+  const catalogKey = useMemo(() => makeScopedKey(CATALOG_STORAGE_KEY, scope), [scope]);
+  const historyKey = useMemo(() => makeScopedKey(ANALYSIS_HISTORY_KEY, scope), [scope]);
+  const chatKey = useMemo(() => makeScopedKey(CHAT_HISTORY_KEY, scope), [scope]);
+
+  const tokenTrimmed = String(token ?? '').trim();
+
+  // Safe-area insets can report 0 the first time a RN <Modal> is mounted.
+  // Use Constants.statusBarHeight as an immediate fallback so the “Your scans” sheet
+  // never renders too high on first open.
+  const insets = useSafeAreaInsets();
+  const statusBarHeight = Number((Constants as any)?.statusBarHeight || 0);
+  const topInsetFallback = Platform.OS === 'ios' ? statusBarHeight : 0;
+  const chatListTopPad = Math.max(insets.top, topInsetFallback) + 10;
+  // This sheet is anchored to the top (dropdown style). Bottom safe-area padding
+  // adds a big empty gap on devices with a home indicator, so keep it tight.
+  const chatListBottomPad = 12;
+
+  const scrollRef = useRef<ScrollView | null>(null);
+
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [composer, setComposer] = useState('');
+
   const [needsAttentionCount, setNeedsAttentionCount] = useState(0);
   const [upcomingClientCount, setUpcomingClientCount] = useState(0);
 
+  const [analysisId, setAnalysisId] = useState<string | null>(null);
+  const [analysis, setAnalysis] = useState<any | null>(null);
+
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [chatStore, setChatStore] = useState<ChatStore>({});
+
+  const [chatListOpen, setChatListOpen] = useState(false);
+  const [chatListQuery, setChatListQuery] = useState('');
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [chatLoading, setChatLoading] = useState(false);
+
+  const [photoPicking, setPhotoPicking] = useState(false);
+
+  // When returning from the Camera screen, it passes a `capturedPhoto` param.
+  // Consume it once and immediately trigger analysis.
+  const lastCapturedUriRef = useRef<string | null>(null);
+  useEffect(() => {
+    const captured: PickedPhoto | undefined = (route as any)?.params?.capturedPhoto;
+    const uri = String((captured as any)?.uri || '').trim();
+    if (!uri) return;
+
+    // Guard against duplicate param merges.
+    if (lastCapturedUriRef.current === uri) return;
+    lastCapturedUriRef.current = uri;
+
+    // Clear the param ASAP so it doesn't retrigger.
+    try {
+      navigation?.setParams?.({ capturedPhoto: undefined });
+    } catch {
+      // ignore
+    }
+
+    if (!analysisLoading && !chatLoading) {
+      void analyzePhoto({ ...captured, uri } as PickedPhoto);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [(route as any)?.params?.capturedPhoto]);
+
+  // Keyboard tracking so the input bar stays above it.
   useEffect(() => {
     const showEvent = Platform.OS === 'android' ? 'keyboardDidShow' : 'keyboardWillShow';
     const hideEvent = Platform.OS === 'android' ? 'keyboardDidHide' : 'keyboardWillHide';
 
     const showListener = Keyboard.addListener(showEvent, (event) => {
-      const height = event?.endCoordinates?.height ?? 0;
+      const height = (event as any)?.endCoordinates?.height ?? 0;
       setKeyboardHeight(height);
     });
 
@@ -144,13 +325,27 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation }) => {
     };
   }, []);
 
-  // Keep the counts in sync (updates when returning to this screen).
+  // Bottom tab UX: tapping the active "scan" icon should open the photo sheet.
+  useEffect(() => {
+    const unsubscribe = navigation?.addListener?.('tabPress', () => {
+      const focused = typeof navigation?.isFocused === 'function' ? navigation.isFocused() : false;
+      if (!focused) return;
+      Keyboard.dismiss();
+      void choosePhoto('camera');
+    });
+
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, [navigation, choosePhoto]);
+
+  // Load counts + history + chat store when screen focuses.
   useEffect(() => {
     let alive = true;
 
     const refresh = async () => {
       try {
-        const raw = await SecureStore.getItemAsync(KITLOG_STORAGE_KEY);
+        const raw = await getString(kitlogKey);
         const count = countNeedsAttentionFromRaw(raw);
         if (alive) setNeedsAttentionCount(count);
       } catch {
@@ -158,11 +353,37 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation }) => {
       }
 
       try {
-        const raw = await SecureStore.getItemAsync(CATALOG_STORAGE_KEY);
+        const raw = await getString(catalogKey);
         const count = countUpcomingClientsFromRaw(raw);
         if (alive) setUpcomingClientCount(count);
       } catch {
         if (alive) setUpcomingClientCount(0);
+      }
+
+      let loadedHistory: HistoryItem[] = [];
+      try {
+        const stored = await getJson<HistoryItem[]>(historyKey);
+        loadedHistory = Array.isArray(stored) ? stored : [];
+      } catch {
+        loadedHistory = [];
+      }
+      if (alive) setHistory(loadedHistory);
+
+      try {
+        const storedChat = await getJson<ChatStore>(chatKey);
+        if (alive && storedChat && typeof storedChat === 'object') setChatStore(storedChat as any);
+        if (alive && (!storedChat || typeof storedChat !== 'object')) setChatStore({});
+      } catch {
+        if (alive) setChatStore({});
+      }
+
+      // If we don't have an active analysis yet, restore the most recent.
+      if (alive && !analysisId && loadedHistory.length) {
+        const mostRecent = loadedHistory[0];
+        if (mostRecent?.id) {
+          setAnalysisId(String(mostRecent.id));
+          setAnalysis(mostRecent.analysis ?? null);
+        }
       }
     };
 
@@ -173,99 +394,711 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation }) => {
       alive = false;
       if (typeof unsubscribe === 'function') unsubscribe();
     };
-  }, [navigation]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navigation, kitlogKey, catalogKey, historyKey, chatKey]);
+
+  useEffect(() => {
+    // Auto-scroll when chat updates.
+    const t = setTimeout(() => {
+      scrollRef.current?.scrollToEnd({ animated: true });
+    }, 0);
+    return () => clearTimeout(t);
+  }, [analysisId, chatStore]);
+
+  const saveHistory = async (items: HistoryItem[]) => {
+    setHistory(items);
+    try {
+      await setJson(historyKey, items);
+    } catch {
+      // ignore
+    }
+  };
+
+  const saveChatStore = async (store: ChatStore) => {
+    setChatStore(store);
+    try {
+      await setJson(chatKey, store);
+    } catch {
+      // ignore
+    }
+  };
+
+  const getChatFor = (id: string | null): ChatMessage[] => {
+    if (!id) return [];
+    const arr = (chatStore as any)?.[id];
+    return Array.isArray(arr) ? arr : [];
+  };
+
+  const upsertChatFor = async (id: string, messages: ChatMessage[]) => {
+    const limited = messages.slice(-60);
+    const next: ChatStore = { ...(chatStore || {}) };
+    next[id] = limited;
+    await saveChatStore(next);
+  };
+
+  const activeChat = getChatFor(analysisId);
+
+  const activeChatTitle = useMemo(() => {
+    if (!analysisId) return 'Your scans';
+    const hit = history.find((h) => String(h?.id || '') === String(analysisId));
+    return hit ? formatChatTitle(hit) : 'Your scans';
+  }, [analysisId, history]);
+
+  const filteredHistory = useMemo(() => {
+    const q = String(chatListQuery || '').trim().toLowerCase();
+    if (!q) return history;
+    return history.filter((h) => {
+      const title = formatChatTitle(h).toLowerCase();
+      const date = formatChatDate(String(h?.createdAt || '')).toLowerCase();
+      return title.includes(q) || date.includes(q);
+    });
+  }, [history, chatListQuery]);
+
+  const promptOpenSettings = (title: string, message: string) => {
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Open Settings',
+        onPress: () => {
+          try {
+            void Linking.openSettings();
+          } catch {
+            // ignore
+          }
+        },
+      },
+    ]);
+  };
+
+  const requestLibrary = async (): Promise<boolean> => {
+    // iOS: if user previously denied, request may not prompt again unless they change Settings.
+    // We check current status first, then request if possible.
+    let perm = await ImagePicker.getMediaLibraryPermissionsAsync();
+    if (!perm.granted && perm.canAskAgain) {
+      perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    }
+    if (!perm.granted) {
+      promptOpenSettings('Permission needed', 'Please allow Photos access to upload a picture.');
+      return false;
+    }
+    return true;
+  };
+
+  const requestCamera = async (): Promise<boolean> => {
+    let perm = await ImagePicker.getCameraPermissionsAsync();
+    if (!perm.granted && perm.canAskAgain) {
+      perm = await ImagePicker.requestCameraPermissionsAsync();
+    }
+    if (!perm.granted) {
+      promptOpenSettings('Permission needed', 'Please allow Camera access to take a picture.');
+      return false;
+    }
+    return true;
+  };
+
+  const pickPhoto = async (source: 'camera' | 'library'): Promise<PickedPhoto | null> => {
+    if (source === 'library') {
+      const ok = await requestLibrary();
+      if (!ok) {
+        return null;
+      }
+
+      let result: ImagePicker.ImagePickerResult;
+      try {
+        // Expo SDK 54+: mediaTypes is an array of MediaType strings.
+        // https://docs.expo.dev/versions/latest/sdk/imagepicker/
+        result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ['images'],
+          allowsEditing: false,
+          quality: 0.92,
+          selectionLimit: 1,
+        });
+      } catch (e: any) {
+        Alert.alert('Upload photo failed', String(e?.message || e));
+        return null;
+      }
+
+      if (result.canceled) return null;
+      const asset = result.assets?.[0];
+      if (!asset?.uri) return null;
+
+      return {
+        uri: asset.uri,
+        fileName: asset.fileName || 'face.jpg',
+        mimeType: asset.mimeType || 'image/jpeg',
+        source,
+      };
+    }
+
+    const ok = await requestCamera();
+    if (!ok) {
+      return null;
+    }
+
+    let result: ImagePicker.ImagePickerResult;
+    try {
+      result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images'],
+        allowsEditing: false,
+        quality: 0.92,
+        cameraType: ImagePicker.CameraType.front,
+      });
+    } catch (e: any) {
+      Alert.alert('Take photo failed', String(e?.message || e));
+      return null;
+    }
+
+    if (result.canceled) return null;
+    const asset = result.assets?.[0];
+    if (!asset?.uri) return null;
+
+    return {
+      uri: asset.uri,
+      fileName: asset.fileName || 'face.jpg',
+      mimeType: asset.mimeType || 'image/jpeg',
+      source,
+      width: (asset as any)?.width,
+      height: (asset as any)?.height,
+    };
+  };
+
+  const analyzePhoto = async (picked: PickedPhoto) => {
+    if (!tokenTrimmed) {
+      Alert.alert('Not logged in', 'Please log in again.');
+      return;
+    }
+
+    setComposer('');
+    Keyboard.dismiss();
+
+    setAnalysisLoading(true);
+
+    try {
+      // Normalize inputs for Vision reliability:
+      // - Convert to JPEG (avoids HEIC/HEIF issues)
+      // - Center-crop library photos to a portrait-ish frame
+      // - Resize to a sane max width
+      let prepared: PickedPhoto = picked;
+
+      try {
+        const uriLower = String(prepared?.uri || '').toLowerCase();
+        const mtLower = String(prepared?.mimeType || '').toLowerCase();
+        const looksHeic =
+          mtLower.includes('heic') ||
+          mtLower.includes('heif') ||
+          uriLower.endsWith('.heic') ||
+          uriLower.endsWith('.heif') ||
+          uriLower.includes('heic');
+
+        const isLibrary = prepared.source === 'library';
+        const isCamera = prepared.source === 'camera';
+
+        // Use provided dimensions when available (ImagePicker often gives these).
+        // If missing, try to resolve them from the file uri.
+        let w = Number(prepared.width || 0);
+        let h = Number(prepared.height || 0);
+        if ((isLibrary || isCamera) && (!w || !h)) {
+          const size = await getImageSizeAsync(prepared.uri);
+          if (size) {
+            w = Number(size.width || 0);
+            h = Number(size.height || 0);
+          }
+        }
+
+        const actions: any[] = [];
+        const maxWidth = 1536;
+
+        // Keep track of expected output dimensions after crop so we don't resize unnecessarily.
+        let outW = w;
+        let outH = h;
+
+        // Camera captures: crop to the guided oval region (face + neck) so the model sees mostly skin.
+        // This dramatically improves reliability in cloudy/mixed lighting because background colors influence less.
+        if (isCamera && w > 0 && h > 0) {
+          const cx = w * 0.5;
+          const cy = h * FACE_OVAL_CENTER_Y;
+          const rx = w * FACE_OVAL_RX;
+          const ry = h * FACE_OVAL_RY;
+
+          // Padding: slightly wider, and *more* padding downward to keep neck in-frame.
+          const padX = rx * 0.20;
+          const padTop = ry * 0.35;
+          const padBottom = ry * 0.70;
+
+          const x0 = clampNum(Math.floor(cx - rx - padX), 0, Math.max(0, w - 2));
+          const y0 = clampNum(Math.floor(cy - ry - padTop), 0, Math.max(0, h - 2));
+          const x1 = clampNum(Math.ceil(cx + rx + padX), x0 + 1, w);
+          const y1 = clampNum(Math.ceil(cy + ry + padBottom), y0 + 1, h);
+
+          const cropW = Math.max(1, x1 - x0);
+          const cropH = Math.max(1, y1 - y0);
+          actions.push({ crop: { originX: x0, originY: y0, width: cropW, height: cropH } });
+          outW = cropW;
+          outH = cropH;
+        }
+
+        // Library photos: center-crop to a portrait-ish frame (keeps face centered without relying on overlay math).
+        if (!actions.length && isLibrary && w > 0 && h > 0) {
+          // Portrait-ish aspect ratio (width / height).
+          const targetAspect = 3 / 4;
+
+          let cropW = w;
+          let cropH = Math.round(cropW / targetAspect);
+
+          if (cropH > h) {
+            cropH = h;
+            cropW = Math.round(cropH * targetAspect);
+          }
+
+          const originX = Math.max(0, Math.round((w - cropW) / 2));
+          const originY = Math.max(0, Math.round((h - cropH) / 2));
+
+          actions.push({ crop: { originX, originY, width: cropW, height: cropH } });
+          outW = cropW;
+          outH = cropH;
+        }
+
+        // Resize down if huge (keeps uploads fast and consistent).
+        if (outW > maxWidth) {
+          actions.push({ resize: { width: maxWidth } });
+          outW = maxWidth;
+          outH = 0;
+        }
+
+        // Re-encode camera images to consistent JPEG (helps Vision), and also re-encode when converting HEIC/HEIF or applying transforms.
+        // Re-encode to consistent JPEG whenever:
+        // - the source is HEIC/HEIF
+        // - we applied transforms (crop/resize)
+        // - the source is a camera capture (normalizes device differences)
+        if (looksHeic || actions.length > 0 || isCamera) {
+          const result = await ImageManipulator.manipulateAsync(
+            prepared.uri,
+            actions.length ? actions : [],
+            { compress: 0.95, format: ImageManipulator.SaveFormat.JPEG }
+          );
+
+          if (result?.uri) {
+            prepared = {
+              ...prepared,
+              uri: result.uri,
+              mimeType: 'image/jpeg',
+              fileName: prepared.fileName?.replace(/\.(heic|heif)$/i, '.jpg') || 'face.jpg',
+            };
+          }
+        } else if (mtLower && !mtLower.includes('jpeg') && !mtLower.includes('jpg')) {
+          // Some platforms report odd mime types even for jpg; force to jpeg.
+          prepared = { ...prepared, mimeType: 'image/jpeg' };
+        }
+      } catch {
+        // ignore preprocessing errors; we can still try sending the original
+      }
+
+      const form = new FormData();
+      form.append('image', {
+        uri: prepared.uri,
+        name: prepared.fileName,
+        type: prepared.mimeType,
+      } as any);
+      form.append('source', prepared.source);
+
+      const res = await fetch(`${API_BASE}/analyze-face`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokenTrimmed}`,
+          accept: 'application/json',
+        } as any,
+        body: form as any,
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+
+      const id = String(data?.analysisId || makeId());
+      const nextAnalysis = data?.analysisStable ?? data?.analysis ?? null;
+
+      setAnalysisId(id);
+      setAnalysis(nextAnalysis);
+
+      // Save analysis history (local)
+      const nextHistory: HistoryItem[] = [
+        { id, createdAt: new Date().toISOString(), analysis: nextAnalysis },
+        ...history,
+      ].slice(0, 20);
+      await saveHistory(nextHistory);
+
+      // Seed chat with: "photo uploaded" + the structured analysis summary
+      const seedMsgs: ChatMessage[] = [
+        {
+          id: makeId(),
+          role: 'user',
+          text: 'Uploaded face photo.',
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: makeId(),
+          role: 'assistant',
+          text: formatAnalysisToText(nextAnalysis),
+          createdAt: new Date().toISOString(),
+        },
+      ];
+      await upsertChatFor(id, seedMsgs);
+    } catch (e: any) {
+      Alert.alert('Analysis failed', String(e?.message || e));
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
+
+  async function choosePhoto(source: 'camera' | 'library') {
+    if (analysisLoading || photoPicking) return;
+    Keyboard.dismiss();
+
+    if (source === 'camera') {
+      // Web builds: prefer ImagePicker's camera (more reliable than expo-camera web capture).
+      if (Platform.OS === 'web') {
+        setPhotoPicking(true);
+        try {
+          const picked = await pickPhoto('camera');
+          if (!picked) return;
+          await analyzePhoto(picked);
+        } finally {
+          setPhotoPicking(false);
+        }
+        return;
+      }
+
+      try {
+        navigation.navigate('Camera');
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    setPhotoPicking(true);
+    try {
+      const picked = await pickPhoto('library');
+      if (!picked) return;
+
+      await analyzePhoto(picked);
+    } finally {
+      setPhotoPicking(false);
+    }
+  }
+
+
+  const openChatList = () => {
+    Keyboard.dismiss();
+    setChatListOpen(true);
+  };
+
+  const startNewChat = () => {
+    setChatListOpen(false);
+    setChatListQuery('');
+    Keyboard.dismiss();
+    setTimeout(() => { void choosePhoto('camera'); }, 0);
+  };
+
+  const selectChat = (item: HistoryItem) => {
+    const id = String(item?.id || '').trim();
+    if (!id) return;
+    setAnalysisId(id);
+    setAnalysis(item?.analysis ?? null);
+    setChatListOpen(false);
+  };
+
+  const deleteChat = (id: string) => {
+    Alert.alert('Delete scan?', 'This will remove the scan and its messages from this device.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          const nextHistory = history.filter((h) => String(h?.id) !== String(id));
+          await saveHistory(nextHistory);
+
+          const nextStore: ChatStore = { ...(chatStore || {}) };
+          delete (nextStore as any)[id];
+          await saveChatStore(nextStore);
+
+          if (String(analysisId) === String(id)) {
+            const fallback = nextHistory[0] || null;
+            setAnalysisId(fallback?.id ? String(fallback.id) : null);
+            setAnalysis(fallback?.analysis ?? null);
+          }
+        },
+      },
+    ]);
+  };
+
+
+  const sendChat = async (text: string) => {
+    const msg = String(text || '').trim();
+    if (!msg) return;
+
+    if (!analysisId) {
+      Alert.alert('Scan a face photo first', 'Tap “Scan” to upload or take a face photo.');
+      return;
+    }
+    if (!tokenTrimmed) {
+      Alert.alert('Not logged in', 'Please log in again.');
+      return;
+    }
+    if (chatLoading) return;
+
+    setComposer('');
+
+    const userMsg: ChatMessage = {
+      id: makeId(),
+      role: 'user',
+      text: msg,
+      createdAt: new Date().toISOString(),
+    };
+
+    const nextMsgs = [...activeChat, userMsg];
+    await upsertChatFor(analysisId, nextMsgs);
+
+    setChatLoading(true);
+    try {
+      const historyForServer = nextMsgs
+        .slice(-14)
+        .slice(0, -1)
+        .map((m) => ({ role: m.role, content: m.text }));
+
+      const res = await fetch(`${API_BASE}/analysis-chat`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokenTrimmed}`,
+          accept: 'application/json',
+          'Content-Type': 'application/json',
+        } as any,
+        body: JSON.stringify({
+          analysisId,
+          message: msg,
+          history: historyForServer,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+
+      const replyText = String(data?.reply || '').trim();
+      if (!replyText) throw new Error('Empty reply');
+
+      const assistantMsg: ChatMessage = {
+        id: makeId(),
+        role: 'assistant',
+        text: replyText,
+        createdAt: new Date().toISOString(),
+      };
+
+      await upsertChatFor(analysisId, [...nextMsgs, assistantMsg]);
+    } catch (e: any) {
+      Alert.alert('Chat failed', String(e?.message || e));
+    } finally {
+      setChatLoading(false);
+    }
+  };
 
   const handleSubmit = () => {
-    const trimmed = message.trim();
-
+    const trimmed = composer.trim();
     if (!trimmed) {
       Keyboard.dismiss();
       return;
     }
-
-    // TODO: send message to backend
-    console.log('Message:', trimmed);
+    void sendChat(trimmed);
   };
 
   // Use different bottom padding depending on keyboard state
-  const bottomPadding =
-    keyboardHeight > 0
-      ? keyboardHeight + KEYBOARD_GAP
-      : CLOSED_BOTTOM_PADDING;
+  const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-      <SafeAreaView style={styles.safeArea} edges={["top", "left", "right"]}>
-        <View
-          style={[
-            styles.container,
-            { paddingBottom: bottomPadding },
-          ]}
-        >
-          {/* Top info row */}
+      <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+        <View style={[styles.container, { paddingBottom: bottomPadding }]}>
+          {/* Top bar: Your scans + scan */}
           <View style={styles.topBar}>
-            <View style={styles.infoPill}>
-              <TouchableOpacity
-                style={styles.catalogRow}
-                activeOpacity={0.8}
-                onPress={() => navigation.navigate('Catalog')}
-                accessibilityRole="button"
-              >
-                <Text style={styles.catalogLabel}>Catalog:</Text>
-                <Text style={styles.catalogCount}>{upcomingClientCount}</Text>
-              </TouchableOpacity>
-
-              <View style={styles.verticalDivider} />
-
-              {/* Plan row */}
-              <TouchableOpacity
-                style={styles.planRow}
-                activeOpacity={0.8}
-                onPress={() => navigation.navigate('KitLog')}
-                accessibilityRole="button"
-              >
-                <Text style={styles.planLabel}>Your kit:</Text>
-                <Text style={styles.planValue}>{needsAttentionCount}</Text>
-              </TouchableOpacity>
-            </View>
+            <TouchableOpacity
+              style={styles.chatSearchPill}
+              activeOpacity={0.85}
+              onPress={openChatList}
+              accessibilityRole="button"
+            >
+              <Ionicons name="search-outline" size={16} color="#111827" style={{ marginRight: 8 }} />
+              <Text style={styles.chatSearchText} numberOfLines={1}>
+                {activeChatTitle}
+              </Text>
+              <Ionicons name="chevron-down" size={16} color="#9ca3af" style={styles.chatSearchChevron} />
+            </TouchableOpacity>
 
             <TouchableOpacity
-              style={styles.accountChip}
-              onPress={() => navigation.navigate('Account')}
+              style={styles.uploadChip}
+              onPress={startNewChat}
+              accessibilityRole="button"
             >
-              <Text style={styles.accountChipText}>Account</Text>
+              <Text style={styles.uploadChipText}>Scan</Text>
             </TouchableOpacity>
           </View>
 
-          {/* Middle area (chat / uploads) */}
-          <View style={styles.chatArea} />
+          {/* Chat area */}
+          <View style={styles.chatArea}>
+            <ScrollView
+              ref={(r) => {
+                scrollRef.current = r;
+              }}
+              contentContainerStyle={styles.chatScroll}
+              keyboardShouldPersistTaps="handled"
+            >
+              {activeChat.length ? (
+                activeChat.map((m) => (
+                  <View
+                    key={m.id}
+                    style={[
+                      styles.chatBubble,
+                      m.role === 'user' ? styles.chatBubbleUser : styles.chatBubbleAssistant,
+                    ]}
+                  >
+                    <Text style={[styles.chatBubbleText, m.role === 'user' && styles.chatBubbleTextUser]}>
+                      {m.text}
+                    </Text>
+                  </View>
+                ))
+              ): null}
+
+              {analysisLoading ? (
+                <View style={[styles.chatBubble, styles.chatBubbleAssistant, styles.loadingBubble]}>
+                  <ActivityIndicator />
+                  <Text style={[styles.chatBubbleText, { marginLeft: 10 }]}>Analyzing…</Text>
+                </View>
+              ) : null}
+            </ScrollView>
+          </View>
 
           {/* Bottom input bar */}
           <View style={styles.inputBar}>
             <View style={styles.inputContainer}>
               <TextInput
                 style={styles.textInput}
-                value={message}
-                onChangeText={setMessage}
-                placeholder="Message"
+                value={composer}
+                onChangeText={setComposer}
+                placeholder="Take a photo..."
                 placeholderTextColor="#999999"
                 returnKeyType="send"
                 onSubmitEditing={handleSubmit}
                 blurOnSubmit={false}
+                editable={!chatLoading && !analysisLoading}
               />
 
-              {/* Single camera icon button */}
+              {/* Camera icon: opens the face scan camera */}
               <TouchableOpacity
-                style={styles.iconButton}
+                style={[styles.iconButton, (analysisLoading || chatLoading || photoPicking) && { opacity: 0.6 }]}
+                disabled={analysisLoading || chatLoading || photoPicking}
                 onPress={() => {
                   Keyboard.dismiss();
-                  console.log('Open camera');
+                  void choosePhoto('camera');
+                }}
+                onLongPress={() => {
+                  Keyboard.dismiss();
+                  void choosePhoto('library');
                 }}
               >
                 <Ionicons name="camera-outline" size={18} color="#ffffff" />
               </TouchableOpacity>
             </View>
           </View>
+          {/* Your scans list */}
+          <Modal
+            visible={chatListOpen}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setChatListOpen(false)}
+          >
+            <View style={styles.chatListOverlay}>
+              <Pressable style={styles.chatListBackdrop} onPress={() => setChatListOpen(false)} />
+
+              <View
+                style={[
+                  styles.chatListSheet,
+                  { paddingTop: chatListTopPad, paddingBottom: chatListBottomPad },
+                ]}
+              >
+                <View style={styles.chatListHeader}>
+                  <Text style={styles.chatListTitle}>Your scans</Text>
+                  <TouchableOpacity
+                    style={styles.chatListClose}
+                    onPress={() => setChatListOpen(false)}
+                    accessibilityRole="button"
+                  >
+                    <Ionicons name="close" size={20} color="#111827" />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.chatListSearchRow}>
+                  <Ionicons name="search-outline" size={16} color="#6b7280" style={{ marginRight: 8 }} />
+                  <TextInput
+                    style={styles.chatListSearchInput}
+                    value={chatListQuery}
+                    onChangeText={setChatListQuery}
+                    placeholder="Search scans"
+                    placeholderTextColor="#9ca3af"
+                    autoCorrect={false}
+                    autoCapitalize="none"
+                    returnKeyType="search"
+                  />
+                </View>
+
+                <ScrollView contentContainerStyle={styles.chatListScroll} keyboardShouldPersistTaps="handled">
+                  {filteredHistory.length ? (
+                    filteredHistory.map((h) => {
+                      const id = String(h?.id || '');
+                      const selected = String(analysisId) === id;
+                      const title = formatChatTitle(h);
+                      const date = formatChatDate(String(h?.createdAt || ''));
+
+                      return (
+                        <Pressable
+                          key={id}
+                          style={[styles.chatListItem, selected && styles.chatListItemSelected]}
+                          onPress={() => selectChat(h)}
+                        >
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.chatListItemTitle} numberOfLines={1}>
+                              {title}
+                            </Text>
+                            {date ? (
+                              <Text style={styles.chatListItemSub} numberOfLines={1}>
+                                {date}
+                              </Text>
+                            ) : null}
+                          </View>
+
+                          <Pressable
+                            style={styles.chatListTrash}
+                            onPress={(e) => {
+                              (e as any)?.stopPropagation?.();
+                              deleteChat(id);
+                            }}
+                            accessibilityRole="button"
+                          >
+                            <Ionicons name="trash-outline" size={18} color="#6b7280" />
+                          </Pressable>
+                        </Pressable>
+                      );
+                    })
+                  ) : (
+                    <View style={styles.chatListEmpty}>
+                      <Text style={styles.chatListEmptyText}>No scans yet.</Text>
+                      <Text style={styles.chatListEmptySub}>Tap “Scan” to upload a face photo.</Text>
+                    </View>
+                  )}
+                </ScrollView>
+              </View>
+            </View>
+          </Modal>
         </View>
       </SafeAreaView>
     </TouchableWithoutFeedback>
@@ -291,7 +1124,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
   },
-  infoPill: {
+  chatSearchPill: {
     flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
@@ -299,53 +1132,19 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e5e7eb',
     backgroundColor: '#ffffff',
-    paddingLeft: 25,
-    paddingRight: 10,
+    paddingLeft: 12,
+    paddingRight: 12,
     minHeight: 38,
   },
-  catalogRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  catalogLabel: {
+  chatSearchText: {
     color: '#111827',
     fontSize: 13,
     fontWeight: '400',
   },
-  catalogCount: {
-    color: '#111827',
-    fontSize: 13,
-    fontWeight: '400',
-    marginLeft: 20,
-    transform: [{ translateX: 1 }]
+  chatSearchChevron: {
+    marginLeft: 'auto',
   },
-  verticalDivider: {
-    width: 1,
-    height: 16,
-    backgroundColor: '#e5e7eb',
-    marginHorizontal: 22,
-    transform: [{ translateX: 2 }]
-  },
-  planRow: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingLeft: 0,
-  },
-  planLabel: {
-    color: '#111827',
-    fontSize: 13,
-    fontWeight: '400',
-    transform: [{ translateX: 3 }]
-  },
-  planValue: {
-    color: '#111827',
-    fontSize: 13,
-    fontWeight: '400',
-    marginRight: 16,
-  },
-  accountChip: {
+  uploadChip: {
     marginLeft: 10,
     paddingHorizontal: 16,
     borderRadius: 18,
@@ -356,14 +1155,48 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     minHeight: 38,
   },
-  accountChipText: {
+  uploadChipText: {
     color: '#111827',
     fontSize: 13,
     fontWeight: '600',
   },
 
+  // Chat
   chatArea: {
     flex: 1,
+  },
+  chatScroll: {
+    paddingTop: 6,
+    paddingBottom: 8,
+    gap: 10,
+  },
+  chatBubble: {
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    maxWidth: '92%',
+  },
+  chatBubbleAssistant: {
+    backgroundColor: '#f9fafb',
+    alignSelf: 'flex-start',
+  },
+  chatBubbleUser: {
+    backgroundColor: '#111111',
+    borderColor: '#111111',
+    alignSelf: 'flex-end',
+  },
+  chatBubbleText: {
+    color: '#111827',
+    lineHeight: 18,
+  },
+  chatBubbleTextUser: {
+    color: '#ffffff',
+  },
+  loadingBubble: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
 
   // Bottom input
@@ -386,6 +1219,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     paddingVertical: 8,
     paddingRight: 8,
+    color: '#111827',
   },
   iconButton: {
     marginLeft: 4,
@@ -395,6 +1229,166 @@ const styles = StyleSheet.create({
     backgroundColor: '#111111',
     alignItems: 'center',
     justifyContent: 'center',
+  },// Photo sheet
+
+  // Chat list
+  chatListOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+    justifyContent: 'flex-start',
+  },
+  chatListBackdrop: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  chatListSheet: {
+    backgroundColor: '#ffffff',
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 18,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 12,
+  },
+  chatListHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 10,
+  },
+  chatListTitle: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#111827',
+  },
+  chatListClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  chatListSearchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 12,
+  },
+  chatListSearchInput: {
+    flex: 1,
+    fontSize: 13,
+    color: '#111827',
+    paddingVertical: 0,
+  },
+  chatListScroll: {
+    paddingBottom: 12,
+    gap: 10,
+  },
+  chatListItem: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  chatListItemSelected: {
+    borderColor: '#111111',
+  },
+  chatListItemTitle: {
+    color: '#111827',
+    fontWeight: '500',
+    marginBottom: 2,
+  },
+  chatListItemSub: {
+    color: '#6b7280',
+    fontSize: 12,
+  },
+  chatListTrash: {
+    marginLeft: 10,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  chatListEmpty: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingVertical: 18,
+    paddingHorizontal: 14,
+  },
+  chatListEmptyText: {
+    color: '#111827',
+    fontWeight: '500',
+    marginBottom: 6,
+  },
+  chatListEmptySub: {
+    color: '#6b7280',
+  },
+sheetModalRoot: {
+  flex: 1,
+  justifyContent: 'flex-end',
+},
+sheetBackdrop: {
+  position: 'absolute',
+  top: 0,
+  right: 0,
+  bottom: 0,
+  left: 0,
+  backgroundColor: 'rgba(0,0,0,0.35)',
+},
+sheet: {
+    zIndex: 1,
+    backgroundColor: '#ffffff',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 47,
+  },
+  sheetTips: {
+    paddingVertical: 8,
+  },
+  sheetTipText: {
+    color: '#374151',
+    lineHeight: 18,
+    marginBottom: 2,
+  },
+  sheetAction: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginTop: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  sheetActionText: {
+    color: '#111827',
+    fontWeight: '700',
+  },
+  sheetCancel: {
+    borderColor: '#111111',
+  },
+  sheetCancelText: {
+    color: '#111111',
+    fontWeight: '800',
+    textAlign: 'center',
+    width: '100%',
   },
 });
 

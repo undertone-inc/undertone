@@ -16,14 +16,14 @@ import {
   Linking,
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import * as SecureStore from 'expo-secure-store';
+import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
 import Constants from 'expo-constants';
 
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-const KITLOG_STORAGE_KEY = 'io_kitlog_v1';
+const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
 
-type PlanTier = 'free' | 'plus' | 'pro';
+type PlanTier = 'free' | 'pro';
 
 const PLAN_CONFIG: Record<
   PlanTier,
@@ -33,11 +33,6 @@ const PLAN_CONFIG: Record<
     label: 'Free',
     priceLabel: '$0',
     features: ['5 uploads / mo', '5 clients / mo', '5 categories', '10 items'],
-  },
-  plus: {
-    label: 'Plus',
-    priceLabel: '$19 / mo',
-    features: ['20 uploads / mo', '20 clients / mo', '10 categories', '100 items'],
   },
   pro: {
     label: 'Pro',
@@ -56,11 +51,10 @@ const PLAN_LIMITS: Record<
   { uploads: number; clients: number; categories: number; items: number }
 > = {
   free: { uploads: 5, clients: 5, categories: 5, items: 10 },
-  plus: { uploads: 20, clients: 20, categories: 10, items: 100 },
   pro: { uploads: 100, clients: 100, categories: Infinity, items: Infinity },
 };
 
-const PLAN_RANK: Record<PlanTier, number> = { free: 0, plus: 1, pro: 2 };
+const PLAN_RANK: Record<PlanTier, number> = { free: 0, pro: 1 };
 
 function formatPercent(used: number, limit: number): string {
   const safeUsed = Number.isFinite(used) && used > 0 ? used : 0;
@@ -78,10 +72,10 @@ function formatPercent(used: number, limit: number): string {
 function normalizePlanTier(value: any): PlanTier {
   const v = String(value ?? '').trim().toLowerCase();
   if (v === 'pro') return 'pro';
-  if (v === 'plus') return 'plus';
   if (v === 'free') return 'free';
   if (v.includes('pro')) return 'pro';
-  if (v.includes('plus')) return 'plus';
+  // "Plus" is no longer offered; treat it as "Pro" so legacy values don't break UI.
+  if (v === 'plus' || v.includes('plus')) return 'pro';
   return 'free';
 }
 
@@ -113,17 +107,20 @@ type AccountScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
+  userId?: string | number | null;
+  token?: string | null;
   onEmailUpdated?: (nextEmail: string) => void;
   onLogout?: () => void;
 };
 
 // How the bar sits when keyboard is CLOSED
-const CLOSED_BOTTOM_PADDING = 12;
+// (Adds a little more breathing room above the bottom nav divider)
+const CLOSED_BOTTOM_PADDING = 28;
 
 // Extra space ABOVE the keyboard when it is OPEN
 const KEYBOARD_GAP = 0;
 
-type ModalKind = null | 'name' | 'email' | 'password' | 'plan';
+type ModalKind = null | 'name' | 'email' | 'password' | 'plan' | 'delete';
 
 async function readJsonSafe(res: Response): Promise<any> {
   const text = await res.text();
@@ -135,10 +132,12 @@ async function readJsonSafe(res: Response): Promise<any> {
   }
 }
 
-async function postJson(path: string, body: any): Promise<any> {
+async function postJson(path: string, body: any, token?: string): Promise<any> {
+  const headers: any = { 'Content-Type': 'application/json' };
+  if (token) headers.authorization = `Bearer ${token}`;
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body ?? {}),
   });
 
@@ -150,8 +149,10 @@ async function postJson(path: string, body: any): Promise<any> {
   return data;
 }
 
-async function getJson(path: string): Promise<any> {
-  const res = await fetch(`${API_BASE}${path}`, { method: 'GET' });
+async function getJson(path: string, token?: string): Promise<any> {
+  const headers: any = {};
+  if (token) headers.authorization = `Bearer ${token}`;
+  const res = await fetch(`${API_BASE}${path}`, { method: 'GET', headers });
   const data = await readJsonSafe(res);
   if (!res.ok || data?.ok === false) {
     const msg = data?.error || data?.message || `HTTP ${res.status}`;
@@ -160,8 +161,12 @@ async function getJson(path: string): Promise<any> {
   return data;
 }
 
-const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdated, onLogout }) => {
+const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, token, onEmailUpdated, onLogout }) => {
+  // Scope local data per user (stable id preferred; fall back to email).
+  const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
+  const kitlogKey = makeScopedKey(KITLOG_STORAGE_KEY, scope);
   const emailTrimmed = (email || '').trim();
+  const tokenTrimmed = (token || '').trim();
 
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [emailUpdatesEnabled, setEmailUpdatesEnabled] = useState(true);
@@ -209,10 +214,12 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   }, []);
 
   const refreshAccount = async () => {
-    if (!emailTrimmed) return;
+    if (!tokenTrimmed) return;
 
     try {
-      const data = await getJson(`/me?email=${encodeURIComponent(emailTrimmed)}`);
+      const data = await getJson(`/me`, tokenTrimmed);
+      const nextEmail = String(data?.user?.email || '').trim();
+      if (nextEmail && onEmailUpdated) onEmailUpdated(nextEmail);
       const nextName = String(data?.user?.accountName || '').trim();
       setAccountName(nextName);
       const nextTier = normalizePlanTier(
@@ -285,7 +292,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
 
     const refresh = async () => {
       try {
-        const raw = await SecureStore.getItemAsync(KITLOG_STORAGE_KEY);
+        const raw = await getString(kitlogKey);
         const usage = countKitUsageFromRaw(raw);
         if (alive) {
           setKitCategoryCount(usage.categories);
@@ -310,26 +317,48 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
       alive = false;
       if (typeof unsubscribe === 'function') unsubscribe();
     };
-  }, [navigation, emailTrimmed]);
+  }, [navigation, tokenTrimmed, kitlogKey]);
 
-  const handleLogoutPress = () => {
+  const handleLogoutPress = async () => {
     Keyboard.dismiss();
+
+    // Best-effort revoke token server-side.
+    try {
+      if (tokenTrimmed) await postJson('/logout', {}, tokenTrimmed);
+    } catch {
+      // ignore
+    }
 
     if (onLogout) {
       onLogout();
     }
+  };
 
-    navigation.reset({
-      index: 0,
-      routes: [{ name: 'Login' }],
-    });
+  const deleteAccount = async () => {
+    if (!requireAuthOrAlert()) return;
+
+    try {
+      setSaving(true);
+
+      await postJson('/delete-account', {}, tokenTrimmed);
+
+      closeModal();
+      Alert.alert('Account deleted', 'Your account has been deleted.');
+
+      if (onLogout) {
+        onLogout();
+      }
+    } catch (e: any) {
+      Alert.alert('Could not delete account', String(e?.message || e));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleDeleteAccountPress = () => {
     Keyboard.dismiss();
-
-    console.log('Delete account pressed');
-    // TODO: wire to your delete-account flow
+    if (!requireAuthOrAlert()) return;
+    setActiveModal('delete');
   };
 
   const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
@@ -347,7 +376,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   const showEmailRow = matchesQuery('Email', 'Update email');
   const showPassword = matchesQuery('Password', 'Update password');
 
-  const showPlan = matchesQuery('Plan', 'Free', 'Plus', 'Pro', 'Upgrade', 'Manage');
+  const showPlan = matchesQuery('Plan', 'Free', 'Pro', 'Upgrade', 'Manage');
   const showBilling = matchesQuery('Billing', 'Update billing');
 
   const showUploadUsage = matchesQuery('Usage', 'Upload usage', 'Upload', 'Uploads');
@@ -371,8 +400,8 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   const anyRowsVisible =
     profileRowsVisible || planRowsVisible || catalogRowsVisible || commRowsVisible || actionRowsVisible;
 
-  const requireEmailOrAlert = () => {
-    if (emailTrimmed) return true;
+  const requireAuthOrAlert = () => {
+    if (tokenTrimmed) return true;
     Alert.alert('Not logged in', 'Please log in to manage your account settings.');
     return false;
   };
@@ -389,14 +418,14 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   };
 
   const openNameModal = () => {
-    if (!requireEmailOrAlert()) return;
+    if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
     setDraftName(accountName || '');
     setActiveModal('name');
   };
 
   const openEmailModal = () => {
-    if (!requireEmailOrAlert()) return;
+    if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
     setDraftEmail(emailTrimmed);
     setEmailPassword('');
@@ -404,7 +433,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   };
 
   const openPasswordModal = () => {
-    if (!requireEmailOrAlert()) return;
+    if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
     setCurrentPassword('');
     setNewPassword('');
@@ -413,7 +442,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   };
 
   const openPlanModal = () => {
-    if (!requireEmailOrAlert()) return;
+    if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
     setActiveModal('plan');
   };
@@ -427,7 +456,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
 
     try {
       setSaving(true);
-      await postJson('/update-account-name', { email: emailTrimmed, accountName: name });
+      await postJson('/update-account-name', { accountName: name }, tokenTrimmed);
       setAccountName(name);
       closeModal();
       Alert.alert('Saved', 'Your account name has been updated.');
@@ -451,11 +480,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
 
     try {
       setSaving(true);
-      const data = await postJson('/update-email', {
-        email: emailTrimmed,
-        password: emailPassword,
-        newEmail: nextEmail,
-      });
+      const data = await postJson('/update-email', { password: emailPassword, newEmail: nextEmail }, tokenTrimmed);
 
       const updated = String(data?.user?.email || nextEmail).trim();
       if (onEmailUpdated) onEmailUpdated(updated);
@@ -482,11 +507,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
 
     try {
       setSaving(true);
-      await postJson('/update-password', {
-        email: emailTrimmed,
-        currentPassword,
-        newPassword,
-      });
+      await postJson('/update-password', { currentPassword, newPassword }, tokenTrimmed);
 
       closeModal();
       Alert.alert('Password updated', 'Your password has been updated.');
@@ -498,7 +519,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   };
 
   const startSubscription = async (targetTier: PlanTier) => {
-    if (!requireEmailOrAlert()) return;
+    if (!requireAuthOrAlert()) return;
 
     try {
       setSaving(true);
@@ -506,10 +527,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
 
       // Server should create a checkout session (Stripe / IAP bridge) and return a URL.
       // Example response: { ok: true, url: "https://..." }
-      const data = await postJson('/start-subscription', {
-        email: emailTrimmed,
-        plan: targetTier,
-      });
+      const data = await postJson('/start-subscription', { plan: targetTier }, tokenTrimmed);
 
       const url = String(data?.url || data?.checkoutUrl || data?.checkout_url || '').trim();
 
@@ -538,7 +556,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
     if (!activeModal) return null;
 
     if (activeModal === 'plan') {
-      const tiers: PlanTier[] = ['plus', 'pro'];
+      const tiers: PlanTier[] = ['pro'];
 
       return (
         <Modal
@@ -616,7 +634,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
                           ))}
                         </View>
 
-                                                <View style={styles.planActionRow}>
+                        <View style={styles.planActionRow}>
                           {isCurrent ? (
                             <View style={styles.planPillMuted}>
                               <Text style={styles.planPillMutedText}>Current plan</Text>
@@ -635,9 +653,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
                               {isPending ? (
                                 <ActivityIndicator size="small" color="#ffffff" />
                               ) : (
-                                <Text style={styles.planButtonPrimaryText}>
-                                  {tier === 'plus' ? 'Get Plus' : 'Get Pro'}
-                                </Text>
+                                <Text style={styles.planButtonPrimaryText}>Get Pro</Text>
                               )}
                             </TouchableOpacity>
                           ) : (
@@ -676,6 +692,79 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
                     disabled={saving}
                   >
                     <Text style={styles.planButtonSecondaryText}>Refresh</Text>
+                  </TouchableOpacity>
+                </View>
+              </Pressable>
+            </KeyboardAvoidingView>
+          </Pressable>
+        </Modal>
+      );
+    }
+
+    if (activeModal === 'delete') {
+      return (
+        <Modal
+          visible
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!saving) closeModal();
+          }}
+        >
+          <Pressable
+            style={styles.modalBackdrop}
+            onPress={() => {
+              if (!saving) closeModal();
+            }}
+          >
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+              style={styles.modalCenter}
+            >
+              <Pressable style={styles.modalCard} onPress={() => {}}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Delete account</Text>
+                  <TouchableOpacity
+                    onPress={closeModal}
+                    activeOpacity={0.85}
+                    style={styles.modalClose}
+                    accessibilityRole="button"
+                    accessibilityLabel="Close"
+                    disabled={saving}
+                  >
+                    <Ionicons name="close" size={20} color="#6b7280" />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.modalWarningText}>
+                  This will permanently delete your account and remove your server data. This can’t be undone.
+                </Text>
+
+                <View style={styles.modalButtons}>
+                  <TouchableOpacity
+                    style={[styles.modalButton, styles.modalButtonSecondary]}
+                    onPress={closeModal}
+                    activeOpacity={0.85}
+                    disabled={saving}
+                  >
+                    <Text style={styles.modalButtonSecondaryText}>Cancel</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.modalButton,
+                      styles.modalButtonDanger,
+                      saving && { opacity: 0.55 },
+                    ]}
+                    onPress={deleteAccount}
+                    activeOpacity={0.85}
+                    disabled={saving}
+                  >
+                    {saving ? (
+                      <ActivityIndicator size="small" color="#ffffff" />
+                    ) : (
+                      <Text style={styles.modalButtonDangerText}>Delete</Text>
+                    )}
                   </TouchableOpacity>
                 </View>
               </Pressable>
@@ -855,8 +944,8 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
   };
 
   const nameValue = accountName.trim().length > 0 ? accountName.trim() : 'Not set';
-  const emailValue = emailTrimmed || 'Not set';
-  const planValue = emailTrimmed ? PLAN_CONFIG[planTier].label : 'Not set';
+  const emailValue = tokenTrimmed ? (emailTrimmed || 'Loading…') : 'Not set';
+  const planValue = tokenTrimmed ? PLAN_CONFIG[planTier].label : 'Not set';
   const planActionLabel = planTier === 'pro' ? 'Manage' : 'Upgrade';
 
   const limits = PLAN_LIMITS[planTier];
@@ -1009,7 +1098,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
                           <Text style={styles.rowLabel}>Plan</Text>
                           <View style={styles.rowRight}>
                             <Text style={styles.rowValue}>{planValue}</Text>
-                            {emailTrimmed ? (
+                            {tokenTrimmed ? (
                               <TouchableOpacity
                                 style={styles.chip}
                                 onPress={openPlanModal}
@@ -1044,7 +1133,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, onEmailUpdat
                     <View style={styles.group}>
                       {showUploadUsage && (
                         <View style={styles.row}>
-                          <Text style={styles.rowLabel}>Usage</Text>
+                          <Text style={styles.rowLabel}>Uploads</Text>
                           <Text style={styles.rowValue}>{usagePercentValue}</Text>
                         </View>
                       )}
@@ -1422,6 +1511,11 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#6b7280',
   },
+  modalWarningText: {
+    fontSize: 12,
+    color: '#6b7280',
+    lineHeight: 16,
+  },
   modalButtons: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
@@ -1449,6 +1543,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#111827',
   },
   modalButtonPrimaryText: {
+    fontSize: 13,
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  modalButtonDanger: {
+    backgroundColor: '#b91c1c',
+  },
+  modalButtonDangerText: {
     fontSize: 13,
     color: '#ffffff',
     fontWeight: '600',

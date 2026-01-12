@@ -25,6 +25,7 @@ const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const multer = require("multer");
+const jpeg = require("jpeg-js");
 
 // Load server env vars from .env.server (preferred).
 // Falls back to .env for backwards compatibility.
@@ -48,9 +49,10 @@ const RESET_TTL_MINUTES = Number(process.env.RESET_TTL_MINUTES || 30);
 
 // OpenAI (server-side only)
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
-const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4o").trim();
+const OPENAI_MODEL_FALLBACK = String(process.env.OPENAI_MODEL_FALLBACK || "").trim();
 const OPENAI_IMAGE_DETAIL = String(process.env.OPENAI_IMAGE_DETAIL || "high").trim();
-const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 650);
+const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 120);
 
 // Upload constraints
 const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8);
@@ -209,12 +211,155 @@ async function getUploadsUsedThisMonth(userId) {
   }
 }
 
-const PLAN_UPLOAD_LIMITS = { free: 100, pro: 100 };
+// Plan limits
+//
+// For local testing, you can bump these in .env.server without touching code:
+//   UPLOAD_LIMIT_FREE=9999
+//   UPLOAD_LIMIT_PRO=9999
+const PLAN_UPLOAD_LIMITS = {
+  free: Number(process.env.UPLOAD_LIMIT_FREE || 5),
+  pro: Number(process.env.UPLOAD_LIMIT_PRO || 100),
+};
+
+// Dev/testing escape hatch
+// Set DISABLE_UPLOAD_LIMITS=true to bypass monthly caps (useful while testing).
+const DISABLE_UPLOAD_LIMITS = (() => {
+  const v = String(process.env.DISABLE_UPLOAD_LIMITS || '').trim().toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes';
+})();
 function uploadLimitForPlan(planTier) {
   const t = String(planTier || "free").toLowerCase();
   // "Plus" is no longer offered; treat it as "Pro" so legacy values don't reduce limits.
   if (t === "plus") return PLAN_UPLOAD_LIMITS.pro;
   return PLAN_UPLOAD_LIMITS[t] ?? PLAN_UPLOAD_LIMITS.free;
+}
+
+
+// --- Stability helpers (to make results consistent across scans) ---
+// We compute a "stable" result by taking a weighted vote across the last N scans,
+// down-weighting low-confidence / poor-lighting / filtered photos.
+
+async function getRecentFaceAnalyses(userId, limit = 10) {
+  try {
+    const { rows } = await pool.query(
+      "SELECT analysis_json FROM face_analyses WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+      [userId, limit]
+    );
+    return (rows || []).map((r) => r.analysis_json).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function clamp01(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function stabilityWeight(a) {
+  try {
+    // If we only have undertone (minimal schema), treat all scans equally.
+    const u = String(a?.undertone || "").toLowerCase();
+    if (!["warm", "cool", "neutral", "olive"].includes(u)) return 0;
+
+    const pq = a?.photo_quality;
+    const confNum = Number(a?.confidence);
+    const hasPq = pq && typeof pq === "object";
+    const hasConf = Number.isFinite(confNum);
+
+    if (!hasPq && !hasConf) return 1;
+
+    // Otherwise, preserve the original weighting behavior.
+    const pqObj = hasPq ? pq : {};
+    if (pqObj?.face_visible === false) return 0;
+
+    const conf = clamp01((hasConf ? confNum : 50) / 100);
+
+    const lighting = String(pqObj?.lighting || "unknown").toLowerCase();
+    const wb = String(pqObj?.white_balance || "unknown").toLowerCase();
+    const filtered = pqObj?.filters_detected === true;
+
+    const lightingW = lighting === "good" ? 1 : lighting === "ok" ? 0.7 : lighting === "poor" ? 0.3 : 0.5;
+    const wbW = wb === "neutral" ? 1 : wb === "warm" || wb === "cool" ? 0.75 : 0.6;
+    const filterW = filtered ? 0.4 : 1;
+
+    return conf * lightingW * wbW * filterW;
+  } catch {
+    return 0;
+  }
+}
+
+
+function weightedVote(analyses, key, allowedValues) {
+  const sums = Object.fromEntries(allowedValues.map((v) => [v, 0]));
+  let total = 0;
+  let counted = 0;
+
+  for (const a of analyses || []) {
+    const w = stabilityWeight(a);
+    if (w <= 0) continue;
+
+    const v = String(a?.[key] || "unknown").toLowerCase();
+    if (!allowedValues.includes(v)) continue;
+
+    sums[v] += w;
+    total += w;
+    counted += 1;
+  }
+
+  let best = "unknown";
+  let bestW = 0;
+  for (const v of allowedValues) {
+    if (sums[v] > bestW) {
+      bestW = sums[v];
+      best = v;
+    }
+  }
+
+  const support = total > 0 ? bestW / total : 0;
+  return { value: best, support, totalWeight: total, counted };
+}
+
+function pickBestRepresentative(analyses, stableUndertone) {
+  let best = null;
+  let bestW = -1;
+
+  for (const a of analyses || []) {
+    const w = stabilityWeight(a);
+    if (w <= bestW) continue;
+
+    const u = String(a?.undertone || "unknown").toLowerCase();
+
+    // Prefer a scan that matches the stable undertone when available.
+    const matches = stableUndertone ? u === stableUndertone : true;
+    if (!matches) continue;
+
+    best = a;
+    bestW = w;
+  }
+
+  // Fallback: highest-weight scan overall
+  if (!best) {
+    for (const a of analyses || []) {
+      const w = stabilityWeight(a);
+      if (w > bestW) {
+        best = a;
+        bestW = w;
+      }
+    }
+  }
+
+  return best || null;
+}
+
+function computeStability(analyses) {
+  const undertoneVote = weightedVote(analyses, "undertone", ["warm", "cool", "neutral", "olive"]);
+  return {
+    counted: undertoneVote.counted,
+    undertone: undertoneVote.value,
+    undertoneSupport: undertoneVote.support,
+  };
 }
 
 // Root
@@ -447,6 +592,7 @@ app.get("/me", authRequired, async (req, res) => {
       },
       limits: {
         uploadsPerMonth: limit,
+        uploadLimitsDisabled: DISABLE_UPLOAD_LIMITS,
       },
     });
   } catch (e) {
@@ -580,79 +726,308 @@ function extractOutputText(resp) {
   return { text: String(text || "").trim(), refusal: String(refusal || "").trim() };
 }
 
-async function callOpenAIForAnalysis({ dataUrl }) {
+// --- Analysis normalization (guarantee we always return a usable undertone) ---
+const ALLOWED_UNDERTONES = ["warm", "cool", "neutral", "olive"];
+const ALLOWED_LIGHTING = ["good", "ok", "poor", "unknown"];
+const ALLOWED_WB = ["neutral", "warm", "cool", "unknown"];
+
+function clampInt(n, min, max, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(v)));
+}
+
+function toStr(x) {
+  if (typeof x === "string") return x;
+  if (x === null || x === undefined) return "";
+  return String(x);
+}
+
+function cleanList(value, max = 10) {
+  const a = Array.isArray(value) ? value : [];
+  return a
+    .map((x) => toStr(x).trim())
+    .filter(Boolean)
+    .slice(0, max);
+}
+
+function normalizeUndertoneValue(v) {
+  const s = toStr(v).trim().toLowerCase();
+  if (!s) return null;
+  if (ALLOWED_UNDERTONES.includes(s)) return s;
+
+  // Common/legacy values or freeform strings.
+  if (s === "unknown" || s === "unsure" || s === "uncertain" || s === "n/a") return "neutral";
+  if (s.includes("warm")) return "warm";
+  if (s.includes("cool")) return "cool";
+  if (s.includes("neutral")) return "neutral";
+  if (s.includes("olive") || s.includes("green")) return "olive";
+
+  return null;
+}
+
+function defaultRecommendationsForUndertone(undertone) {
+  const u = normalizeUndertoneValue(undertone) || "neutral";
+
+  switch (u) {
+    case "warm":
+      return {
+        best_neutrals: ["ivory", "cream", "warm beige", "camel", "warm taupe", "chocolate"],
+        accent_colors: ["coral", "peach", "tomato red", "terracotta", "mustard", "warm teal"],
+        metals: ["gold", "rose gold", "bronze"],
+        makeup_tips: [
+          "Choose foundation/skin tints labeled warm or golden (test on jawline).",
+          "Try peach/coral blushes.",
+          "Warm browns, bronzes, and olive tones tend to flatter.",
+        ],
+        avoid: ["icy pastels", "blue-based pinks", "very ashy grays"],
+      };
+
+    case "cool":
+      return {
+        best_neutrals: ["soft white", "cool beige", "cool taupe", "charcoal", "navy", "black"],
+        accent_colors: ["berry", "fuchsia", "true red", "cobalt", "emerald", "icy lavender"],
+        metals: ["silver", "platinum", "white gold"],
+        makeup_tips: [
+          "Choose foundation/skin tints labeled cool, rosy, or neutral-cool (test on jawline).",
+          "Try rosy/berry blushes.",
+          "Cool browns, plums, and gray-taupes often work well.",
+        ],
+        avoid: ["very orange tones", "yellow-heavy beige", "mustard-heavy palettes"],
+      };
+
+    case "olive":
+      return {
+        best_neutrals: ["off-white", "stone", "deep taupe", "charcoal", "navy", "espresso"],
+        accent_colors: ["emerald", "teal", "burgundy", "plum", "brick", "muted gold"],
+        metals: ["gold", "bronze", "antique silver"],
+        makeup_tips: [
+          "Try foundations labeled olive/neutral-olive when available.",
+          "Muted, earthy tones often look more seamless than very pastel shades.",
+          "If redness shows, a subtle green-corrector can help (lightly).",
+        ],
+        avoid: ["very pink/blue-based pastels", "chalky light beiges", "neon brights"],
+      };
+
+    default:
+      return {
+        best_neutrals: ["soft white", "taupe", "medium gray", "navy", "mushroom", "soft black"],
+        accent_colors: ["dusty rose", "teal", "true red", "sage", "berry", "peach"],
+        metals: ["silver", "gold"],
+        makeup_tips: [
+          "Neutral undertones can often wear both warm and cool shades—test on the jawline in daylight.",
+          "Choose blush/lip colors that are muted rather than very neon.",
+        ],
+        avoid: ["extreme orange", "extreme icy pastels"],
+      };
+  }
+}
+
+function softenQualityNotes(s) {
+  let t = toStr(s).trim();
+  if (!t) return "";
+  // Remove overly absolute language. We always return a best-effort undertone.
+  t = t.replace(/not\s+sufficient[^.]*\.?/gi, "Best-effort estimate; brighter, neutral daylight improves accuracy.");
+  t = t.replace(/cannot\s+determine[^.]*\.?/gi, "Best-effort estimate; a clearer, evenly lit photo improves accuracy.");
+  t = t.replace(/seasonal\s+(family|analysis|color|palette)/gi, "undertone");
+  return t.trim();
+}
+
+function sanitizeAnalysis(raw) {
+  // Minimal response: ONLY undertone.
+  // Always normalize into one of: warm | cool | neutral | olive
+  const undertoneNorm = normalizeUndertoneValue(raw?.undertone);
+  const undertone = undertoneNorm || "neutral";
+  return { undertone };
+}
+
+
+function guessUndertoneFromJpeg(jpegBuffer) {
+  try {
+    const decoded = jpeg.decode(jpegBuffer, { useTArray: true });
+    const w = decoded?.width || 0;
+    const h = decoded?.height || 0;
+    const data = decoded?.data;
+    if (!w || !h || !data) return null;
+
+    const cx = w * 0.5;
+    const cy = h * 0.42;
+    const rx = w * 0.34;
+    const ry = h * 0.32;
+    const step = Math.max(2, Math.min(8, Math.floor(Math.min(w, h) / 180)));
+
+    const x0 = Math.max(0, Math.floor(cx - rx));
+    const x1 = Math.min(w - 1, Math.ceil(cx + rx));
+    const y0 = Math.max(0, Math.floor(cy - ry));
+    const y1 = Math.min(h - 1, Math.ceil(cy + ry));
+
+    const lumOf = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const isSkin = (r, g, b) => {
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const y = 0.299 * r + 0.587 * g + 0.114 * b;
+      const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+      const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+
+      const rgbRule =
+        r > 45 &&
+        g > 18 &&
+        b > 12 &&
+        r >= g &&
+        r >= b &&
+        Math.abs(r - g) > 8 &&
+        max - min > 12;
+
+      const ycbcrRule = y > 28 && cb >= 75 && cb <= 145 && cr >= 132 && cr <= 190;
+      return rgbRule || ycbcrRule;
+    };
+
+    let count = 0;
+    let skinCount = 0;
+    let sumLum = 0;
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let dark = 0;
+    let bright = 0;
+
+    for (let y = y0; y <= y1; y += step) {
+      const yn = (y - cy) / (ry || 1);
+      for (let x = x0; x <= x1; x += step) {
+        const xn = (x - cx) / (rx || 1);
+        if (xn * xn + yn * yn > 1) continue;
+
+        const i = (y * w + x) * 4;
+        const r = data[i] || 0;
+        const g = data[i + 1] || 0;
+        const b = data[i + 2] || 0;
+        const lum = lumOf(r, g, b);
+
+        count++;
+        sumLum += lum;
+        if (lum < 35) dark++;
+        if (lum > 225) bright++;
+
+        if (isSkin(r, g, b)) {
+          skinCount++;
+          sumR += r;
+          sumG += g;
+          sumB += b;
+        }
+      }
+    }
+
+    if (count < 200 || skinCount < 120) {
+      return {
+        undertone: "neutral",
+        confidence: 18,
+        lighting: "unknown",
+        white_balance: "unknown",
+        face_visible: skinCount >= 60,
+        notes: "Best-effort estimate; ensure your face and neck are centered and evenly lit.",
+      };
+    }
+
+    const meanLum = sumLum / Math.max(1, count);
+    const darkRatio = dark / Math.max(1, count);
+    const brightRatio = bright / Math.max(1, count);
+
+    const avgR = sumR / Math.max(1, skinCount);
+    const avgG = sumG / Math.max(1, skinCount);
+    const avgB = sumB / Math.max(1, skinCount);
+
+    const denom = meanLum + 1;
+    const castRB = (avgR - avgB) / denom; // +warm, -cool
+    const greenDelta = (avgG - (avgR + avgB) / 2) / denom;
+
+    let undertone = "neutral";
+    // Olive: green-ish bias without a strong red-blue bias.
+    if (greenDelta > 0.06 && Math.abs(castRB) < 0.11) undertone = "olive";
+    else if (castRB > 0.09) undertone = "warm";
+    else if (castRB < -0.09) undertone = "cool";
+    else undertone = "neutral";
+
+    const lighting = meanLum < 55 || darkRatio > 0.35 || brightRatio > 0.35 ? "poor" : meanLum < 70 || darkRatio > 0.25 ? "ok" : "good";
+    const white_balance = Math.abs(castRB) < 0.06 ? "neutral" : castRB > 0 ? "warm" : "cool";
+
+    // Conservative confidence: this is a fallback heuristic.
+    const signal = Math.max(Math.abs(castRB), Math.abs(greenDelta));
+    let confidence = 18 + Math.round(Math.min(22, (signal / 0.18) * 22));
+    confidence = clampInt(confidence, 10, 40, 20);
+
+    return {
+      undertone,
+      confidence,
+      lighting,
+      white_balance,
+      face_visible: true,
+      notes: "Best-effort estimate; brighter, neutral daylight improves accuracy.",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildFallbackAnalysisFromImage({ jpegBuffer, reason }) {
+  const guess = guessUndertoneFromJpeg(jpegBuffer);
+  const undertone = guess?.undertone || "neutral";
+  // Minimal response to clients: only undertone.
+  return sanitizeAnalysis({ undertone });
+}
+
+
+async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUrlCrop = null, modelOverride = null }) {
   if (!OPENAI_API_KEY) {
     throw new Error("Missing OPENAI_API_KEY on server");
   }
 
-  // Structured Outputs schema
+  // Structured Outputs schema (undertone-only)
   const schema = {
     type: "object",
     additionalProperties: false,
     properties: {
-      undertone: { type: "string", enum: ["warm", "cool", "neutral", "olive", "unknown"] },
-      season_family: { type: "string", enum: ["spring", "summer", "autumn", "winter", "unknown"] },
-      season_subtype: { type: "string" },
-      confidence: { type: "integer" },
-      reasoning_summary: { type: "string" },
-      photo_quality: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          lighting: { type: "string", enum: ["good", "ok", "poor", "unknown"] },
-          white_balance: { type: "string", enum: ["neutral", "warm", "cool", "unknown"] },
-          face_visible: { type: "boolean" },
-          filters_detected: { type: "boolean" },
-          notes: { type: "string" },
-        },
-        required: ["lighting", "white_balance", "face_visible", "filters_detected", "notes"],
-      },
-      recommendations: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          best_neutrals: { type: "array", items: { type: "string" } },
-          accent_colors: { type: "array", items: { type: "string" } },
-          metals: { type: "array", items: { type: "string" } },
-          makeup_tips: { type: "array", items: { type: "string" } },
-          hair_color_notes: { type: "array", items: { type: "string" } },
-          avoid: { type: "array", items: { type: "string" } },
-        },
-        required: ["best_neutrals", "accent_colors", "metals", "makeup_tips", "hair_color_notes", "avoid"],
-      },
-      disclaimer: { type: "string" },
+      undertone: { type: "string", enum: ["warm", "cool", "neutral", "olive"] },
     },
-    required: [
-      "undertone",
-      "season_family",
-      "season_subtype",
-      "confidence",
-      "reasoning_summary",
-      "photo_quality",
-      "recommendations",
-      "disclaimer",
-    ],
+    required: ["undertone"],
   };
 
+  const systemPrompt =
+    "You are a color-analysis assistant. Your ONLY task is to estimate skin undertone (warm/cool/neutral/olive) from a face photo. " +
+    "Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, or health. " +
+    "Do NOT guess race/ethnicity, age, or other sensitive attributes. " +
+    "CRITICAL: You MUST always choose exactly one undertone from the allowed list. Never output 'unknown' and never say you cannot determine undertone. " +
+    "If uncertain between warm and cool, choose neutral. " +
+    "Cloudy daylight is acceptable (often neutral) and is NOT a reason to avoid an undertone classification. " +
+    "Do NOT mention seasonal color analysis, seasonal families, or seasons. " +
+    "Return JSON that matches the provided schema.";
+
+  const userText =
+    "Determine the person's skin undertone (warm/cool/neutral/olive). " +
+    "If multiple images are provided: the first is the original, the second is a mild white-balanced version (reduces color-cast), and an optional third is a tighter crop of the face/neck. " +
+    "Use all provided images to estimate undertone as it would appear in neutral daylight.";
+
+  const content = [
+    { type: "input_text", text: userText },
+    { type: "input_image", image_url: dataUrl, detail: OPENAI_IMAGE_DETAIL },
+  ];
+  if (dataUrlNormalized) {
+    content.push({ type: "input_image", image_url: dataUrlNormalized, detail: OPENAI_IMAGE_DETAIL });
+  }
+  if (dataUrlCrop) {
+    content.push({ type: "input_image", image_url: dataUrlCrop, detail: OPENAI_IMAGE_DETAIL });
+  }
+
   const payload = {
-    model: OPENAI_MODEL,
+    model: modelOverride || OPENAI_MODEL,
     temperature: 0,
     input: [
       {
         role: "system",
-        content:
-          "You are a color-analysis assistant. You estimate skin undertone and seasonal color palette from a face photo. " +
-          "Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, or health. " +
-          "Do NOT guess race/ethnicity or age. " +
-          "If lighting is poor, heavily filtered, or the face is not clearly visible, set undertone=unknown and season_family=unknown. " +
-          "Return JSON that matches the provided schema.",
+        content: systemPrompt,
       },
       {
         role: "user",
-        content: [
-          { type: "input_text", text: "Analyze this face photo and return undertone + season + practical style suggestions." },
-          { type: "input_image", image_url: dataUrl, detail: OPENAI_IMAGE_DETAIL },
-        ],
+        content,
       },
     ],
     max_output_tokens: OPENAI_MAX_OUTPUT_TOKENS,
@@ -695,6 +1070,139 @@ async function callOpenAIForAnalysis({ dataUrl }) {
   return parsed;
 }
 
+function mildWhiteBalanceJpeg(jpegBuffer) {
+  try {
+    const decoded = jpeg.decode(jpegBuffer, { useTArray: true });
+    const w = decoded?.width || 0;
+    const h = decoded?.height || 0;
+    const data = decoded?.data;
+    if (!w || !h || !data) return null;
+
+    // Sample bright, near-neutral pixels to estimate the scene's white point.
+    const step = Math.max(1, Math.floor(Math.min(w, h) / 260));
+
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let count = 0;
+
+    const lumOf = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+    for (let y = 0; y < h; y += step) {
+      for (let x = 0; x < w; x += step) {
+        const i = (y * w + x) * 4;
+        const r = data[i] || 0;
+        const g = data[i + 1] || 0;
+        const b = data[i + 2] || 0;
+
+        const lum = lumOf(r, g, b);
+        if (lum < 180 || lum > 250) continue;
+
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        if (max >= 252 || min <= 6) continue;
+        if (max - min > 18) continue;
+
+        sumR += r;
+        sumG += g;
+        sumB += b;
+        count++;
+      }
+    }
+
+    // Fallback: if we couldn't find enough near-neutral highlights, use a broader set.
+    if (count < 120) {
+      sumR = 0;
+      sumG = 0;
+      sumB = 0;
+      count = 0;
+
+      for (let y = Math.floor(h * 0.15); y < Math.floor(h * 0.85); y += step) {
+        for (let x = Math.floor(w * 0.15); x < Math.floor(w * 0.85); x += step) {
+          const i = (y * w + x) * 4;
+          const r = data[i] || 0;
+          const g = data[i + 1] || 0;
+          const b = data[i + 2] || 0;
+
+          const lum = lumOf(r, g, b);
+          if (lum < 60 || lum > 220) continue;
+
+          sumR += r;
+          sumG += g;
+          sumB += b;
+          count++;
+        }
+      }
+    }
+
+    if (count < 60) return null;
+
+    const avgR = sumR / count;
+    const avgG = sumG / count;
+    const avgB = sumB / count;
+    const target = (avgR + avgG + avgB) / 3;
+
+    let scaleR = target / (avgR || 1);
+    let scaleG = target / (avgG || 1);
+    let scaleB = target / (avgB || 1);
+
+    // Clamp + soften (mild correction so we reduce lighting cast without nuking undertone).
+    const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+    scaleR = clamp(scaleR, 0.85, 1.15);
+    scaleG = clamp(scaleG, 0.85, 1.15);
+    scaleB = clamp(scaleB, 0.85, 1.15);
+
+    const strength = 0.65;
+    scaleR = 1 + (scaleR - 1) * strength;
+    scaleG = 1 + (scaleG - 1) * strength;
+    scaleB = 1 + (scaleB - 1) * strength;
+
+    const out = Buffer.from(data);
+    for (let i = 0; i < out.length; i += 4) {
+      out[i] = Math.max(0, Math.min(255, Math.round((out[i] || 0) * scaleR)));
+      out[i + 1] = Math.max(0, Math.min(255, Math.round((out[i + 1] || 0) * scaleG)));
+      out[i + 2] = Math.max(0, Math.min(255, Math.round((out[i + 2] || 0) * scaleB)));
+      // alpha stays
+    }
+
+    const enc = jpeg.encode({ data: out, width: w, height: h }, 90);
+    return enc?.data || null;
+  } catch {
+    return null;
+  }
+}
+
+function centerCropJpeg(jpegBuffer) {
+  try {
+    const decoded = jpeg.decode(jpegBuffer, { useTArray: true });
+    const w = decoded?.width || 0;
+    const h = decoded?.height || 0;
+    const data = decoded?.data;
+    if (!w || !h || !data) return null;
+
+    // A safe, device-agnostic crop that keeps the face + neck without relying on UI overlay math.
+    const cropW = Math.max(1, Math.floor(w * 0.76));
+    const cropH = Math.max(1, Math.floor(h * 0.88));
+
+    const originX = Math.max(0, Math.floor((w - cropW) / 2));
+    const originY = Math.max(0, Math.min(h - cropH, Math.floor(h * 0.06)));
+
+    const out = Buffer.allocUnsafe(cropW * cropH * 4);
+
+    for (let y = 0; y < cropH; y++) {
+      const srcStart = ((originY + y) * w + originX) * 4;
+      const srcEnd = srcStart + cropW * 4;
+      const dstStart = y * cropW * 4;
+      out.set(data.subarray(srcStart, srcEnd), dstStart);
+    }
+
+    const enc = jpeg.encode({ data: out, width: cropW, height: cropH }, 90);
+    return enc?.data || null;
+  } catch {
+    return null;
+  }
+}
+
 async function insertFaceAnalysisRow({ userId, sha256, source, analysis }) {
   try {
     const { rows } = await pool.query(
@@ -718,8 +1226,8 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
 
     const used = await getUploadsUsedThisMonth(userId);
     const limit = uploadLimitForPlan("free");
-    if (used >= limit) {
-      return res.status(402).json({ ok: false, error: "Monthly upload limit reached" });
+    if (!DISABLE_UPLOAD_LIMITS && used >= limit) {
+      return res.status(402).json({ ok: false, error: "Monthly upload limit reached", used, limit });
     }
 
     const file = req.file;
@@ -730,15 +1238,89 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${mime};base64,${b64}`;
 
-    const analysis = await callOpenAIForAnalysis({ dataUrl });
+    // Optional: mild white-balance normalization (JPEG only). This helps reduce lighting color-cast
+    // so undertone can be inferred more consistently.
+    let dataUrlNormalized = null;
+    try {
+      const mt = String(mime || "").toLowerCase();
+      if (mt.includes("jpeg") || mt.includes("jpg")) {
+        const wbBuf = mildWhiteBalanceJpeg(file.buffer);
+        if (wbBuf) {
+          const b64n = Buffer.from(wbBuf).toString("base64");
+          dataUrlNormalized = `data:${mime};base64,${b64n}`;
+        }
+      }
+    } catch {
+      dataUrlNormalized = null;
+    }
+
+    
+    // Optional: tighter, safe crop (JPEG only). This helps the model focus on face/neck.
+    let dataUrlCrop = null;
+    try {
+      const mt = String(mime || "").toLowerCase();
+      if (mt.includes("jpeg") || mt.includes("jpg")) {
+        const cropBuf = centerCropJpeg(file.buffer);
+        if (cropBuf) {
+          const b64c = Buffer.from(cropBuf).toString("base64");
+          dataUrlCrop = `data:${mime};base64,${b64c}`;
+        }
+      }
+    } catch {
+      dataUrlCrop = null;
+    }
+
+    // 1) Primary model attempt
+    let analysis = null;
+    try {
+      analysis = await callOpenAIForAnalysis({ dataUrl, dataUrlNormalized, dataUrlCrop });
+      analysis = sanitizeAnalysis(analysis);
+    } catch (e) {
+      // Don't fail the entire request – we'll fall back to a best-effort heuristic.
+      console.error("OpenAI analysis failed:", e);
+      analysis = null;
+    }
+
+    // 2) Optional upgrade pass (if configured): re-run with a stronger model only when the primary call fails.
+    if (OPENAI_MODEL_FALLBACK && analysis === null) {
+      try {
+        const upgraded = await callOpenAIForAnalysis({
+          dataUrl,
+          dataUrlNormalized,
+          dataUrlCrop,
+          modelOverride: OPENAI_MODEL_FALLBACK,
+        });
+        analysis = sanitizeAnalysis(upgraded);
+      } catch {
+        // ignore fallback model failures
+      }
+    }
+
+    // 3) Hard fallback: always return a usable result (undertone never "unknown").
+    if (!analysis) {
+      analysis = buildFallbackAnalysisFromImage({ jpegBuffer: file.buffer, reason: "fallback" });
+    }
+
 
     const source = String(req.body?.source || "").trim();
     const analysisId = await insertFaceAnalysisRow({ userId, sha256: sha, source, analysis });
+
+    const recent = await getRecentFaceAnalyses(userId, 10);
+    const combined = [analysis, ...(recent || [])].slice(0, 10);
+    const stability = computeStability(combined);
+
+    // Prefer a stable representative once we have a few scans that agree.
+    const analysisStable =
+      stability.counted >= 3 && stability.undertoneSupport >= 0.6
+        ? pickBestRepresentative(combined, stability.undertone)
+        : null;
 
     return res.json({
       ok: true,
       analysisId,
       analysis,
+      analysisStable,
+      stability,
       usage: { uploadsThisMonth: used + 1 },
       limits: { uploadsPerMonth: limit },
     });

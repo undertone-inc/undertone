@@ -27,10 +27,18 @@
       "favicon": "./assets/favicon.png"
     },
     "extra": {
-      "EXPO_PUBLIC_API_BASE": "http://localhost:3000"
+      "EXPO_PUBLIC_API_BASE": "https://undertone.onrender.com"
     },
     "plugins": [
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-sqlite",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Undertone to access your photos so you can analyze your undertone.",
+          "cameraPermission": "Allow Undertone to use your camera so you can take a photo for undertone analysis."
+        }
+      ]
     ]
   }
 }

@@ -15,11 +15,11 @@ import {
   Dimensions,
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import * as SecureStore from 'expo-secure-store';
+import { DOC_KEYS, getJson, getString, makeScopedKey, setString } from '../localstore';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-const STORAGE_KEY = 'io_catalog_v1';
-const KITLOG_STORAGE_KEY = 'io_kitlog_v1';
+const STORAGE_KEY = DOC_KEYS.catalog;
+const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
 
 // Keep enough room to show most/all categories without scrolling,
 // but still scroll safely if the list grows.
@@ -42,8 +42,8 @@ const DEFAULT_KITLOG_CATEGORIES = [
 const FALLBACK_CATEGORY_NAME = 'Base';
 
 // How the bottom bars sit when the keyboard is CLOSED
-// (match spacing on KitLog)
-const CLOSED_BOTTOM_PADDING = 12;
+// (Adds a little more breathing room above the bottom nav divider)
+const CLOSED_BOTTOM_PADDING = 28;
 
 // Extra space ABOVE the keyboard when it’s OPEN
 const KEYBOARD_GAP = 0;
@@ -94,6 +94,7 @@ type CatalogScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
+  userId?: string | number | null;
 };
 
 function uid(prefix: string) {
@@ -331,7 +332,11 @@ function normalizeData(input: any): CatalogData {
   }
 }
 
-const Catalog: React.FC<CatalogScreenProps> = ({ navigation }) => {
+const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) => {
+  // Scope local data per user (stable id preferred; fall back to email).
+  const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
+  const catalogKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
+  const kitlogKey = useMemo(() => makeScopedKey(KITLOG_STORAGE_KEY, scope), [scope]);
   const [hydrated, setHydrated] = useState(false);
   const [data, setData] = useState<CatalogData>({ version: 1, clients: [] });
   const persistTimer = useRef<any>(null);
@@ -362,12 +367,12 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation }) => {
       showSub.remove();
       hideSub.remove();
     };
-  }, []);
+  }, [catalogKey]);
 
   async function refreshKitlogCategories() {
     try {
-      const raw = await SecureStore.getItemAsync(KITLOG_STORAGE_KEY);
-      if (!raw) {
+      const parsed = await getJson<any>(kitlogKey);
+      if (!parsed) {
         setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
         setNewProductCategory((prev) => {
           if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
@@ -376,8 +381,6 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation }) => {
         });
         return;
       }
-
-      const parsed = JSON.parse(raw);
       const catsRaw = Array.isArray(parsed?.categories) ? parsed.categories : [];
       const names = catsRaw
         .map((c: any) => (typeof c?.name === 'string' ? c.name.trim() : ''))
@@ -422,14 +425,14 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation }) => {
       alive = false;
       if (typeof unsub === 'function') unsub();
     };
-  }, [navigation]);
+  }, [navigation, kitlogKey]);
 
   // Load catalog
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync(STORAGE_KEY);
+        const raw = await getString(catalogKey);
         const parsed = raw ? normalizeData(JSON.parse(raw)) : EMPTY_CATALOG;
         if (alive) {
           setData(parsed);
@@ -445,23 +448,19 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation }) => {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [catalogKey]);
 
   // Persist catalog (debounced)
   useEffect(() => {
     if (!hydrated) return;
     if (persistTimer.current) clearTimeout(persistTimer.current);
-    persistTimer.current = setTimeout(async () => {
-      try {
-        await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(data));
-      } catch {
-        // ignore
-      }
+    persistTimer.current = setTimeout(() => {
+      setString(catalogKey, JSON.stringify(data)).catch(() => {});
     }, 250);
     return () => {
       if (persistTimer.current) clearTimeout(persistTimer.current);
     };
-  }, [data, hydrated]);
+  }, [data, hydrated, catalogKey]);
 
   const now = new Date();
   const todayUtcStart = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
