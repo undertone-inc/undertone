@@ -217,7 +217,7 @@ async function getUploadsUsedThisMonth(userId) {
 //   UPLOAD_LIMIT_FREE=9999
 //   UPLOAD_LIMIT_PRO=9999
 const PLAN_UPLOAD_LIMITS = {
-  free: Number(process.env.UPLOAD_LIMIT_FREE || 5),
+  free: Number(process.env.UPLOAD_LIMIT_FREE || 100),
   pro: Number(process.env.UPLOAD_LIMIT_PRO || 100),
 };
 
