@@ -203,8 +203,21 @@ function compactList(arr: unknown, max = 10): string {
     .join(', ');
 }
 
+function displayUndertone(raw: unknown): string {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return '';
+  // Normalize legacy value.
+  if (s === 'olive') return 'Neutral';
+  // Title-case dash-delimited labels.
+  return s
+    .split('-')
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join('-');
+}
+
 function formatAnalysisToText(analysis: any): string {
-  const undertone = String(analysis?.undertone || 'unknown');
+  const undertone = displayUndertone(analysis?.undertone) || 'Unknown';
   const confidence = Number(analysis?.confidence ?? 0);
 
   const bestNeutrals = compactList(analysis?.recommendations?.best_neutrals);
@@ -269,7 +282,7 @@ function formatAnalysisToText(analysis: any): string {
 
 function formatChatTitle(item: HistoryItem): string {
   const a = item?.analysis ?? null;
-  const undertone = String(a?.undertone || '').trim();
+  const undertone = displayUndertone(a?.undertone);
 
   return undertone || 'Scan';
 }

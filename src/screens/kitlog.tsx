@@ -64,7 +64,9 @@ type HomeAttentionMode = 'low' | 'empty' | 'expiring';
 
 const TONE_OPTIONS = [
   { key: 'cool', label: 'Cool' },
+  { key: 'neutral-cool', label: 'Neutral-Cool' },
   { key: 'neutral', label: 'Neutral' },
+  { key: 'neutral-warm', label: 'Neutral-Warm' },
   { key: 'warm', label: 'Warm' },
 ] as const;
 

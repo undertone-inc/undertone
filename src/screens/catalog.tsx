@@ -61,7 +61,10 @@ const MODAL_CLOSED_BOTTOM_PADDING = 56;
 const MODAL_KEYBOARD_GAP = 12;
 
 type Season4 = 'spring' | 'summer' | 'autumn' | 'winter';
-type Undertone = 'cool' | 'warm' | 'neutral' | 'olive' | 'unknown';
+// 5-class undertone output:
+//   cool | neutral-cool | neutral | neutral-warm | warm
+// (Legacy values like "olive" are treated as neutral when loading older data.)
+type Undertone = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm' | 'unknown';
 
 // Category is driven by KitLog (dynamic), so store it as a string (category name).
 type PlanCategory = string;
@@ -117,9 +120,10 @@ function seasonLabel(s: Season4 | null): string {
 
 function undertoneLabel(u: Undertone): string {
   if (u === 'cool') return 'Cool';
+  if (u === 'neutral-cool') return 'Neutral-Cool';
   if (u === 'warm') return 'Warm';
   if (u === 'neutral') return 'Neutral';
-  if (u === 'olive') return 'Olive';
+  if (u === 'neutral-warm') return 'Neutral-Warm';
   return '—';
 }
 
@@ -285,9 +289,15 @@ function normalizeData(input: any): CatalogData {
         const id = typeof c.id === 'string' ? c.id : uid('client');
         const displayName = typeof c.displayName === 'string' ? c.displayName : '';
         const undertone: Undertone =
-          c.undertone === 'cool' || c.undertone === 'warm' || c.undertone === 'neutral' || c.undertone === 'olive'
+          c.undertone === 'cool' ||
+          c.undertone === 'neutral-cool' ||
+          c.undertone === 'neutral' ||
+          c.undertone === 'neutral-warm' ||
+          c.undertone === 'warm'
             ? c.undertone
-            : 'unknown';
+            : c.undertone === 'olive'
+              ? 'neutral'
+              : 'unknown';
         const season: Season4 | null =
           c.season === 'spring' || c.season === 'summer' || c.season === 'autumn' || c.season === 'winter'
             ? c.season
@@ -932,7 +942,7 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
 
                     <Text style={styles.fieldLabel}>Undertone</Text>
                     <View style={styles.pillRow}>
-                      {(['cool', 'warm', 'neutral', 'olive'] as Undertone[]).map((u) => {
+                      {(['cool', 'neutral-cool', 'neutral', 'neutral-warm', 'warm'] as Undertone[]).map((u) => {
                         const on = (draft?.undertone ?? 'unknown') === u;
                         return (
                           <TouchableOpacity

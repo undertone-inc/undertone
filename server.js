@@ -260,8 +260,9 @@ function clamp01(x) {
 function stabilityWeight(a) {
   try {
     // If we only have undertone (minimal schema), treat all scans equally.
-    const u = String(a?.undertone || "").toLowerCase();
-    if (!["warm", "cool", "neutral", "olive"].includes(u)) return 0;
+    // Normalize legacy values (e.g. "olive") into the current 5-class schema.
+    const u = normalizeUndertoneValue(a?.undertone);
+    if (!u) return 0;
 
     const pq = a?.photo_quality;
     const confNum = Number(a?.confidence);
@@ -300,8 +301,9 @@ function weightedVote(analyses, key, allowedValues) {
     const w = stabilityWeight(a);
     if (w <= 0) continue;
 
-    const v = String(a?.[key] || "unknown").toLowerCase();
-    if (!allowedValues.includes(v)) continue;
+    const raw = a?.[key];
+    const v = key === "undertone" ? normalizeUndertoneValue(raw) : String(raw || "unknown").toLowerCase();
+    if (!v || !allowedValues.includes(v)) continue;
 
     sums[v] += w;
     total += w;
@@ -329,7 +331,8 @@ function pickBestRepresentative(analyses, stableUndertone) {
     const w = stabilityWeight(a);
     if (w <= bestW) continue;
 
-    const u = String(a?.undertone || "unknown").toLowerCase();
+    const u = normalizeUndertoneValue(a?.undertone);
+    if (!u) continue;
 
     // Prefer a scan that matches the stable undertone when available.
     const matches = stableUndertone ? u === stableUndertone : true;
@@ -354,7 +357,7 @@ function pickBestRepresentative(analyses, stableUndertone) {
 }
 
 function computeStability(analyses) {
-  const undertoneVote = weightedVote(analyses, "undertone", ["warm", "cool", "neutral", "olive"]);
+  const undertoneVote = weightedVote(analyses, "undertone", ["warm", "neutral-warm", "neutral", "neutral-cool", "cool"]);
   return {
     counted: undertoneVote.counted,
     undertone: undertoneVote.value,
@@ -727,7 +730,10 @@ function extractOutputText(resp) {
 }
 
 // --- Analysis normalization (guarantee we always return a usable undertone) ---
-const ALLOWED_UNDERTONES = ["warm", "cool", "neutral", "olive"];
+// 5-class undertone output:
+//   cool | neutral-cool | neutral | neutral-warm | warm
+// (Legacy values like "olive" are normalized to "neutral".)
+const ALLOWED_UNDERTONES = ["warm", "neutral-warm", "neutral", "neutral-cool", "cool"];
 const ALLOWED_LIGHTING = ["good", "ok", "poor", "unknown"];
 const ALLOWED_WB = ["neutral", "warm", "cool", "unknown"];
 
@@ -757,17 +763,37 @@ function normalizeUndertoneValue(v) {
   if (ALLOWED_UNDERTONES.includes(s)) return s;
 
   // Common/legacy values or freeform strings.
-  if (s === "unknown" || s === "unsure" || s === "uncertain" || s === "n/a") return "neutral";
+  if (s === "unknown" || s === "unsure" || s === "uncertain" || s === "n/a") return null;
+
+  // Normalize common separators first.
+  const hy = s.replace(/[_\s]+/g, "-");
+  const letters = s.replace(/[^a-z]+/g, "");
+
+  // Prefer the 5-class neutral-leaning labels when explicitly present.
+  if (hy === "neutral-cool" || hy === "cool-neutral") return "neutral-cool";
+  if (hy === "neutral-warm" || hy === "warm-neutral") return "neutral-warm";
+  if (letters === "neutralcool" || letters === "coolneutral") return "neutral-cool";
+  if (letters === "neutralwarm" || letters === "warmneutral") return "neutral-warm";
+
+  // Heuristic: "neutral" + "cool" (and not "warm") => neutral-cool
+  if (s.includes("neutral") && s.includes("cool") && !s.includes("warm")) return "neutral-cool";
+  // Heuristic: "neutral" + "warm" (and not "cool") => neutral-warm
+  if (s.includes("neutral") && s.includes("warm") && !s.includes("cool")) return "neutral-warm";
+
+  // Fallback: pick the nearest base bucket.
   if (s.includes("warm")) return "warm";
   if (s.includes("cool")) return "cool";
   if (s.includes("neutral")) return "neutral";
-  if (s.includes("olive") || s.includes("green")) return "olive";
+  // Legacy: keep the 5-class output stable.
+  if (s.includes("olive") || s.includes("green")) return "neutral";
 
   return null;
 }
 
 function defaultRecommendationsForUndertone(undertone) {
-  const u = normalizeUndertoneValue(undertone) || "neutral";
+  // Treat neutral-leaning labels as their base direction for recommendations.
+  const u0 = normalizeUndertoneValue(undertone) || "neutral";
+  const u = u0 === "neutral-warm" ? "warm" : u0 === "neutral-cool" ? "cool" : u0;
 
   switch (u) {
     case "warm":
@@ -796,19 +822,6 @@ function defaultRecommendationsForUndertone(undertone) {
         avoid: ["very orange tones", "yellow-heavy beige", "mustard-heavy palettes"],
       };
 
-    case "olive":
-      return {
-        best_neutrals: ["off-white", "stone", "deep taupe", "charcoal", "navy", "espresso"],
-        accent_colors: ["emerald", "teal", "burgundy", "plum", "brick", "muted gold"],
-        metals: ["gold", "bronze", "antique silver"],
-        makeup_tips: [
-          "Try foundations labeled olive/neutral-olive when available.",
-          "Muted, earthy tones often look more seamless than very pastel shades.",
-          "If redness shows, a subtle green-corrector can help (lightly).",
-        ],
-        avoid: ["very pink/blue-based pastels", "chalky light beiges", "neon brights"],
-      };
-
     default:
       return {
         best_neutrals: ["soft white", "taupe", "medium gray", "navy", "mushroom", "soft black"],
@@ -835,7 +848,7 @@ function softenQualityNotes(s) {
 
 function sanitizeAnalysis(raw) {
   // Minimal response: ONLY undertone.
-  // Always normalize into one of: warm | cool | neutral | olive
+  // Always normalize into one of: warm | neutral-warm | neutral | neutral-cool | cool
   const undertoneNorm = normalizeUndertoneValue(raw?.undertone);
   const undertone = undertoneNorm || "neutral";
   return { undertone };
@@ -941,10 +954,13 @@ function guessUndertoneFromJpeg(jpegBuffer) {
     const greenDelta = (avgG - (avgR + avgB) / 2) / denom;
 
     let undertone = "neutral";
-    // Olive: green-ish bias without a strong red-blue bias.
-    if (greenDelta > 0.06 && Math.abs(castRB) < 0.11) undertone = "olive";
+    // Legacy "olive" handling removed for 5-class output.
+    // Green-ish bias without a strong red/blue bias: treat as neutral.
+    if (greenDelta > 0.06 && Math.abs(castRB) < 0.11) undertone = "neutral";
     else if (castRB > 0.09) undertone = "warm";
+    else if (castRB > 0.04) undertone = "neutral-warm";
     else if (castRB < -0.09) undertone = "cool";
+    else if (castRB < -0.04) undertone = "neutral-cool";
     else undertone = "neutral";
 
     const lighting = meanLum < 55 || darkRatio > 0.35 || brightRatio > 0.35 ? "poor" : meanLum < 70 || darkRatio > 0.25 ? "ok" : "good";
@@ -986,23 +1002,25 @@ async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUr
     type: "object",
     additionalProperties: false,
     properties: {
-      undertone: { type: "string", enum: ["warm", "cool", "neutral", "olive"] },
+      undertone: { type: "string", enum: ["cool", "neutral-cool", "neutral", "neutral-warm", "warm"] },
     },
     required: ["undertone"],
   };
 
   const systemPrompt =
-    "You are a color-analysis assistant. Your ONLY task is to estimate skin undertone (warm/cool/neutral/olive) from a face photo. " +
+    "You are a color-analysis assistant. Your ONLY task is to estimate skin undertone from a face photo. " +
     "Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, or health. " +
     "Do NOT guess race/ethnicity, age, or other sensitive attributes. " +
-    "CRITICAL: You MUST always choose exactly one undertone from the allowed list. Never output 'unknown' and never say you cannot determine undertone. " +
-    "If uncertain between warm and cool, choose neutral. " +
+    "CRITICAL: You MUST always choose exactly one undertone from the allowed list: cool | neutral-cool | neutral | neutral-warm | warm. " +
+    "Never output 'unknown' and never say you cannot determine undertone. " +
+    "Use neutral-cool / neutral-warm ONLY when the skin appears neutral overall but clearly leans cool or warm. " +
+    "If uncertain, choose neutral. " +
     "Cloudy daylight is acceptable (often neutral) and is NOT a reason to avoid an undertone classification. " +
     "Do NOT mention seasonal color analysis, seasonal families, or seasons. " +
     "Return JSON that matches the provided schema.";
 
   const userText =
-    "Determine the person's skin undertone (warm/cool/neutral/olive). " +
+    "Determine the person's skin undertone (cool/neutral-cool/neutral/neutral-warm/warm). " +
     "If multiple images are provided: the first is the original, the second is a mild white-balanced version (reduces color-cast), and an optional third is a tighter crop of the face/neck. " +
     "Use all provided images to estimate undertone as it would appear in neutral daylight.";
 
