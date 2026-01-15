@@ -217,7 +217,8 @@ function displayUndertone(raw: unknown): string {
 }
 
 
-type UndertoneKey = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm' | 'unknown';
+
+type UndertoneKey = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm';
 
 type KitItemLite = {
   id?: string;
@@ -225,346 +226,268 @@ type KitItemLite = {
   brand?: string;
   shade?: string;
   undertone?: string;
-  status?: 'inKit' | 'low' | 'empty' | string;
+  status?: 'inKit' | 'low' | 'empty';
   expiryDate?: string;
   notes?: string;
 };
 
 type KitCategoryLite = {
-  name: string;
-  items: KitItemLite[];
+  name?: string;
+  items?: KitItemLite[];
 };
 
-type KitPick = {
-  item: KitItemLite;
-  categoryName: string;
-  itemUndertone: UndertoneKey;
-  score: number;
+type KitLogLite = {
+  categories?: KitCategoryLite[];
 };
 
-function normalizeUndertoneKey(raw: unknown): UndertoneKey {
-  const s = String(raw || '').trim().toLowerCase();
-  if (!s) return 'unknown';
+function normalizeUndertoneKey(raw: unknown): UndertoneKey | null {
+  const s0 = String(raw || '').trim().toLowerCase();
+  if (!s0) return null;
+  const s = s0.replace(/_/g, '-');
+
+  // Legacy value.
   if (s === 'olive') return 'neutral';
 
-  if (s === 'cool') return 'cool';
-  if (s === 'warm') return 'warm';
-  if (s === 'neutral') return 'neutral';
+  if (s === 'cool' || s === 'neutral-cool' || s === 'neutral' || s === 'neutral-warm' || s === 'warm') {
+    return s as UndertoneKey;
+  }
 
-  if (s === 'neutral-cool' || s === 'neutral cool' || s === 'neutralcool') return 'neutral-cool';
-  if (s === 'neutral-warm' || s === 'neutral warm' || s === 'neutralwarm') return 'neutral-warm';
+  // Heuristics for messy strings.
+  if (s.includes('neutral') && s.includes('cool') && !s.includes('warm')) return 'neutral-cool';
+  if (s.includes('neutral') && s.includes('warm') && !s.includes('cool')) return 'neutral-warm';
+  if (s.includes('warm') && !s.includes('cool')) return 'warm';
+  if (s.includes('cool') && !s.includes('warm')) return 'cool';
+  if (s.includes('neutral')) return 'neutral';
 
-  return 'unknown';
+  return null;
 }
 
-function undertoneAxis(u: UndertoneKey): number | null {
+function undertoneToNumber(u: UndertoneKey): number {
+  // warmth scale: cool=-2 ... warm=+2
   if (u === 'cool') return -2;
   if (u === 'neutral-cool') return -1;
   if (u === 'neutral') return 0;
   if (u === 'neutral-warm') return 1;
-  if (u === 'warm') return 2;
-  return null;
+  return 2;
 }
 
-function inferUndertoneFromText(text: string): UndertoneKey {
-  const t = String(text || '').toLowerCase();
-
-  // Prefer explicit labels first.
-  if (t.includes('neutral-warm') || t.includes('neutral warm')) return 'neutral-warm';
-  if (t.includes('neutral-cool') || t.includes('neutral cool')) return 'neutral-cool';
-
-  // Whole-word matches help avoid random "warm" in product names.
-  const hasNeutral = /\bneutral\b/.test(t);
-  const hasWarm =
-    /\bwarm\b/.test(t) ||
-    /\bgolden\b/.test(t) ||
-    /\byellow\b/.test(t) ||
-    /\bpeach\b/.test(t) ||
-    /\bapricot\b/.test(t) ||
-    /\bterracotta\b/.test(t);
-  const hasCool =
-    /\bcool\b/.test(t) ||
-    /\bpink\b/.test(t) ||
-    /\brosy\b/.test(t) ||
-    /\brose\b/.test(t) ||
-    /\bmauve\b/.test(t) ||
-    /\bberry\b/.test(t);
-
-  if (hasNeutral && hasWarm) return 'neutral-warm';
-  if (hasNeutral && hasCool) return 'neutral-cool';
-
-  if (hasWarm && !hasCool) return 'warm';
-  if (hasCool && !hasWarm) return 'cool';
-  if (hasNeutral) return 'neutral';
-
-  return 'unknown';
-}
-
-function bestEffortItemUndertone(item: KitItemLite | null | undefined): UndertoneKey {
-  const direct = normalizeUndertoneKey(item?.undertone);
-  if (direct !== 'unknown') return direct;
-
-  const text = [item?.shade, item?.name, item?.brand, item?.notes].filter(Boolean).join(' ');
-  return inferUndertoneFromText(text);
-}
-
-type RecGroup = 'base' | 'eyes' | 'lips' | 'cheeks';
-
-function groupForKitCategoryName(name: string): RecGroup | null {
-  const s = String(name || '').trim().toLowerCase();
-  if (!s) return null;
-
-  // Base picks can include prep/skin because they affect how foundation reads.
-  if (s.includes('base') || s.includes('prep') || s.includes('skin')) return 'base';
-  if (s.includes('eye')) return 'eyes';
-  if (s.includes('lip')) return 'lips';
-  if (s.includes('cheek')) return 'cheeks';
-  return null;
-}
-
-function statusToLabel(status: string | undefined): string {
-  const s = String(status || '').trim();
-  if (s === 'inKit') return 'In kit';
-  if (s === 'low') return 'Low';
-  if (s === 'empty') return 'Empty';
-  return s ? s : '';
-}
-
-function itemDisplayName(it: KitItemLite): string {
-  const brand = String(it?.brand || '').trim();
-  const name = String(it?.name || '').trim();
-  if (brand && name) return `${brand} ${name}`;
-  return name || brand || 'Untitled';
-}
-
-function compatibilityScore(scan: UndertoneKey, item: UndertoneKey): number {
-  const a = undertoneAxis(scan);
-  const b = undertoneAxis(item);
-  if (a === null || b === null) return 55;
-  const dist = Math.abs(a - b);
-  // dist 0 => 100, dist 1 => 75, dist 2 => 50, dist 3 => 25, dist 4 => 0
-  return Math.max(0, 100 - dist * 25);
-}
-
-function scoreKitItem(
-  scan: UndertoneKey,
-  group: RecGroup,
-  categoryName: string,
-  it: KitItemLite,
-  inferred: UndertoneKey
-): number {
-  const status = String(it?.status || '').trim();
-  if (status === 'empty') return -9999;
-
-  const compat = compatibilityScore(scan, inferred);
-  let score = compat;
-
-  // Base needs the tightest match.
-  if (group === 'base') score *= 1.1;
-
-  // Prefer actual Base items over general Prep & Skin when both exist.
-  if (group === 'base') {
-    const c = String(categoryName || '').toLowerCase();
-    if (c.includes('base')) score += 8;
-    if (c.includes('prep') || c.includes('skin')) score -= 6;
-  }
-
-
-  // Base products usually have a shade; de-prioritize shade-less items a bit (helps avoid skincare floating to the top).
-  if (group === 'base' && !String(it?.shade || '').trim()) score -= 4;
-  // Prefer in-kit over low, and de-prioritize expiring.
-  if (status === 'inKit') score += 10;
-  else if (status === 'low') score += 3;
-
-  if (isExpiring(it?.expiryDate)) score -= 15;
-  if (inferred === 'unknown') score -= 12;
-
-  return score;
-}
-
-function parseKitCategoriesFromRaw(raw: string | null): KitCategoryLite[] {
-  if (!raw) return [];
+function safeParseKitLog(raw: string | null): KitLogLite {
+  if (!raw) return { categories: [] };
   try {
     const parsed = JSON.parse(raw);
     const cats = Array.isArray(parsed?.categories) ? parsed.categories : [];
-    return cats
-      .map((c: any) => {
-        const name = String(c?.name || '').trim();
-        const items = Array.isArray(c?.items) ? (c.items as any[]) : [];
-        return {
-          name: name || 'Untitled',
-          items: items as any,
-        } as KitCategoryLite;
-      })
-      .filter(Boolean);
+    return { categories: cats } as KitLogLite;
   } catch {
-    return [];
+    return { categories: [] };
   }
 }
 
-function computeKitPicks(scan: UndertoneKey, rawKit: string | null): Record<RecGroup, KitPick[]> {
-  const out: Record<RecGroup, KitPick[]> = {
-    base: [],
-    eyes: [],
-    lips: [],
-    cheeks: [],
-  };
+function categoryItems(kit: KitLogLite, nameWant: string): KitItemLite[] {
+  const cats = Array.isArray(kit?.categories) ? kit.categories : [];
+  const want = String(nameWant || '').trim().toLowerCase();
+  if (!want) return [];
 
-  const cats = parseKitCategoriesFromRaw(rawKit);
-  for (const cat of cats) {
-    const group = groupForKitCategoryName(cat?.name || '');
-    if (!group) continue;
-
-    const items = Array.isArray(cat?.items) ? cat.items : [];
-    for (const it of items) {
-      if (!it) continue;
-      const name = String((it as any)?.name || '').trim();
-      const brand = String((it as any)?.brand || '').trim();
-      if (!name && !brand) continue;
-
-      const itemLite: KitItemLite = {
-        id: String((it as any)?.id || ''),
-        name,
-        brand,
-        shade: String((it as any)?.shade || '').trim(),
-        undertone: String((it as any)?.undertone || '').trim(),
-        status: (it as any)?.status,
-        expiryDate: String((it as any)?.expiryDate || '').trim(),
-        notes: String((it as any)?.notes || '').trim(),
-      };
-
-      const inferred = bestEffortItemUndertone(itemLite);
-      const score = scoreKitItem(scan, group, String(cat?.name || ''), itemLite, inferred);
-      if (!Number.isFinite(score) || score < -1000) continue;
-
-      out[group].push({
-        item: itemLite,
-        categoryName: String(cat?.name || '').trim() || 'Untitled',
-        itemUndertone: inferred,
-        score,
-      });
-    }
-  }
-
-  (Object.keys(out) as RecGroup[]).forEach((g) => {
-    out[g].sort((a, b) => (b.score || 0) - (a.score || 0));
-    out[g] = out[g].slice(0, 3);
-  });
-
-  return out;
-}
-
-function shoppingSuggestionsFor(scan: UndertoneKey): Record<RecGroup, string[]> {
-  const suggestions: Record<RecGroup, string[]> = {
-    base: [],
-    eyes: [],
-    lips: [],
-    cheeks: [],
-  };
-
-  if (scan === 'cool') {
-    suggestions.base = [
-      'Foundation/concealer that lists cool or neutral-cool undertone (rosy / pink-leaning beige)',
-      'A blue-toned mixer/adjuster to cool down warm bases',
-    ];
-    suggestions.cheeks = ['Rose / mauve blush', 'Cool pink or berry cream blush'];
-    suggestions.lips = ['Mauve / berry lip', 'Blue-red (cool red) lipstick'];
-    suggestions.eyes = ['Taupe + cool brown palette', 'Plum / mauve shadow for dimension'];
-  } else if (scan === 'neutral-cool') {
-    suggestions.base = ['Neutral base that leans slightly pink (neutral-cool)', 'A blue-toned adjuster for warmer foundations'];
-    suggestions.cheeks = ['Neutral rose blush', 'Mauve-pink blush'];
-    suggestions.lips = ['Rose / mauve lip', 'Berry stain'];
-    suggestions.eyes = ['Taupe / neutral-brown palette', 'Soft plum shadow'];
-  } else if (scan === 'neutral') {
-    suggestions.base = ['True-neutral foundation/concealer (no strong yellow or pink)', 'One warm + one cool adjuster so you can fine-tune any base'];
-    suggestions.cheeks = ['Neutral rose blush', 'Soft peach blush'];
-    suggestions.lips = ['Rose nude', 'Neutral red'];
-    suggestions.eyes = ['Neutral brown palette', 'Champagne shimmer'];
-  } else if (scan === 'neutral-warm') {
-    suggestions.base = ['Neutral base that leans golden/peach (neutral-warm)', 'A yellow/peach adjuster to warm up cooler bases'];
-    suggestions.cheeks = ['Peach / apricot blush', 'Warm rose blush'];
-    suggestions.lips = ['Peachy nude', 'Warm red / brick red'];
-    suggestions.eyes = ['Warm brown + bronze palette', 'Copper shimmer'];
-  } else if (scan === 'warm') {
-    suggestions.base = [
-      'Foundation/concealer that lists warm or neutral-warm undertone (golden / yellow / peach)',
-      'A yellow/peach adjuster to warm up neutral bases',
-    ];
-    suggestions.cheeks = ['Peach / coral blush', 'Terracotta blush for depth'];
-    suggestions.lips = ['Coral / peach lip', 'Brick / warm red lip'];
-    suggestions.eyes = ['Warm brown + bronze palette', 'Gold / olive shimmer'];
-  }
-
-  return suggestions;
-}
-
-function buildKitAndShoppingRecommendationsMessage(args: {
-  scanUndertoneRaw: unknown;
-  kitRaw: string | null;
-}): string {
-  const scan = normalizeUndertoneKey(args?.scanUndertoneRaw);
-  if (scan === 'unknown') return '';
-
-  const pretty = displayUndertone(scan);
-  const picks = computeKitPicks(scan, args.kitRaw);
-  const shop = shoppingSuggestionsFor(scan);
-
-  const groupTitle = (g: RecGroup) => (g === 'base' ? 'Base' : g === 'eyes' ? 'Eyes' : g === 'lips' ? 'Lips' : 'Cheeks');
-
-  const lines: string[] = [];
-  lines.push(`Recommendations for ${pretty}`);
-  lines.push('');
-  lines.push('Use from your kit:');
-
-  (['base', 'eyes', 'lips', 'cheeks'] as RecGroup[]).forEach((g) => {
-    lines.push(`${groupTitle(g)}:`);
-    const arr = picks[g] || [];
-    if (!arr.length) {
-      lines.push('- No strong matches yet (tag product undertones in KitLog to improve picks)');
-      lines.push('');
-      return;
-    }
-
-    arr.forEach((p) => {
-      const it = p.item;
-      const shade = String(it?.shade || '').trim();
-      const tone = p.itemUndertone;
-      const status = statusToLabel(String(it?.status || '').trim());
-      const exp = isExpiring(it?.expiryDate) ? 'Expiring' : '';
-
-      let line = `- ${itemDisplayName(it)}`;
-      if (shade) line += ` — ${shade}`;
-      if (tone !== 'unknown') line += ` (${displayUndertone(tone)})`;
-
-      const meta = [status, exp].filter(Boolean).join(' • ');
-      if (meta) line += ` • ${meta}`;
-
-      lines.push(line);
+  const exact = cats.find((c) => String(c?.name || '').trim().toLowerCase() === want);
+  const fuzzy =
+    exact ||
+    cats.find((c) => {
+      const n = String(c?.name || '').trim().toLowerCase();
+      return n === want || n.includes(want);
     });
 
-    lines.push('');
-  });
-
-  lines.push('Recommended to buy:');
-  lines.push('');
-
-  (['base', 'eyes', 'lips', 'cheeks'] as RecGroup[]).forEach((g) => {
-    lines.push(`${groupTitle(g)}:`);
-    const arr = shop[g] || [];
-    if (!arr.length) {
-      lines.push('- —');
-      lines.push('');
-      return;
-    }
-    arr.slice(0, 3).forEach((s) => lines.push(`- ${s}`));
-    lines.push('');
-  });
-
-  lines.push('Tip: match base to the neck/chest in neutral light for the final call.');
-
-  return lines.join('\n').trim();
+  const items = Array.isArray((fuzzy as any)?.items) ? (fuzzy as any).items : [];
+  return items as KitItemLite[];
 }
 
+function inferItemUndertone(item: KitItemLite): UndertoneKey | null {
+  const direct = normalizeUndertoneKey(item?.undertone);
+  if (direct) return direct;
+
+  const blob = `${item?.brand || ''} ${item?.name || ''} ${item?.shade || ''} ${item?.notes || ''}`
+    .trim()
+    .toLowerCase();
+
+  if (!blob) return null;
+
+  // explicit neutral-lean cues
+  if (blob.includes('neutral-cool') || blob.includes('neutral cool') || blob.includes('nc')) return 'neutral-cool';
+  if (blob.includes('neutral-warm') || blob.includes('neutral warm') || blob.includes('nw')) return 'neutral-warm';
+
+  // warm cues
+  const warm =
+    blob.includes('warm') ||
+    blob.includes('golden') ||
+    blob.includes('yellow') ||
+    blob.includes('olive') ||
+    blob.includes('peach') ||
+    blob.includes('coral') ||
+    blob.includes('terracotta') ||
+    blob.includes('bronze');
+
+  // cool cues
+  const cool =
+    blob.includes('cool') ||
+    blob.includes('rosy') ||
+    blob.includes('pink') ||
+    blob.includes('berry') ||
+    blob.includes('mauve') ||
+    blob.includes('plum') ||
+    blob.includes('blue-red') ||
+    blob.includes('ash');
+
+  if (warm && !cool) return 'warm';
+  if (cool && !warm) return 'cool';
+
+  if (blob.includes('neutral')) return 'neutral';
+
+  return null;
+}
+
+function statusBoost(status?: string): number {
+  if (status === 'inKit') return 3;
+  if (status === 'low') return 1;
+  if (status === 'empty') return -10;
+  return 0;
+}
+
+function compatibilityScore(client: UndertoneKey, product: UndertoneKey | null): number {
+  if (!product) return 0;
+  const d = Math.abs(undertoneToNumber(client) - undertoneToNumber(product));
+  // d: 0..4
+  return 10 - d * 3; // 10,7,4,1,-2
+}
+
+function formatKitItemLine(it: KitItemLite): string {
+  const brand = String(it?.brand || '').trim();
+  const name = String(it?.name || '').trim();
+  const shade = String(it?.shade || '').trim();
+
+  const base = [brand, name].filter(Boolean).join(' ').trim() || 'Unnamed item';
+  const withShade = shade ? `${base} — ${shade}` : base;
+
+  const tags: string[] = [];
+  const st = String(it?.status || '').trim();
+  if (st === 'low') tags.push('low');
+  if (st === 'empty') tags.push('empty');
+  if (isExpiring(it?.expiryDate)) tags.push('expiring');
+
+  return tags.length ? `${withShade} (${tags.join(', ')})` : withShade;
+}
+
+function pickBestKitItems(items: KitItemLite[], client: UndertoneKey, n = 2): KitItemLite[] {
+  const arr = Array.isArray(items) ? items : [];
+
+  const scored = arr
+    .filter((it) => {
+      const name = String(it?.name || '').trim();
+      if (!name) return false;
+      // Prefer usable items.
+      return String(it?.status || 'inKit') !== 'empty';
+    })
+    .map((it) => {
+      const inferred = inferItemUndertone(it);
+      const score = compatibilityScore(client, inferred) + statusBoost(it?.status) - (isExpiring(it?.expiryDate) ? 2 : 0);
+      return { it, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored.slice(0, Math.max(0, n)).map((x) => x.it);
+}
+
+const BUY_RECS: Record<UndertoneKey, { base: string[]; cheeks: string[]; eyes: string[]; lips: string[] }> = {
+  cool: {
+    base: [
+      'Estée Lauder Double Wear Stay-in-Place Foundation',
+      'NARS Light Reflecting Foundation',
+      'Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation',
+    ],
+    cheeks: ['Rare Beauty Soft Pinch Liquid Blush', 'Clinique Cheek Pop', 'NARS Blush'],
+    eyes: ['Natasha Denona Glam Palette', 'Urban Decay Naked2 Basics Palette', 'Make Up For Ever Artist Color Pencil'],
+    lips: ['MAC Matte Lipstick', 'Charlotte Tilbury Matte Revolution Lipstick', 'Fenty Beauty Gloss Bomb'],
+  },
+  'neutral-cool': {
+    base: ['Dior Backstage Face & Body Foundation', 'NARS Light Reflecting Foundation', 'Fenty Beauty Pro Filt'r Foundation'],
+    cheeks: ['Clinique Cheek Pop', 'Rare Beauty Soft Pinch Liquid Blush', 'NARS Blush'],
+    eyes: ['Natasha Denona Glam Palette', 'Urban Decay Naked2 Basics Palette', 'Make Up For Ever Artist Color Pencil'],
+    lips: ['MAC Satin Lipstick', 'Charlotte Tilbury Matte Revolution Lipstick', 'Fenty Beauty Gloss Bomb'],
+  },
+  neutral: {
+    base: ['Dior Backstage Face & Body Foundation', 'Fenty Beauty Eaze Drop Blurring Skin Tint', 'NARS Light Reflecting Foundation'],
+    cheeks: ['Rare Beauty Soft Pinch Liquid Blush', 'Clinique Cheek Pop', 'NARS Blush'],
+    eyes: ['Natasha Denona Glam Palette', 'Urban Decay Naked3 Palette', 'Make Up For Ever Artist Color Pencil'],
+    lips: ['Charlotte Tilbury Matte Revolution Lipstick', 'MAC Satin Lipstick', 'Fenty Beauty Gloss Bomb'],
+  },
+  'neutral-warm': {
+    base: ['Giorgio Armani Luminous Silk Foundation', 'Dior Backstage Face & Body Foundation', 'Make Up For Ever HD Skin Foundation'],
+    cheeks: ['Rare Beauty Soft Pinch Liquid Blush', 'Fenty Beauty Cheeks Out Cream Blush', 'NARS Blush'],
+    eyes: ['Natasha Denona Bronze Palette', 'Huda Beauty Nude Obsessions Palette', 'Make Up For Ever Artist Color Pencil'],
+    lips: ['Charlotte Tilbury K.I.S.S.I.N.G Lipstick', 'MAC Matte Lipstick', 'Fenty Beauty Gloss Bomb'],
+  },
+  warm: {
+    base: ['Giorgio Armani Luminous Silk Foundation', 'Charlotte Tilbury Beautiful Skin Foundation', 'Make Up For Ever HD Skin Foundation'],
+    cheeks: ['Fenty Beauty Cheeks Out Cream Blush', 'Rare Beauty Soft Pinch Liquid Blush', 'NARS Blush'],
+    eyes: ['Natasha Denona Bronze Palette', 'Huda Beauty Nude Obsessions Palette', 'Too Faced Natural Eyes Palette'],
+    lips: ['Charlotte Tilbury K.I.S.S.I.N.G Lipstick', 'MAC Matte Lipstick', 'Fenty Beauty Gloss Bomb'],
+  },
+};
+
+function buildPostScanRecommendationsText(opts: { undertoneRaw: unknown; kitRaw: string | null }): string {
+  const u = normalizeUndertoneKey(opts.undertoneRaw);
+  if (!u) return '';
+
+  const kit = safeParseKitLog(opts.kitRaw);
+
+  const baseItems = categoryItems(kit, 'base');
+  const cheekItems = categoryItems(kit, 'cheeks');
+  const eyeItems = categoryItems(kit, 'eyes');
+  const lipItems = categoryItems(kit, 'lips');
+
+  const basePicks = pickBestKitItems(baseItems, u, 2);
+  const cheekPicks = pickBestKitItems(cheekItems, u, 2);
+  const eyePicks = pickBestKitItems(eyeItems, u, 2);
+  const lipPicks = pickBestKitItems(lipItems, u, 2);
+
+  const lines: string[] = [];
+
+  lines.push('Best matches from your kit:');
+
+  const block = (label: string, picks: KitItemLite[]) => {
+    if (!picks.length) {
+      lines.push(`${label}: (add items in KitLog to get picks)`);
+      return;
+    }
+    lines.push(`${label}:`);
+    picks.forEach((it) => lines.push(`- ${formatKitItemLine(it)}`));
+  };
+
+  block('Base', basePicks);
+  block('Cheeks', cheekPicks);
+  block('Eyes', eyePicks);
+  block('Lips', lipPicks);
+
+  const buy = BUY_RECS[u] || BUY_RECS.neutral;
+
+  lines.push('');
+  lines.push('Recommended to buy (real product names):');
+
+  const buyBlock = (label: string, arr: string[]) => {
+    const list = Array.isArray(arr) ? arr.slice(0, 2) : [];
+    if (!list.length) return;
+    lines.push(`${label}:`);
+    list.forEach((x) => lines.push(`- ${x}`));
+  };
+
+  buyBlock('Base', buy.base);
+  buyBlock('Cheeks', buy.cheeks);
+  buyBlock('Eyes', buy.eyes);
+  buyBlock('Lips', buy.lips);
+
+  lines.push('');
+  lines.push('Tip: pick shades labeled for this undertone; exact shade still depends on depth and preference.');
+
+  return lines.join('
+');
+}
 
 function formatAnalysisToText(analysis: any): string {
   const undertone = displayUndertone(analysis?.undertone) || 'Unknown';
@@ -1097,10 +1020,21 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         } as any,
         body: form as any,
       });
-
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data?.ok === false) {
-        throw new Error(data?.error || `HTTP ${res.status}`);
+        const code = String(data?.code || '').trim();
+        const msg = String(data?.error || `HTTP ${res.status}`);
+
+        if (res.status === 422 && code === 'NO_HUMAN_FACE') {
+          Alert.alert('No human face detected', msg);
+          return;
+        }
+        if (res.status === 422) {
+          Alert.alert('Photo not usable', msg);
+          return;
+        }
+
+        throw new Error(msg);
       }
 
       const id = String(data?.analysisId || makeId());
@@ -1116,7 +1050,30 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       ].slice(0, 20);
       await saveHistory(nextHistory);
 
-      // Seed chat with: "photo uploaded" + the structured analysis summary + kit/shopping recommendations
+      // Seed chat with: "photo uploaded" + the structured analysis summary
+      const recText = (() => {
+        try {
+          // Pull from KitLog on-device and build recommendations.
+          // (No network / no hallucinated product lists.)
+          return buildPostScanRecommendationsText({
+            undertoneRaw: nextAnalysis?.undertone,
+            kitRaw: null,
+          });
+        } catch {
+          return '';
+        }
+      })();
+
+      // Load KitLog raw (scoped per user) for real in-kit matching.
+      let kitRaw: string | null = null;
+      try {
+        kitRaw = await getString(kitlogKey);
+      } catch {
+        kitRaw = null;
+      }
+
+      const recTextFinal = buildPostScanRecommendationsText({ undertoneRaw: nextAnalysis?.undertone, kitRaw });
+
       const seedMsgs: ChatMessage[] = [
         {
           id: makeId(),
@@ -1130,27 +1087,17 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
           text: formatAnalysisToText(nextAnalysis),
           createdAt: new Date().toISOString(),
         },
+        ...(recTextFinal
+          ? [
+              {
+                id: makeId(),
+                role: 'assistant',
+                text: recTextFinal,
+                createdAt: new Date().toISOString(),
+              },
+            ]
+          : []),
       ];
-
-      try {
-        const kitRaw = await getString(kitlogKey);
-        const recText = buildKitAndShoppingRecommendationsMessage({
-          scanUndertoneRaw: nextAnalysis?.undertone,
-          kitRaw,
-        });
-
-        if (recText) {
-          seedMsgs.push({
-            id: makeId(),
-            role: 'assistant',
-            text: recText,
-            createdAt: new Date().toISOString(),
-          });
-        }
-      } catch {
-        // ignore
-      }
-
       await upsertChatFor(id, seedMsgs);
     } catch (e: any) {
       Alert.alert('Analysis failed', String(e?.message || e));

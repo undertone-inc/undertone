@@ -264,6 +264,11 @@ function stabilityWeight(a) {
     const u = normalizeUndertoneValue(a?.undertone);
     if (!u) return 0;
 
+    // Never let invalid photos (no face / not a photo) influence stability.
+    if (a?.photo_ok === false) return 0;
+    const issue = String(a?.issue || "").toLowerCase();
+    if (issue === "no_human_face" || issue === "not_a_photo") return 0;
+
     const pq = a?.photo_quality;
     const confNum = Number(a?.confidence);
     const hasPq = pq && typeof pq === "object";
@@ -847,11 +852,47 @@ function softenQualityNotes(s) {
 }
 
 function sanitizeAnalysis(raw) {
-  // Minimal response: ONLY undertone.
-  // Always normalize into one of: warm | neutral-warm | neutral | neutral-cool | cool
+  // Minimal client response with strict fields.
+  // - undertone: one of the 5 labels
+  // - photo_ok: whether a real human face is present + usable
+  // - issue: why a photo is not usable (or "ok")
+  // - confidence: 0-100 (undertone confidence; capped low when photo_ok is false)
+
   const undertoneNorm = normalizeUndertoneValue(raw?.undertone);
   const undertone = undertoneNorm || "neutral";
-  return { undertone };
+
+  const photoOkRaw =
+    raw?.photo_ok ??
+    raw?.photoOk ??
+    raw?.photoOK ??
+    raw?.human_face ??
+    raw?.humanFace ??
+    raw?.face_present ??
+    raw?.facePresent;
+
+  const photo_ok = typeof photoOkRaw === "boolean" ? photoOkRaw : true;
+
+  const issueRaw = String(raw?.issue ?? raw?.photo_issue ?? raw?.photoIssue ?? "")
+    .trim()
+    .toLowerCase();
+
+  const allowedIssues = new Set([
+    "ok",
+    "no_human_face",
+    "face_not_clear",
+    "face_too_far",
+    "lighting_poor",
+    "obstructed",
+    "multiple_faces",
+    "not_a_photo",
+  ]);
+
+  const issue = allowedIssues.has(issueRaw) ? issueRaw : photo_ok ? "ok" : "face_not_clear";
+
+  let confidence = clampInt(raw?.confidence, 0, 100, 55);
+  if (photo_ok === false) confidence = Math.min(confidence, 20);
+
+  return { undertone, photo_ok, issue, confidence };
 }
 
 
@@ -986,9 +1027,23 @@ function guessUndertoneFromJpeg(jpegBuffer) {
 
 function buildFallbackAnalysisFromImage({ jpegBuffer, reason }) {
   const guess = guessUndertoneFromJpeg(jpegBuffer);
-  const undertone = guess?.undertone || "neutral";
-  // Minimal response to clients: only undertone.
-  return sanitizeAnalysis({ undertone });
+
+  // If we cannot see enough skin / face region, treat as invalid photo.
+  if (!guess || guess.face_visible === false) {
+    return sanitizeAnalysis({
+      undertone: "neutral",
+      photo_ok: false,
+      issue: "no_human_face",
+      confidence: 10,
+    });
+  }
+
+  return sanitizeAnalysis({
+    undertone: guess.undertone || "neutral",
+    photo_ok: true,
+    issue: "ok",
+    confidence: typeof guess.confidence === "number" ? guess.confidence : 25,
+  });
 }
 
 
@@ -997,32 +1052,49 @@ async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUr
     throw new Error("Missing OPENAI_API_KEY on server");
   }
 
-  // Structured Outputs schema (undertone-only)
+  // Structured Outputs schema (photo validity + undertone)
   const schema = {
     type: "object",
     additionalProperties: false,
     properties: {
+      photo_ok: { type: "boolean" },
+      issue: {
+        type: "string",
+        enum: [
+          "ok",
+          "no_human_face",
+          "face_not_clear",
+          "face_too_far",
+          "lighting_poor",
+          "obstructed",
+          "multiple_faces",
+          "not_a_photo",
+        ],
+      },
       undertone: { type: "string", enum: ["cool", "neutral-cool", "neutral", "neutral-warm", "warm"] },
+      confidence: { type: "integer", minimum: 0, maximum: 100 },
     },
-    required: ["undertone"],
+    required: ["photo_ok", "issue", "undertone", "confidence"],
   };
 
   const systemPrompt =
-    "You are a color-analysis assistant. Your ONLY task is to estimate skin undertone from a face photo. " +
-    "Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, or health. " +
-    "Do NOT guess race/ethnicity, age, or other sensitive attributes. " +
-    "CRITICAL: You MUST always choose exactly one undertone from the allowed list: cool | neutral-cool | neutral | neutral-warm | warm. " +
-    "Never output 'unknown' and never say you cannot determine undertone. " +
-    "Use neutral-cool / neutral-warm ONLY when the skin appears neutral overall but clearly leans cool or warm. " +
-    "If uncertain, choose neutral. " +
-    "Cloudy daylight is acceptable (often neutral) and is NOT a reason to avoid an undertone classification. " +
-    "Do NOT mention seasonal color analysis, seasonal families, or seasons. " +
-    "Return JSON that matches the provided schema.";
+    "You are a color-analysis assistant." +
+    " First, verify whether the image contains a REAL HUMAN FACE suitable for skin undertone analysis." +
+    " If there is no human face (animal/object/illustration), set photo_ok=false and issue=no_human_face." +
+    " If a human face is present but not usable (too far, too blurry, heavily obscured, extreme lighting), set photo_ok=false and choose the best issue from the enum." +
+    " Only when photo_ok=true, estimate skin undertone from the face/neck/jaw area." +
+    " Return exactly one undertone from: cool | neutral-cool | neutral | neutral-warm | warm." +
+    " Use neutral-cool / neutral-warm ONLY when the skin appears neutral overall but clearly leans cool or warm." +
+    " If uncertain (but photo_ok=true), choose neutral." +
+    " Provide confidence 0-100 for the undertone classification. If photo_ok=false, keep confidence low (0-20)." +
+    " Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, health, age, or race/ethnicity." +
+    " Return JSON that matches the provided schema.";
 
   const userText =
-    "Determine the person's skin undertone (cool/neutral-cool/neutral/neutral-warm/warm). " +
-    "If multiple images are provided: the first is the original, the second is a mild white-balanced version (reduces color-cast), and an optional third is a tighter crop of the face/neck. " +
-    "Use all provided images to estimate undertone as it would appear in neutral daylight.";
+    "1) Determine if a real human face is present and usable for undertone analysis." +
+    " 2) If usable, output undertone (cool/neutral-cool/neutral/neutral-warm/warm)." +
+    " Issue enum: ok | no_human_face | face_not_clear | face_too_far | lighting_poor | obstructed | multiple_faces | not_a_photo." +
+    " If multiple images are provided: the first is the original, the second is a mild white-balanced version (reduces color-cast), and an optional third is a tighter crop of the face/neck.";
 
   const content = [
     { type: "input_text", text: userText },
@@ -1314,9 +1386,21 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
       }
     }
 
-    // 3) Hard fallback: always return a usable result (undertone never "unknown").
+    // 3) Hard fallback: always return a usable result when possible.
     if (!analysis) {
       analysis = buildFallbackAnalysisFromImage({ jpegBuffer: file.buffer, reason: "fallback" });
+    }
+
+    // If there is no valid human face, do NOT return an undertone.
+    if (analysis?.photo_ok === false) {
+      const issue = String(analysis?.issue || "").toLowerCase();
+      const code = issue === "no_human_face" ? "NO_HUMAN_FACE" : "PHOTO_NOT_SUITABLE";
+      const msg =
+        issue === "no_human_face"
+          ? "No human face detected. Please retake a clear, front-facing photo of a human face with jawline/neck visible (no filters, even lighting)."
+          : "Photo isn't suitable for undertone analysis. Please retake: clear human face, evenly lit, no heavy shadows or filters.";
+
+      return res.status(422).json({ ok: false, code, error: msg, analysis });
     }
 
 
