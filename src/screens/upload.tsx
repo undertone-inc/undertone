@@ -399,14 +399,14 @@ const BUY_RECS: Record<UndertoneKey, { base: string[]; cheeks: string[]; eyes: s
     base: [
       'Estée Lauder Double Wear Stay-in-Place Foundation',
       'NARS Light Reflecting Foundation',
-      'Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation',
+	      "Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation",
     ],
     cheeks: ['Rare Beauty Soft Pinch Liquid Blush', 'Clinique Cheek Pop', 'NARS Blush'],
     eyes: ['Natasha Denona Glam Palette', 'Urban Decay Naked2 Basics Palette', 'Make Up For Ever Artist Color Pencil'],
     lips: ['MAC Matte Lipstick', 'Charlotte Tilbury Matte Revolution Lipstick', 'Fenty Beauty Gloss Bomb'],
   },
   'neutral-cool': {
-    base: ['Dior Backstage Face & Body Foundation', 'NARS Light Reflecting Foundation', 'Fenty Beauty Pro Filt'r Foundation'],
+	    base: ['Dior Backstage Face & Body Foundation', 'NARS Light Reflecting Foundation', "Fenty Beauty Pro Filt'r Foundation"],
     cheeks: ['Clinique Cheek Pop', 'Rare Beauty Soft Pinch Liquid Blush', 'NARS Blush'],
     eyes: ['Natasha Denona Glam Palette', 'Urban Decay Naked2 Basics Palette', 'Make Up For Ever Artist Color Pencil'],
     lips: ['MAC Satin Lipstick', 'Charlotte Tilbury Matte Revolution Lipstick', 'Fenty Beauty Gloss Bomb'],
@@ -485,8 +485,7 @@ function buildPostScanRecommendationsText(opts: { undertoneRaw: unknown; kitRaw:
   lines.push('');
   lines.push('Tip: pick shades labeled for this undertone; exact shade still depends on depth and preference.');
 
-  return lines.join('
-');
+	return lines.join('\n');
 }
 
 function formatAnalysisToText(analysis: any): string {
@@ -1074,31 +1073,31 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
       const recTextFinal = buildPostScanRecommendationsText({ undertoneRaw: nextAnalysis?.undertone, kitRaw });
 
-      const seedMsgs: ChatMessage[] = [
-        {
-          id: makeId(),
-          role: 'user',
-          text: 'Uploaded face photo.',
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: makeId(),
-          role: 'assistant',
-          text: formatAnalysisToText(nextAnalysis),
-          createdAt: new Date().toISOString(),
-        },
-        ...(recTextFinal
-          ? [
-              {
-                id: makeId(),
-                role: 'assistant',
-                text: recTextFinal,
-                createdAt: new Date().toISOString(),
-              },
-            ]
-          : []),
-      ];
-      await upsertChatFor(id, seedMsgs);
+	  const seedMsgs: ChatMessage[] = [
+	    {
+	      id: makeId(),
+	      role: 'user',
+	      text: 'Uploaded face photo.',
+	      createdAt: new Date().toISOString(),
+	    },
+	    {
+	      id: makeId(),
+	      role: 'assistant',
+	      text: formatAnalysisToText(nextAnalysis),
+	      createdAt: new Date().toISOString(),
+	    },
+	  ];
+
+	  if (recTextFinal) {
+	    seedMsgs.push({
+	      id: makeId(),
+	      role: 'assistant',
+	      text: recTextFinal,
+	      createdAt: new Date().toISOString(),
+	    });
+	  }
+
+	  await upsertChatFor(id, seedMsgs);
     } catch (e: any) {
       Alert.alert('Analysis failed', String(e?.message || e));
     } finally {
