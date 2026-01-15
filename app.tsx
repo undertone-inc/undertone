@@ -7,7 +7,7 @@ import Constants from 'expo-constants';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import Svg, { Line, Rect, Path } from 'react-native-svg';
 
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-context';
 
 import { clearToken, getToken } from './src/auth';
 import { migrateLegacySecureStoreIfNeeded } from './src/localstore';
@@ -183,10 +183,12 @@ type AppTabsProps = {
 function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: AppTabsProps) {
   return (
     <TabNavigator
+      lazy={false}
       screenOptions={{
         headerShown: false,
         tabBarShowLabel: true,
-        tabBarHideOnKeyboard: true,
+        // Keep the nav bar fixed; let the keyboard cover it instead of hiding/moving it.
+        tabBarHideOnKeyboard: false,
         tabBarActiveTintColor: '#111111',
         tabBarInactiveTintColor: '#9ca3af',
         tabBarBackground: () => <TabBarBackground />,
@@ -346,63 +348,59 @@ export default function App() {
     setUserEmail(nextEmail);
   };
 
-  if (booting) {
-    return (
-      <SafeAreaProvider>
-        <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
-        <StatusBar barStyle="dark-content" />
-        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-          <Text style={{ color: '#111111' }}>Loading…</Text>
-        </View>
-      </View>
-      </SafeAreaProvider>
-    );
-  }
-
   return (
-    <SafeAreaProvider>
-      <NavigationContainer key={authToken ? 'app' : 'auth'}>
+    <SafeAreaProvider initialMetrics={initialWindowMetrics} style={{ flex: 1 }}>
       <StatusBar barStyle="dark-content" />
-      <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
-        {authToken ? (
-          <AppStackNavigator screenOptions={{ headerShown: false }}>
-            <AppStack.Screen name="Tabs">
-              {() => (
-                <AppTabsShell
-                  userEmail={userEmail}
-                  userId={userId}
-                  token={authToken as string}
-                  onEmailUpdated={handleEmailUpdated}
-                  onLogout={handleLogout}
-                />
-              )}
-            </AppStack.Screen>
 
-            <AppStack.Screen
-              name="Camera"
-              component={CameraScreen}
-              options={{
-                headerShown: false,
-                presentation: 'fullScreenModal',
-                animation: 'slide_from_bottom',
-              }}
-            />
-          </AppStackNavigator>
+      <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
+        {booting ? (
+          <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+            <Text style={{ color: '#111111' }}>Loading…</Text>
+          </View>
         ) : (
-          <AuthStackNavigator
-            screenOptions={{
-              headerShown: false,
-              animation: 'none',
-              contentStyle: { backgroundColor: '#ffffff' },
-            }}
-          >
-            <AuthStack.Screen name="Login">
-              {(props: any) => <Login {...props} onAuthSuccess={handleAuthSuccess} />}
-            </AuthStack.Screen>
-          </AuthStackNavigator>
+          <NavigationContainer key={authToken ? 'app' : 'auth'}>
+            <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
+              {authToken ? (
+                <AppStackNavigator screenOptions={{ headerShown: false }}>
+                  <AppStack.Screen name="Tabs">
+                    {() => (
+                      <AppTabsShell
+                        userEmail={userEmail}
+                        userId={userId}
+                        token={authToken as string}
+                        onEmailUpdated={handleEmailUpdated}
+                        onLogout={handleLogout}
+                      />
+                    )}
+                  </AppStack.Screen>
+
+                  <AppStack.Screen
+                    name="Camera"
+                    component={CameraScreen}
+                    options={{
+                      headerShown: false,
+                      presentation: 'fullScreenModal',
+                      animation: 'slide_from_bottom',
+                    }}
+                  />
+                </AppStackNavigator>
+              ) : (
+                <AuthStackNavigator
+                  screenOptions={{
+                    headerShown: false,
+                    animation: 'none',
+                    contentStyle: { backgroundColor: '#ffffff' },
+                  }}
+                >
+                  <AuthStack.Screen name="Login">
+                    {(props: any) => <Login {...props} onAuthSuccess={handleAuthSuccess} />}
+                  </AuthStack.Screen>
+                </AuthStackNavigator>
+              )}
+            </View>
+          </NavigationContainer>
         )}
       </View>
-    </NavigationContainer>
     </SafeAreaProvider>
   );
 }

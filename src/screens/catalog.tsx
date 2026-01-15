@@ -13,10 +13,14 @@ import {
   ScrollView,
   Alert,
   Dimensions,
+  StatusBar,
+  useWindowDimensions,
 } from 'react-native';
+import Constants from 'expo-constants';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { DOC_KEYS, getJson, getString, makeScopedKey, setString } from '../localstore';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
 
 const STORAGE_KEY = DOC_KEYS.catalog;
 const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
@@ -27,13 +31,14 @@ const SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.8);
 
 // Default KitLog categories (used only if KitLog hasn't been opened yet)
 const DEFAULT_KITLOG_CATEGORIES = [
-  'Prep & Skin',
+  // Match KitLog category ordering
   'Base',
-  'Cheeks',
-  'Brows',
-  'Eyes',
-  'Lashes',
   'Lips',
+  'Cheeks',
+  'Eyes',
+  'Prep & Skin',
+  'Brows',
+  'Lashes',
   'Tools',
   'Hygiene & Disposables',
   'Body / FX / Extras',
@@ -46,7 +51,8 @@ const FALLBACK_CATEGORY_NAME = 'Base';
 const CLOSED_BOTTOM_PADDING = 28;
 
 // Extra space ABOVE the keyboard when it’s OPEN
-const KEYBOARD_GAP = 0;
+// (Raised to make the lift clearly noticeable)
+const KEYBOARD_GAP = 33;
 
 // Modal gets a bit more lift than the main screen.
 const MODAL_CLOSED_BOTTOM_PADDING = 56;
@@ -352,6 +358,19 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
   const [newProductCategory, setNewProductCategory] = useState<PlanCategory>(FALLBACK_CATEGORY_NAME);
   const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const tabBarHeight = useBottomTabBarHeight();
+
+  // On first mount of a tab screen, safe-area insets can briefly report 0.
+  // Use a stable fallback so the screen never “drops” into place.
+  const insets = useSafeAreaInsets();
+  const { width: winW, height: winH } = useWindowDimensions();
+  const isLandscape = winW > winH;
+  const initialTop = Number((initialWindowMetrics as any)?.insets?.top || 0);
+  const iosStatusBar = Number((Constants as any)?.statusBarHeight || 0);
+  const androidStatusBar = Number((StatusBar as any)?.currentHeight || 0);
+  const safeTop = Number(insets?.top || 0);
+  const fallbackTop = Platform.OS === 'android' ? androidStatusBar : iosStatusBar;
+  const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
 
   // keyboard spacer (modal)
   useEffect(() => {
@@ -529,7 +548,9 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
   }, [hasUpcoming, upcomingVisible, nonUpcomingVisible, clientsMeta]);
 
 
-  const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
+  // Screens render ABOVE the tab bar, so subtract its height to avoid a jump.
+  const keyboardInset = keyboardHeight > 0 ? Math.max(0, keyboardHeight - tabBarHeight) : 0;
+  const bottomPadding = keyboardHeight > 0 ? keyboardInset + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
   const modalBottomPadding = keyboardHeight > 0 ? keyboardHeight + MODAL_KEYBOARD_GAP : MODAL_CLOSED_BOTTOM_PADDING;
 
   function addClientFromBar() {
@@ -688,7 +709,7 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-      <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+      <SafeAreaView style={[styles.safeArea, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
         <View style={[styles.container, { paddingBottom: bottomPadding }]}>
           {/* Top bar: Search */}
           <View style={styles.topBar}>
@@ -824,7 +845,7 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
           onRequestClose={closeClient}
         >
           <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-            <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
+            <SafeAreaView style={[styles.modalSafe, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
               <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
                 <View style={styles.modalHeader}>
                   <TouchableOpacity style={styles.modalBack} onPress={closeClient} accessibilityRole="button">

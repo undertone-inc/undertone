@@ -11,9 +11,13 @@ import {
   ScrollView,
   Modal,
   Alert,
+  StatusBar,
+  useWindowDimensions,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import Constants from 'expo-constants';
+import { SafeAreaView, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { DOC_KEYS, getString, makeScopedKey, setString } from '../localstore';
 
 type KitLogScreenProps = {
@@ -58,6 +62,12 @@ type KitLogData = {
 type ViewMode = 'all' | 'low' | 'empty' | 'expiring';
 type HomeAttentionMode = 'low' | 'empty' | 'expiring';
 
+const TONE_OPTIONS = [
+  { key: 'cool', label: 'Cool' },
+  { key: 'neutral', label: 'Neutral' },
+  { key: 'warm', label: 'Warm' },
+] as const;
+
 
 const STORAGE_KEY = DOC_KEYS.kitlog;
 
@@ -70,7 +80,8 @@ const CATEGORY_BAR_TARGET = 12;
 const CLOSED_BOTTOM_PADDING = 28;
 
 // Extra space ABOVE the keyboard when it’s OPEN
-const KEYBOARD_GAP = 0;
+// (Raised to make the lift clearly noticeable)
+const KEYBOARD_GAP = 33;
 
 function uid(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -79,13 +90,15 @@ function uid(prefix: string) {
 function defaultCategories(): KitCategory[] {
   const now = Date.now();
   const names = [
+    // Put Prep & Skin first (user request).
     'Prep & Skin',
+    // Core defaults
     'Base',
-    'Cheeks',
-    'Brows',
-    'Eyes',
-    'Lashes',
     'Lips',
+    'Cheeks',
+    'Eyes',
+    'Brows',
+    'Lashes',
     'Tools',
     'Hygiene & Disposables',
     'Body / FX / Extras',
@@ -216,6 +229,19 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
   const editorScrollRef = useRef<any>(null);
 
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const tabBarHeight = useBottomTabBarHeight();
+
+  // On first mount of a tab screen, safe-area insets can briefly report 0.
+  // Use a stable fallback so the screen never “drops” into place.
+  const insets = useSafeAreaInsets();
+  const { width: winW, height: winH } = useWindowDimensions();
+  const isLandscape = winW > winH;
+  const initialTop = Number((initialWindowMetrics as any)?.insets?.top || 0);
+  const iosStatusBar = Number((Constants as any)?.statusBarHeight || 0);
+  const androidStatusBar = Number((StatusBar as any)?.currentHeight || 0);
+  const safeTop = Number(insets?.top || 0);
+  const fallbackTop = Platform.OS === 'android' ? androidStatusBar : iosStatusBar;
+  const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
 
   const [mode, setMode] = useState<'home' | 'category' | 'item'>('home');
   const [activeCategoryId, setActiveCategoryId] = useState<string | null>(null);
@@ -227,6 +253,12 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
 
   const [newCategoryText, setNewCategoryText] = useState('');
   const [quickAddText, setQuickAddText] = useState('');
+  const [toneMenuOpen, setToneMenuOpen] = useState(false);
+
+  // Close the inline tone dropdown when navigating between screens/items.
+  useEffect(() => {
+    setToneMenuOpen(false);
+  }, [mode, activeCategoryId, activeItemId]);
 
   // keyboard spacer
   useEffect(() => {
@@ -281,7 +313,9 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
     };
   }, [data, hydrated, storageKey]);
 
-  const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
+  // Screens render ABOVE the tab bar, so subtract its height to avoid a jump.
+  const keyboardInset = keyboardHeight > 0 ? Math.max(0, keyboardHeight - tabBarHeight) : 0;
+  const bottomPadding = keyboardHeight > 0 ? keyboardInset + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
 
   const activeCategory = useMemo(() => {
     if (!activeCategoryId) return null;
@@ -295,16 +329,36 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
 
   const visibleCategories = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return data.categories;
+    const filtered = !q
+      ? data.categories
+      : data.categories.filter((c) => {
+          if (c.name.toLowerCase().includes(q)) return true;
+          return c.items.some((it) => {
+            const name = (it.name ?? '').toLowerCase();
+            const brand = (it.brand ?? '').toLowerCase();
+            return name.includes(q) || brand.includes(q);
+          });
+        });
 
-    return data.categories.filter((c) => {
-      if (c.name.toLowerCase().includes(q)) return true;
-      return c.items.some((it) => {
-        const name = (it.name ?? '').toLowerCase();
-        const brand = (it.brand ?? '').toLowerCase();
-        return name.includes(q) || brand.includes(q);
-      });
-    });
+    // Keep Prep & Skin first, then the core face areas.
+    const priority = ['prep & skin', 'base', 'lips', 'cheeks', 'eyes'] as const;
+    const rank = new Map<string, number>(priority.map((n, i) => [n, i]));
+
+    // Stable sort: preserve existing order for non-priority categories.
+    return filtered
+      .map((c, idx) => ({ c, idx }))
+      .sort((a, b) => {
+        const ra = rank.get(a.c.name.trim().toLowerCase());
+        const rb = rank.get(b.c.name.trim().toLowerCase());
+
+        const aHas = ra !== undefined;
+        const bHas = rb !== undefined;
+        if (aHas && bHas) return (ra as number) - (rb as number);
+        if (aHas) return -1;
+        if (bHas) return 1;
+        return a.idx - b.idx;
+      })
+      .map((row) => row.c);
   }, [data.categories, search]);
 
       const lowItems = useMemo(() => {
@@ -605,7 +659,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-      <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+      <SafeAreaView style={[styles.safeArea, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
         <View style={[styles.container, { paddingBottom: bottomPadding }]}>
           {/* Top bar */}
           <View style={styles.topBar}>
@@ -717,16 +771,6 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
                                   {meta}
                                 </Text>
                               ) : null}
-                            </View>
-
-                            <View style={styles.categoryListRowActions}>
-                              <TouchableOpacity
-                                style={styles.categoryRowTrash}
-                                onPress={() => confirmDeleteCategory(cat.id)}
-                                accessibilityRole="button"
-                              >
-                                <Ionicons name="trash-outline" size={18} color="#9ca3af" />
-                              </TouchableOpacity>
                             </View>
                           </TouchableOpacity>
                         </View>
@@ -1001,7 +1045,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
             presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
             onRequestClose={closeItem}
           >
-            <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
+            <SafeAreaView style={[styles.modalSafe, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
               <View style={styles.modalContainer}>
                 <View style={styles.modalHeader}>
                   <TouchableOpacity style={styles.modalBack} onPress={closeItem} accessibilityRole="button">
@@ -1069,17 +1113,89 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
                       onChangeText={(v) => updateItemField('shade', v)}
                     />
                     <View style={styles.rowDivider} />
-                    <FormRow
-                      label="Tone"
-                      value={activeItem?.undertone ?? ''}
-                      placeholder="warm"
-                      onChangeText={(v) => updateItemField('undertone', v)}
-                    />
+                    <View style={styles.formRow}>
+                      <Text style={styles.formLabel}>Tone</Text>
+
+                      <TouchableOpacity
+                        style={styles.toneDropdownButton}
+                        activeOpacity={0.9}
+                        onPress={() => setToneMenuOpen((v) => !v)}
+                        accessibilityRole="button"
+                      >
+                        <Text
+                          style={[
+                            styles.toneDropdownText,
+                            (activeItem?.undertone ?? '').trim() ? null : styles.toneDropdownPlaceholder,
+                          ]}
+                        >
+                          {(() => {
+                            const v = (activeItem?.undertone ?? '').trim().toLowerCase();
+                            const opt = TONE_OPTIONS.find((o) => o.key === v);
+                            return opt ? opt.label : 'Select';
+                          })()}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {toneMenuOpen ? (
+                      <>
+                        <View style={styles.rowDivider} />
+                        <TouchableOpacity
+                          style={styles.toneOptionRow}
+                          activeOpacity={0.9}
+                          onPress={() => {
+                            updateItemField('undertone', '');
+                            setToneMenuOpen(false);
+                          }}
+                          accessibilityRole="button"
+                        >
+                          <View style={styles.toneOptionLabelSpacer} />
+                          <View style={styles.toneOptionContent}>
+                            <Text style={styles.toneOptionText}>None</Text>
+                            {!(activeItem?.undertone ?? '').trim() ? (
+                              <Ionicons name="checkmark" size={18} color="#111111" />
+                            ) : (
+                              <View style={{ width: 18 }} />
+                            )}
+                          </View>
+                        </TouchableOpacity>
+                        <View style={styles.rowDivider} />
+
+                        {TONE_OPTIONS.map((t, idx) => {
+                          const current = (activeItem?.undertone ?? '').trim().toLowerCase();
+                          const on = current === t.key;
+                          return (
+                            <React.Fragment key={t.key}>
+                              <TouchableOpacity
+                                style={styles.toneOptionRow}
+                                activeOpacity={0.9}
+                                onPress={() => {
+                                  updateItemField('undertone', t.key);
+                                  setToneMenuOpen(false);
+                                }}
+                                accessibilityRole="button"
+                              >
+                                <View style={styles.toneOptionLabelSpacer} />
+                                <View style={styles.toneOptionContent}>
+                                  <Text style={styles.toneOptionText}>{t.label}</Text>
+                                  {on ? (
+                                    <Ionicons name="checkmark" size={18} color="#111111" />
+                                  ) : (
+                                    <View style={{ width: 18 }} />
+                                  )}
+                                </View>
+                              </TouchableOpacity>
+                              {idx < TONE_OPTIONS.length - 1 ? <View style={styles.rowDivider} /> : null}
+                            </React.Fragment>
+                          );
+                        })}
+                      </>
+                    ) : null}
                     <View style={styles.rowDivider} />
                     <FormRow
                       label="Form"
                       value={activeItem?.form ?? ''}
-                      placeholder="cream"
+                      placeholder="Cream"
                       onChangeText={(v) => updateItemField('form', v)}
                     />
                   </View>
@@ -1466,13 +1582,18 @@ const styles = StyleSheet.create({
     paddingLeft: 0,
     paddingRight: 0,
     paddingVertical: 10,
+    // Keep visual spacing identical to when the 34px action icon existed.
+    // (Trash icon removed, but the row height shouldn't visually collapse.)
+    minHeight: 54,
     flexDirection: 'row',
     alignItems: 'flex-start',
     justifyContent: 'space-between',
   },
   categoryListRowMain: {
     flex: 1,
-    paddingRight: 8,
+    // Keep a tiny right inset so the progress bar doesn't feel "too long" / flush.
+    // This matches where the old action icon ended (marginRight: 2).
+    paddingRight: 2,
   },
   categoryListRowActions: {
     flexDirection: 'row',
@@ -1646,6 +1767,8 @@ const styles = StyleSheet.create({
   },
   categoryRackBar: {
     marginTop: 8,
+    // Slight right inset so the bar doesn't feel flush/overextended.
+    marginRight: 8,
     height: 6,
     borderRadius: 999,
     overflow: 'hidden',
@@ -1945,6 +2068,85 @@ const styles = StyleSheet.create({
   },
   statusMiniTextOn: {
     color: '#ffffff',
+  },
+
+  toneChips: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 30,
+  },
+  toneChip: {
+    flex: 1,
+    height: 30,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 999,
+    backgroundColor: '#f9fafb',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  toneChipSpacer: {
+    marginLeft: 8,
+  },
+  toneChipOn: {
+    borderColor: '#111111',
+    backgroundColor: '#111111',
+  },
+  toneChipInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toneChipIcon: {
+    marginRight: 6,
+  },
+  toneChipText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  toneChipTextOn: {
+    color: '#ffffff',
+  },
+
+  // Tone dropdown (inline)
+  toneDropdownButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+  },
+  toneDropdownText: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '400',
+    color: '#111111',
+    textAlign: 'left',
+  },
+  toneDropdownPlaceholder: {
+    color: '#9ca3af',
+  },
+  toneOptionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  toneOptionLabelSpacer: {
+    width: 74,
+  },
+  toneOptionContent: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  toneOptionText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#111111',
   },
 
 

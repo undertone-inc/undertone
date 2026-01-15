@@ -7,6 +7,8 @@ import {
   Keyboard,
   TextInput,
   Platform,
+  StatusBar,
+  useWindowDimensions,
   ScrollView,
   Modal,
   Pressable,
@@ -19,7 +21,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
 import Constants from 'expo-constants';
 
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, initialWindowMetrics, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
 
@@ -169,6 +171,18 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
   const tokenTrimmed = (token || '').trim();
 
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  // On first mount of a tab screen, safe-area insets can briefly report 0.
+  // Use a stable fallback so the screen never “drops” into place.
+  const insets = useSafeAreaInsets();
+  const { width: winW, height: winH } = useWindowDimensions();
+  const isLandscape = winW > winH;
+  const initialTop = Number((initialWindowMetrics as any)?.insets?.top || 0);
+  const iosStatusBar = Number((Constants as any)?.statusBarHeight || 0);
+  const androidStatusBar = Number((StatusBar as any)?.currentHeight || 0);
+  const safeTop = Number(insets?.top || 0);
+  const fallbackTop = Platform.OS === 'android' ? androidStatusBar : iosStatusBar;
+  const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
   const [emailUpdatesEnabled, setEmailUpdatesEnabled] = useState(true);
   const [uploadsUsedThisMonth, setUploadsUsedThisMonth] = useState(0);
   const [clientsUsedThisMonth, setClientsUsedThisMonth] = useState(0);
@@ -958,7 +972,10 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
 
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+    <SafeAreaView
+      style={[styles.safeArea, { paddingTop: stableTopInset }]}
+      edges={['left', 'right']}
+    >
       <View style={[styles.container, { paddingBottom: bottomPadding }]}>
         {/* Top bar */}
         <View style={styles.topBar}>

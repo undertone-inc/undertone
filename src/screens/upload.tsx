@@ -16,6 +16,7 @@ import {
   ScrollView,
   Linking,
 } from 'react-native';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import Constants from 'expo-constants';
 import * as ImagePicker from 'expo-image-picker';
@@ -44,7 +45,8 @@ const FACE_OVAL_RY = 0.32;
 const CLOSED_BOTTOM_PADDING = 28;
 
 // Extra space ABOVE the keyboard when it’s OPEN
-const KEYBOARD_GAP = 0;
+// (Raised to make the lift clearly noticeable)
+const KEYBOARD_GAP = 33;
 
 // Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
 // IMPORTANT: Strip trailing slashes so we never generate URLs like "//analyze-face".
@@ -154,10 +156,6 @@ function getImageSizeAsync(uri: string): Promise<{ width: number; height: number
   });
 }
 
-function clampNum(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
 type UploadScreenProps = {
   navigation: any;
   route: any;
@@ -206,13 +204,68 @@ function compactList(arr: unknown, max = 10): string {
 }
 
 function formatAnalysisToText(analysis: any): string {
-  // Return ONLY undertone (no extra notes/recommendations).
-  const allowed = new Set(['warm', 'cool', 'neutral', 'olive']);
-  let undertone = String(analysis?.undertone || '').trim().toLowerCase();
-  if (!allowed.has(undertone)) undertone = 'neutral';
-  return `Undertone: ${undertone}`;
-}
+  const undertone = String(analysis?.undertone || 'unknown');
+  const confidence = Number(analysis?.confidence ?? 0);
 
+  const bestNeutrals = compactList(analysis?.recommendations?.best_neutrals);
+  const accentColors = compactList(analysis?.recommendations?.accent_colors);
+  const metals = compactList(analysis?.recommendations?.metals);
+  const makeupTips = Array.isArray(analysis?.recommendations?.makeup_tips)
+    ? (analysis.recommendations.makeup_tips as any[]).map((x) => String(x || '').trim()).filter(Boolean).slice(0, 6)
+    : [];
+  const avoid = Array.isArray(analysis?.recommendations?.avoid)
+    ? (analysis.recommendations.avoid as any[]).map((x) => String(x || '').trim()).filter(Boolean).slice(0, 6)
+    : [];
+
+  const lines: string[] = [];
+  lines.push(`Undertone: ${undertone}`);
+  if (Number.isFinite(confidence) && confidence > 0) lines.push(`Confidence: ${confidence}%`);
+
+  if (analysis?.photo_quality?.notes) {
+    const q = String(analysis.photo_quality.notes).trim();
+    if (q) {
+      lines.push('');
+      lines.push(`Photo notes: ${q}`);
+    }
+  }
+
+  if (analysis?.reasoning_summary) {
+    const rs = String(analysis.reasoning_summary).trim();
+    if (rs) {
+      lines.push('');
+      lines.push(rs);
+    }
+  }
+
+  if (bestNeutrals || accentColors || metals) {
+    lines.push('');
+    if (bestNeutrals) lines.push(`Best neutrals: ${bestNeutrals}`);
+    if (accentColors) lines.push(`Accent colors: ${accentColors}`);
+    if (metals) lines.push(`Metals: ${metals}`);
+  }
+
+  if (makeupTips.length) {
+    lines.push('');
+    lines.push('Makeup tips:');
+    makeupTips.forEach((t) => lines.push(`- ${t}`));
+  }
+
+  if (avoid.length) {
+    lines.push('');
+    lines.push('Avoid:');
+    avoid.forEach((t) => lines.push(`- ${t}`));
+  }
+
+  if (analysis?.disclaimer) {
+    const d = String(analysis.disclaimer).trim();
+    if (d) {
+      lines.push('');
+      lines.push(d);
+    }
+  }
+
+  return lines.join('\n');
+}
 
 function formatChatTitle(item: HistoryItem): string {
   const a = item?.analysis ?? null;
@@ -252,6 +305,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   // Use Constants.statusBarHeight as an immediate fallback so the “Your scans” sheet
   // never renders too high on first open.
   const insets = useSafeAreaInsets();
+  const tabBarHeight = useBottomTabBarHeight();
   const statusBarHeight = Number((Constants as any)?.statusBarHeight || 0);
   const topInsetFallback = Platform.OS === 'ios' ? statusBarHeight : 0;
   const chatListTopPad = Math.max(insets.top, topInsetFallback) + 10;
@@ -590,14 +644,14 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
           uriLower.endsWith('.heif') ||
           uriLower.includes('heic');
 
-        const isLibrary = prepared.source === 'library';
-        const isCamera = prepared.source === 'camera';
+        const shouldCenterCrop = prepared.source === 'library';
+        const shouldReencodeCamera = prepared.source === 'camera';
 
         // Use provided dimensions when available (ImagePicker often gives these).
         // If missing, try to resolve them from the file uri.
         let w = Number(prepared.width || 0);
         let h = Number(prepared.height || 0);
-        if ((isLibrary || isCamera) && (!w || !h)) {
+        if ((shouldCenterCrop || shouldReencodeCamera) && (!w || !h)) {
           const size = await getImageSizeAsync(prepared.uri);
           if (size) {
             w = Number(size.width || 0);
@@ -606,39 +660,9 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         }
 
         const actions: any[] = [];
-        const maxWidth = 1536;
-
-        // Keep track of expected output dimensions after crop so we don't resize unnecessarily.
-        let outW = w;
-        let outH = h;
-
-        // Camera captures: crop to the guided oval region (face + neck) so the model sees mostly skin.
-        // This dramatically improves reliability in cloudy/mixed lighting because background colors influence less.
-        if (isCamera && w > 0 && h > 0) {
-          const cx = w * 0.5;
-          const cy = h * FACE_OVAL_CENTER_Y;
-          const rx = w * FACE_OVAL_RX;
-          const ry = h * FACE_OVAL_RY;
-
-          // Padding: slightly wider, and *more* padding downward to keep neck in-frame.
-          const padX = rx * 0.20;
-          const padTop = ry * 0.35;
-          const padBottom = ry * 0.70;
-
-          const x0 = clampNum(Math.floor(cx - rx - padX), 0, Math.max(0, w - 2));
-          const y0 = clampNum(Math.floor(cy - ry - padTop), 0, Math.max(0, h - 2));
-          const x1 = clampNum(Math.ceil(cx + rx + padX), x0 + 1, w);
-          const y1 = clampNum(Math.ceil(cy + ry + padBottom), y0 + 1, h);
-
-          const cropW = Math.max(1, x1 - x0);
-          const cropH = Math.max(1, y1 - y0);
-          actions.push({ crop: { originX: x0, originY: y0, width: cropW, height: cropH } });
-          outW = cropW;
-          outH = cropH;
-        }
 
         // Library photos: center-crop to a portrait-ish frame (keeps face centered without relying on overlay math).
-        if (!actions.length && isLibrary && w > 0 && h > 0) {
+        if (shouldCenterCrop && w > 0 && h > 0) {
           // Portrait-ish aspect ratio (width / height).
           const targetAspect = 3 / 4;
 
@@ -653,24 +677,25 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
           const originX = Math.max(0, Math.round((w - cropW) / 2));
           const originY = Math.max(0, Math.round((h - cropH) / 2));
 
-          actions.push({ crop: { originX, originY, width: cropW, height: cropH } });
-          outW = cropW;
-          outH = cropH;
-        }
+          actions.push({
+            crop: { originX, originY, width: cropW, height: cropH },
+          });
 
-        // Resize down if huge (keeps uploads fast and consistent).
-        if (outW > maxWidth) {
-          actions.push({ resize: { width: maxWidth } });
-          outW = maxWidth;
-          outH = 0;
+          // Resize down if huge (keeps uploads fast and consistent).
+          const maxWidth = 1536;
+          if (w > maxWidth) {
+            actions.push({ resize: { width: maxWidth } });
+          }
+        } else {
+          // If we couldn't crop, still resize down if huge.
+          const maxWidth = 1536;
+          if (w > maxWidth) {
+            actions.push({ resize: { width: maxWidth } });
+          }
         }
 
         // Re-encode camera images to consistent JPEG (helps Vision), and also re-encode when converting HEIC/HEIF or applying transforms.
-        // Re-encode to consistent JPEG whenever:
-        // - the source is HEIC/HEIF
-        // - we applied transforms (crop/resize)
-        // - the source is a camera capture (normalizes device differences)
-        if (looksHeic || actions.length > 0 || isCamera) {
+        if (looksHeic || actions.length > 0 || shouldReencodeCamera) {
           const result = await ImageManipulator.manipulateAsync(
             prepared.uri,
             actions.length ? actions : [],
@@ -913,8 +938,10 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     void sendChat(trimmed);
   };
 
-  // Use different bottom padding depending on keyboard state
-  const bottomPadding = keyboardHeight > 0 ? keyboardHeight + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
+  // Use different bottom padding depending on keyboard state.
+  // Screens render ABOVE the tab bar, so subtract its height to avoid an oversized jump.
+  const keyboardInset = keyboardHeight > 0 ? Math.max(0, keyboardHeight - tabBarHeight) : 0;
+  const bottomPadding = keyboardHeight > 0 ? keyboardInset + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
