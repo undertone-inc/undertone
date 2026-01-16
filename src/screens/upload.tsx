@@ -181,11 +181,18 @@ type HistoryItem = {
 
 type ChatRole = 'user' | 'assistant';
 
+type ChatMessageKind = 'analysis' | 'kit_recs' | 'buy_recs';
+
 type ChatMessage = {
   id: string;
   role: ChatRole;
   text: string;
   createdAt: string;
+  kind?: ChatMessageKind;
+  // When kind === 'kit_recs', we keep the structured picks so “Save” can
+  // persist the exact products that were recommended.
+  kitProducts?: SavedKitProduct[];
+  savedClientId?: string;
 };
 
 type ChatStore = Record<string, ChatMessage[]>;
@@ -214,6 +221,20 @@ function displayUndertone(raw: unknown): string {
     .filter(Boolean)
     .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
     .join('-');
+}
+
+type SeasonKey = 'spring' | 'summer' | 'autumn' | 'winter';
+
+function normalizeSeasonKey(raw: unknown): SeasonKey | null {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'spring' || s === 'summer' || s === 'autumn' || s === 'winter') return s as SeasonKey;
+  return null;
+}
+
+function displaySeason(raw: unknown): string {
+  const s = normalizeSeasonKey(raw);
+  if (!s) return '';
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 
@@ -284,7 +305,9 @@ function safeParseKitLog(raw: string | null): KitLogLite {
 
 function categoryItems(kit: KitLogLite, nameWant: string): KitItemLite[] {
   const cats = Array.isArray(kit?.categories) ? kit.categories : [];
-  const want = String(nameWant || '').trim().toLowerCase();
+  let want = String(nameWant || '').trim().toLowerCase();
+  // Migration/alias: "Base" is now "Foundation" in Your Kit.
+  if (want === 'base') want = 'foundation';
   if (!want) return [];
 
   const exact = cats.find((c) => String(c?.name || '').trim().toLowerCase() === want);
@@ -431,66 +454,145 @@ const BUY_RECS: Record<UndertoneKey, { base: string[]; cheeks: string[]; eyes: s
   },
 };
 
-function buildPostScanRecommendationsText(opts: { undertoneRaw: unknown; kitRaw: string | null }): string {
+type SavedKitProduct = { category: string; name: string; shade?: string };
+
+function buildKitRecommendationsPayload(opts: {
+  undertoneRaw: unknown;
+  kitRaw: string | null;
+}): { text: string; products: SavedKitProduct[] } {
   const u = normalizeUndertoneKey(opts.undertoneRaw);
-  if (!u) return '';
+  if (!u) return { text: '', products: [] };
 
   const kit = safeParseKitLog(opts.kitRaw);
 
-  const baseItems = categoryItems(kit, 'base');
+  // "Base" migrated to "Foundation" in Your Kit.
+  const foundationItems = categoryItems(kit, 'foundation');
   const cheekItems = categoryItems(kit, 'cheeks');
   const eyeItems = categoryItems(kit, 'eyes');
   const lipItems = categoryItems(kit, 'lips');
 
-  const basePicks = pickBestKitItems(baseItems, u, 2);
+  const foundationPicks = pickBestKitItems(foundationItems, u, 2);
   const cheekPicks = pickBestKitItems(cheekItems, u, 2);
   const eyePicks = pickBestKitItems(eyeItems, u, 2);
   const lipPicks = pickBestKitItems(lipItems, u, 2);
 
+  const products: SavedKitProduct[] = [];
   const lines: string[] = [];
-
   lines.push('Best matches from your kit:');
 
-  const block = (label: string, picks: KitItemLite[]) => {
+  const addProducts = (category: string, picks: KitItemLite[]) => {
+    picks.forEach((it) => {
+      const brand = String(it?.brand || '').trim();
+      const name = String(it?.name || '').trim();
+      const shade = String(it?.shade || '').trim();
+      const fullName = [brand, name].filter(Boolean).join(' ').trim() || 'Unnamed item';
+      products.push({ category, name: fullName, shade: shade || undefined });
+    });
+  };
+
+  const block = (label: string, category: string, picks: KitItemLite[], first = false) => {
+    if (!first) lines.push('');
     if (!picks.length) {
-      lines.push(`${label}: (add items in KitLog to get picks)`);
+      lines.push(`${label}: (add items to your kit...)`);
       return;
     }
     lines.push(`${label}:`);
     picks.forEach((it) => lines.push(`- ${formatKitItemLine(it)}`));
+    addProducts(category, picks);
   };
 
-  block('Base', basePicks);
-  block('Cheeks', cheekPicks);
-  block('Eyes', eyePicks);
-  block('Lips', lipPicks);
+  block('Foundation', 'Foundation', foundationPicks, true);
+  block('Cheeks', 'Cheeks', cheekPicks);
+  block('Eyes', 'Eyes', eyePicks);
+  block('Lips', 'Lips', lipPicks);
 
+  return { text: lines.join('\n'), products };
+}
+
+function undertoneDirection(u: UndertoneKey): 'cool' | 'neutral' | 'warm' {
+  const n = undertoneToNumber(u);
+  if (n > 0) return 'warm';
+  if (n < 0) return 'cool';
+  return 'neutral';
+}
+
+function baseShadeHint(u: UndertoneKey, season: SeasonKey): string {
+  const dir = undertoneDirection(u);
+  const tone =
+    dir === 'warm'
+      ? 'warm/golden'
+      : dir === 'cool'
+      ? 'cool/rosy'
+      : 'neutral';
+
+  // Season nuance (kept subtle for complexion products).
+  const nuance = season === 'winter' ? 'clear' : season === 'autumn' ? 'rich' : season === 'spring' ? 'fresh' : 'soft';
+  return `${tone} (${season}, ${nuance})`;
+}
+
+function colorShadeHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, season: SeasonKey): string {
+  const dir = undertoneDirection(u);
+
+  const pick = (cool: string, neutral: string, warm: string) => (dir === 'cool' ? cool : dir === 'warm' ? warm : neutral);
+
+  let base = '';
+
+  if (category === 'cheeks') {
+    if (season === 'spring') base = pick('cool pink', 'peach-pink', 'peach/coral');
+    else if (season === 'summer') base = pick('soft rose', 'dusty rose', 'soft peach');
+    else if (season === 'autumn') base = pick('mauve-rose', 'rose-bronze', 'apricot/terracotta');
+    else base = pick('berry', 'deep rose', 'warm red');
+
+    return `${base} (${season})`;
+  }
+
+  if (category === 'eyes') {
+    if (season === 'spring') base = pick('cool champagne', 'taupe-champagne', 'golden champagne');
+    else if (season === 'summer') base = pick('cool taupe', 'soft taupe', 'warm taupe');
+    else if (season === 'autumn') base = pick('cool brown', 'mushroom brown', 'bronze/olive');
+    else base = pick('charcoal/plum', 'deep taupe', 'deep bronze');
+
+    return `${base} (${season})`;
+  }
+
+  // lips
+  if (season === 'spring') base = pick('raspberry pink', 'warm rose', 'coral');
+  else if (season === 'summer') base = pick('mauve', 'rose', 'warm rose');
+  else if (season === 'autumn') base = pick('berry-brown', 'rose-brown', 'brick/terracotta');
+  else base = pick('blue-red/cranberry', 'classic red', 'true red');
+
+  return `${base} (${season})`;
+}
+
+function buildBuyRecommendationsText(opts: { undertoneRaw: unknown; seasonRaw: unknown }): string {
+  const u = normalizeUndertoneKey(opts.undertoneRaw);
+  if (!u) return '';
+
+  const season = normalizeSeasonKey(opts.seasonRaw) || 'summer';
   const buy = BUY_RECS[u] || BUY_RECS.neutral;
 
-  lines.push('');
-  lines.push('Recommended to buy (real product names):');
+  const lines: string[] = [];
+  lines.push('Recommended to buy:');
 
-  const buyBlock = (label: string, arr: string[]) => {
+  const addBlock = (label: string, arr: string[], shadeHint: string) => {
     const list = Array.isArray(arr) ? arr.slice(0, 2) : [];
     if (!list.length) return;
-    lines.push(`${label}:`);
-    list.forEach((x) => lines.push(`- ${x}`));
+    lines.push('');
+    lines.push(`${label} (shade: ${shadeHint}):`);
+    list.forEach((x) => lines.push(`- ${x} — Shade: ${shadeHint}`));
   };
 
-  buyBlock('Base', buy.base);
-  buyBlock('Cheeks', buy.cheeks);
-  buyBlock('Eyes', buy.eyes);
-  buyBlock('Lips', buy.lips);
+  addBlock('Foundation', buy.base, baseShadeHint(u, season));
+  addBlock('Cheeks', buy.cheeks, colorShadeHint('cheeks', u, season));
+  addBlock('Eyes', buy.eyes, colorShadeHint('eyes', u, season));
+  addBlock('Lips', buy.lips, colorShadeHint('lips', u, season));
 
-  lines.push('');
-  lines.push('Tip: pick shades labeled for this undertone; exact shade still depends on depth and preference.');
-
-	return lines.join('\n');
+  return lines.join('\n');
 }
 
 function formatAnalysisToText(analysis: any): string {
   const undertone = displayUndertone(analysis?.undertone) || 'Unknown';
-  const confidence = Number(analysis?.confidence ?? 0);
+  const season = normalizeSeasonKey(analysis?.season);
 
   const bestNeutrals = compactList(analysis?.recommendations?.best_neutrals);
   const accentColors = compactList(analysis?.recommendations?.accent_colors);
@@ -504,7 +606,7 @@ function formatAnalysisToText(analysis: any): string {
 
   const lines: string[] = [];
   lines.push(`Undertone: ${undertone}`);
-  if (Number.isFinite(confidence) && confidence > 0) lines.push(`Confidence: ${confidence}%`);
+  lines.push(`Season: ${season || 'unknown'}`);
 
   if (analysis?.photo_quality?.notes) {
     const q = String(analysis.photo_quality.notes).trim();
@@ -776,6 +878,17 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   };
 
   const activeChat = getChatFor(analysisId);
+
+  const hasKitRecs = useMemo(() => activeChat.some((m) => m?.kind === 'kit_recs'), [activeChat]);
+  const hasBuyRecs = useMemo(() => activeChat.some((m) => m?.kind === 'buy_recs'), [activeChat]);
+
+  const lastUnsavedKitRecId = useMemo(() => {
+    for (let i = activeChat.length - 1; i >= 0; i--) {
+      const m = activeChat[i];
+      if (m?.kind === 'kit_recs' && !m?.savedClientId) return m.id;
+    }
+    return null;
+  }, [activeChat]);
 
   const activeChatTitle = useMemo(() => {
     if (!analysisId) return 'Your scans';
@@ -1049,30 +1162,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       ].slice(0, 20);
       await saveHistory(nextHistory);
 
-      // Seed chat with: "photo uploaded" + the structured analysis summary
-      const recText = (() => {
-        try {
-          // Pull from KitLog on-device and build recommendations.
-          // (No network / no hallucinated product lists.)
-          return buildPostScanRecommendationsText({
-            undertoneRaw: nextAnalysis?.undertone,
-            kitRaw: null,
-          });
-        } catch {
-          return '';
-        }
-      })();
 
-      // Load KitLog raw (scoped per user) for real in-kit matching.
-      let kitRaw: string | null = null;
-      try {
-        kitRaw = await getString(kitlogKey);
-      } catch {
-        kitRaw = null;
-      }
-
-      const recTextFinal = buildPostScanRecommendationsText({ undertoneRaw: nextAnalysis?.undertone, kitRaw });
-
+      // Seed chat with: "photo uploaded" + analysis summary.
 	  const seedMsgs: ChatMessage[] = [
 	    {
 	      id: makeId(),
@@ -1083,19 +1174,11 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 	    {
 	      id: makeId(),
 	      role: 'assistant',
+	      kind: 'analysis',
 	      text: formatAnalysisToText(nextAnalysis),
 	      createdAt: new Date().toISOString(),
 	    },
 	  ];
-
-	  if (recTextFinal) {
-	    seedMsgs.push({
-	      id: makeId(),
-	      role: 'assistant',
-	      text: recTextFinal,
-	      createdAt: new Date().toISOString(),
-	    });
-	  }
 
 	  await upsertChatFor(id, seedMsgs);
     } catch (e: any) {
@@ -1185,6 +1268,131 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         },
       },
     ]);
+  };
+
+  const recommendFromKit = async () => {
+    if (!analysisId) return;
+    const undertoneRaw = analysis?.undertone;
+
+    let kitRaw: string | null = null;
+    try {
+      kitRaw = await getString(kitlogKey);
+    } catch {
+      kitRaw = null;
+    }
+
+    const payload = buildKitRecommendationsPayload({ undertoneRaw, kitRaw });
+    const text = String(payload?.text || '').trim();
+    if (!text) return;
+
+    const assistantMsg: ChatMessage = {
+      id: makeId(),
+      role: 'assistant',
+      kind: 'kit_recs',
+      text,
+      kitProducts: Array.isArray(payload?.products) ? payload.products : [],
+      createdAt: new Date().toISOString(),
+    };
+
+    const current = getChatFor(analysisId);
+    await upsertChatFor(analysisId, [...current, assistantMsg]);
+  };
+
+  const recommendToBuy = async () => {
+    if (!analysisId) return;
+    const text = buildBuyRecommendationsText({ undertoneRaw: analysis?.undertone, seasonRaw: analysis?.season });
+    const t = String(text || '').trim();
+    if (!t) return;
+
+    const assistantMsg: ChatMessage = {
+      id: makeId(),
+      role: 'assistant',
+      kind: 'buy_recs',
+      text: t,
+      createdAt: new Date().toISOString(),
+    };
+
+    const current = getChatFor(analysisId);
+    await upsertChatFor(analysisId, [...current, assistantMsg]);
+  };
+
+  const saveKitRecsToClients = async (kitMsgId: string) => {
+    if (!analysisId) return;
+    const msgs = getChatFor(analysisId);
+    const hit = msgs.find((m) => m.id === kitMsgId);
+    if (!hit || hit.kind !== 'kit_recs') return;
+    if (hit.savedClientId) return;
+
+    const products = Array.isArray(hit.kitProducts) ? hit.kitProducts : [];
+
+    // Read existing catalog
+    let catalog: any = null;
+    try {
+      catalog = await getJson<any>(catalogKey);
+    } catch {
+      catalog = null;
+    }
+
+    const existingClients = Array.isArray(catalog?.clients) ? catalog.clients : [];
+
+    // Next "Scan N" label
+    let max = 0;
+    existingClients.forEach((c: any) => {
+      const name = String(c?.displayName || '').trim();
+      const m = /^scan\s+(\d+)$/i.exec(name);
+      if (!m) return;
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > max) max = n;
+    });
+    const scanLabel = `Scan ${max + 1}`;
+
+    const now = Date.now();
+    const uid = (prefix: string) => `${prefix}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const undertoneKey = normalizeUndertoneKey(analysis?.undertone);
+    const seasonKey = normalizeSeasonKey(analysis?.season);
+
+    const clientId = uid('client');
+    const clientProducts = products.map((p) => ({
+      id: uid('prod'),
+      category: String(p?.category || 'Foundation'),
+      name: String(p?.name || '').trim(),
+      shade: String(p?.shade || '').trim(),
+      notes: 'Recommended from kit',
+      createdAt: now,
+      updatedAt: now,
+    })).filter((p: any) => !!p.name);
+
+    const nextClient: any = {
+      id: clientId,
+      displayName: scanLabel,
+      undertone: (undertoneKey || 'unknown') as any,
+      season: seasonKey || null,
+      trialDate: '',
+      finalDate: '',
+      eventType: '',
+      notes: '',
+      products: clientProducts,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const nextCatalog = {
+      version: 1,
+      clients: [nextClient, ...existingClients],
+    };
+
+    try {
+      await setJson(catalogKey, nextCatalog);
+    } catch (e: any) {
+      Alert.alert('Save failed', String(e?.message || e));
+      return;
+    }
+
+    const nextMsgs = msgs.map((m) => (m.id === kitMsgId ? { ...m, savedClientId: clientId } : m));
+    await upsertChatFor(analysisId, nextMsgs);
+
+    Alert.alert('Saved', `${scanLabel} was added to Clients.`);
   };
 
 
@@ -1311,19 +1519,68 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
             >
               {activeChat.length ? (
                 activeChat.map((m) => (
-                  <View
-                    key={m.id}
-                    style={[
-                      styles.chatBubble,
-                      m.role === 'user' ? styles.chatBubbleUser : styles.chatBubbleAssistant,
-                    ]}
-                  >
-                    <Text style={[styles.chatBubbleText, m.role === 'user' && styles.chatBubbleTextUser]}>
-                      {m.text}
-                    </Text>
+                  <View key={m.id}>
+                    <View
+                      style={[
+                        styles.chatBubble,
+                        m.role === 'user' ? styles.chatBubbleUser : styles.chatBubbleAssistant,
+                      ]}
+                    >
+                      <Text style={[styles.chatBubbleText, m.role === 'user' && styles.chatBubbleTextUser]}>
+                        {m.text}
+                      </Text>
+                    </View>
+
+                    {m.id === lastUnsavedKitRecId ? (
+                      <View style={styles.kitSaveRow}>
+                        <TouchableOpacity
+                          style={[styles.kitSaveBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
+                          disabled={analysisLoading || chatLoading}
+                          onPress={() => {
+                            Keyboard.dismiss();
+                            void saveKitRecsToClients(m.id);
+                          }}
+                          accessibilityRole="button"
+                        >
+                          <Text style={styles.kitSaveBtnText}>Save</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ) : null}
                   </View>
                 ))
-              ): null}
+              ) : null}
+
+              {!analysisLoading && analysisId && analysis && (!hasKitRecs || !hasBuyRecs) ? (
+                <View style={styles.recommendRow}>
+                  {!hasKitRecs ? (
+                    <TouchableOpacity
+                      style={[styles.recommendBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
+                      disabled={analysisLoading || chatLoading}
+                      onPress={() => {
+                        Keyboard.dismiss();
+                        void recommendFromKit();
+                      }}
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.recommendBtnText}>Recommend from kit</Text>
+                    </TouchableOpacity>
+                  ) : null}
+
+                  {!hasBuyRecs ? (
+                    <TouchableOpacity
+                      style={[styles.recommendBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
+                      disabled={analysisLoading || chatLoading}
+                      onPress={() => {
+                        Keyboard.dismiss();
+                        void recommendToBuy();
+                      }}
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.recommendBtnText}>Recommend to buy</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+              ) : null}
 
               {analysisLoading ? (
                 <View style={[styles.chatBubble, styles.chatBubbleAssistant, styles.loadingBubble]}>
@@ -1549,6 +1806,50 @@ const styles = StyleSheet.create({
   },
   chatBubbleTextUser: {
     color: '#ffffff',
+  },
+  recommendRow: {
+    maxWidth: '92%',
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 2,
+  },
+  recommendBtn: {
+    flex: 1,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recommendBtnText: {
+    color: '#111827',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  kitSaveRow: {
+    maxWidth: '92%',
+    alignSelf: 'flex-start',
+    marginTop: 8,
+  },
+  kitSaveBtn: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#111111',
+    backgroundColor: '#111111',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'flex-start',
+  },
+  kitSaveBtnText: {
+    color: '#ffffff',
+    fontWeight: '800',
+    fontSize: 13,
   },
   loadingBubble: {
     flexDirection: 'row',

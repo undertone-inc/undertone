@@ -854,12 +854,27 @@ function softenQualityNotes(s) {
 function sanitizeAnalysis(raw) {
   // Minimal client response with strict fields.
   // - undertone: one of the 5 labels
+  // - season: one of the 4 seasons
   // - photo_ok: whether a real human face is present + usable
   // - issue: why a photo is not usable (or "ok")
   // - confidence: 0-100 (undertone confidence; capped low when photo_ok is false)
 
   const undertoneNorm = normalizeUndertoneValue(raw?.undertone);
   const undertone = undertoneNorm || "neutral";
+
+  const seasonRaw = String(raw?.season ?? raw?.color_season ?? raw?.season4 ?? "").trim().toLowerCase();
+  const allowedSeasons = new Set(["spring", "summer", "autumn", "winter"]);
+  let season = allowedSeasons.has(seasonRaw) ? seasonRaw : "";
+
+  // Best-effort fallback if season isn't provided.
+  if (!season) {
+    // Classic 4-season heuristic: warm-leaning tends to spring/autumn; cool-leaning tends to summer/winter.
+    // Without clear contrast info, default to the lighter/softer season.
+    const u = undertone;
+    if (u === "warm" || u === "neutral-warm") season = "spring";
+    else if (u === "cool" || u === "neutral-cool") season = "summer";
+    else season = "summer";
+  }
 
   const photoOkRaw =
     raw?.photo_ok ??
@@ -892,7 +907,7 @@ function sanitizeAnalysis(raw) {
   let confidence = clampInt(raw?.confidence, 0, 100, 55);
   if (photo_ok === false) confidence = Math.min(confidence, 20);
 
-  return { undertone, photo_ok, issue, confidence };
+  return { undertone, season, photo_ok, issue, confidence };
 }
 
 
@@ -1052,7 +1067,7 @@ async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUr
     throw new Error("Missing OPENAI_API_KEY on server");
   }
 
-  // Structured Outputs schema (photo validity + undertone)
+  // Structured Outputs schema (photo validity + undertone + season)
   const schema = {
     type: "object",
     additionalProperties: false,
@@ -1072,9 +1087,10 @@ async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUr
         ],
       },
       undertone: { type: "string", enum: ["cool", "neutral-cool", "neutral", "neutral-warm", "warm"] },
+      season: { type: "string", enum: ["spring", "summer", "autumn", "winter"] },
       confidence: { type: "integer", minimum: 0, maximum: 100 },
     },
-    required: ["photo_ok", "issue", "undertone", "confidence"],
+    required: ["photo_ok", "issue", "undertone", "season", "confidence"],
   };
 
   const systemPrompt =
@@ -1086,6 +1102,8 @@ async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUr
     " Return exactly one undertone from: cool | neutral-cool | neutral | neutral-warm | warm." +
     " Use neutral-cool / neutral-warm ONLY when the skin appears neutral overall but clearly leans cool or warm." +
     " If uncertain (but photo_ok=true), choose neutral." +
+    " Also estimate the person's 4-season color season: spring | summer | autumn | winter (best-effort)." +
+    " If uncertain, pick the most likely season given undertone: warm-leaning often spring/autumn, cool-leaning often summer/winter." +
     " Provide confidence 0-100 for the undertone classification. If photo_ok=false, keep confidence low (0-20)." +
     " Be neutral and non-judgmental. Do NOT comment on attractiveness, body shape, health, age, or race/ethnicity." +
     " Return JSON that matches the provided schema.";
@@ -1093,6 +1111,7 @@ async function callOpenAIForAnalysis({ dataUrl, dataUrlNormalized = null, dataUr
   const userText =
     "1) Determine if a real human face is present and usable for undertone analysis." +
     " 2) If usable, output undertone (cool/neutral-cool/neutral/neutral-warm/warm)." +
+    " 3) If usable, output a 4-season color season (spring/summer/autumn/winter)." +
     " Issue enum: ok | no_human_face | face_not_clear | face_too_far | lighting_poor | obstructed | multiple_faces | not_a_photo." +
     " If multiple images are provided: the first is the original, the second is a mild white-balanced version (reduces color-cast), and an optional third is a tighter crop of the face/neck.";
 

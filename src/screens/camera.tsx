@@ -568,8 +568,8 @@ export default function CameraScreen({ navigation }: any) {
                   index: 0,
                   routes: [
                     { name: 'Upload', params: { capturedPhoto: picked } },
-                    { name: 'Catalog' },
-                    { name: 'KitLog' },
+                    { name: 'Clients' },
+						{ name: 'YourKit' },
                     { name: 'Account' },
                   ],
                 },

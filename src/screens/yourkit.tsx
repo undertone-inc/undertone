@@ -64,9 +64,7 @@ type HomeAttentionMode = 'low' | 'empty' | 'expiring';
 
 const TONE_OPTIONS = [
   { key: 'cool', label: 'Cool' },
-  { key: 'neutral-cool', label: 'Neutral-Cool' },
   { key: 'neutral', label: 'Neutral' },
-  { key: 'neutral-warm', label: 'Neutral-Warm' },
   { key: 'warm', label: 'Warm' },
 ] as const;
 
@@ -89,24 +87,39 @@ function uid(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const FOUNDATION_CATEGORY_NAME = 'Foundation';
+
+// Core/default categories (non-deletable). User-added categories are deletable.
+const CORE_CATEGORY_ORDER = [
+  'Prep & Skin',
+  FOUNDATION_CATEGORY_NAME,
+  'Lips',
+  'Cheeks',
+  'Eyes',
+  'Brows',
+  'Lashes',
+  'Tools',
+  'Hygiene & Disposables',
+  'Body / FX / Extras',
+];
+
+const CORE_CATEGORY_NAME_SET = new Set(CORE_CATEGORY_ORDER.map((n) => n.trim().toLowerCase()));
+
+function isCoreCategoryName(name: string): boolean {
+  return CORE_CATEGORY_NAME_SET.has((name || '').trim().toLowerCase());
+}
+
+function normalizeCategoryName(raw: any): string {
+  const t = typeof raw === 'string' ? raw.trim() : '';
+  if (!t) return '';
+  // Migration: "Base" -> "Foundation".
+  if (t.toLowerCase() === 'base') return FOUNDATION_CATEGORY_NAME;
+  return t;
+}
+
 function defaultCategories(): KitCategory[] {
   const now = Date.now();
-  const names = [
-    // Put Prep & Skin first (user request).
-    'Prep & Skin',
-    // Core defaults
-    'Base',
-    'Lips',
-    'Cheeks',
-    'Eyes',
-    'Brows',
-    'Lashes',
-    'Tools',
-    'Hygiene & Disposables',
-    'Body / FX / Extras',
-  ];
-
-  return names.map((name) => ({
+  return CORE_CATEGORY_ORDER.map((name) => ({
     id: uid('cat'),
     name,
     createdAt: now,
@@ -174,7 +187,7 @@ function normalizeData(input: any): KitLogData {
       .map((c: any) => {
         if (!c) return null;
         const id = typeof c.id === 'string' ? c.id : uid('cat');
-        const name = typeof c.name === 'string' && c.name.trim() ? c.name.trim() : 'Untitled';
+        const name = normalizeCategoryName(c.name) || 'Untitled';
         const createdAt = typeof c.createdAt === 'number' ? c.createdAt : Date.now();
         const itemsRaw = Array.isArray(c.items) ? c.items : [];
 
@@ -214,13 +227,33 @@ function normalizeData(input: any): KitLogData {
       .filter(Boolean) as KitCategory[];
 
     if (normalizedCats.length === 0) return base;
-    return { version: 1, categories: normalizedCats };
+
+    // Merge duplicate categories created by migration (e.g., "Base" + "Foundation").
+    const merged: KitCategory[] = [];
+    const byName = new Map<string, number>();
+    for (const cat of normalizedCats) {
+      const key = (cat.name || '').trim().toLowerCase();
+      const idx = byName.get(key);
+      if (idx === undefined) {
+        byName.set(key, merged.length);
+        merged.push(cat);
+      } else {
+        const existing = merged[idx];
+        merged[idx] = {
+          ...existing,
+          createdAt: Math.min(existing.createdAt, cat.createdAt),
+          items: [...existing.items, ...cat.items],
+        };
+      }
+    }
+
+    return { version: 1, categories: merged };
   } catch {
     return base;
   }
 }
 
-const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
+const YourKit: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const storageKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
@@ -248,6 +281,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
   const [mode, setMode] = useState<'home' | 'category' | 'item'>('home');
   const [activeCategoryId, setActiveCategoryId] = useState<string | null>(null);
   const [activeItemId, setActiveItemId] = useState<string | null>(null);
+  const [newItemId, setNewItemId] = useState<string | null>(null);
 
   const [search, setSearch] = useState('');
   const [view, setView] = useState<ViewMode>('all');
@@ -343,7 +377,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
         });
 
     // Keep Prep & Skin first, then the core face areas.
-    const priority = ['prep & skin', 'base', 'lips', 'cheeks', 'eyes'] as const;
+    const priority = ['prep & skin', 'foundation', 'lips', 'cheeks', 'eyes'] as const;
     const rank = new Map<string, number>(priority.map((n, i) => [n, i]));
 
     // Stable sort: preserve existing order for non-priority categories.
@@ -466,6 +500,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
     setMode('category');
     setView('all');
     setQuickAddText('');
+    setNewItemId(null);
   }
 
   function closeCategory() {
@@ -475,6 +510,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
     setView('all');
     setQuickAddText('');
     setSearch('');
+    setNewItemId(null);
   }
 
   function openItemDirect(categoryId: string, itemId: string) {
@@ -484,28 +520,87 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
     setView('all');
     setQuickAddText('');
     setSearch('');
+    setNewItemId(null);
   }
 
   function openItem(itemId: string) {
     setActiveItemId(itemId);
     setMode('item');
+    setNewItemId(null);
+  }
+
+  function isBlankItem(it: KitItem): boolean {
+    const nameEmpty = !(it.name || '').trim();
+    const brandEmpty = !(it.brand || '').trim();
+    const shadeEmpty = !(it.shade || '').trim();
+    const undertoneEmpty = !(it.undertone || '').trim();
+    const formEmpty = !(it.form || '').trim();
+    const locationEmpty = !(it.location || '').trim();
+    const qtyEmpty = !(it.quantity || '').trim();
+    const purchaseEmpty = !(it.purchaseDate || '').trim();
+    const openedEmpty = !(it.openedDate || '').trim();
+    const expiryEmpty = !(it.expiryDate || '').trim();
+    const notesEmpty = !(it.notes || '').trim();
+    const statusDefault = it.status === 'inKit';
+
+    return (
+      nameEmpty &&
+      brandEmpty &&
+      shadeEmpty &&
+      undertoneEmpty &&
+      formEmpty &&
+      locationEmpty &&
+      qtyEmpty &&
+      purchaseEmpty &&
+      openedEmpty &&
+      expiryEmpty &&
+      notesEmpty &&
+      statusDefault
+    );
   }
 
   function closeItem() {
+    const catId = activeCategoryId;
+    const itemId = activeItemId;
+
+    // If the user opened the panel from the + button without filling anything,
+    // discard the empty placeholder item on close.
+    if (catId && itemId && newItemId === itemId && activeItem && isBlankItem(activeItem)) {
+      setData((prev) => ({
+        ...prev,
+        categories: prev.categories.map((c) => {
+          if (c.id !== catId) return c;
+          return { ...c, items: c.items.filter((it) => it.id !== itemId) };
+        }),
+      }));
+    }
+
     setMode('category');
     setActiveItemId(null);
+    setNewItemId(null);
   }
 
   function addCategoryFromBar() {
-    const name = newCategoryText.trim();
+    const name = normalizeCategoryName(newCategoryText).trim();
     if (!name) {
       Keyboard.dismiss();
       return;
     }
 
+    // If the category already exists, jump to it instead of creating a duplicate.
+    const existing = data.categories.find((c) => (c.name || '').trim().toLowerCase() === name.toLowerCase());
+    if (existing) {
+      setNewCategoryText('');
+      Keyboard.dismiss();
+      openCategory(existing.id);
+      return;
+    }
+
     const now = Date.now();
     const cat: KitCategory = { id: uid('cat'), name, createdAt: now, items: [] };
-    setData((prev) => ({ ...prev, categories: [cat, ...prev.categories] }));
+
+    // Append so the default/core category order stays intact.
+    setData((prev) => ({ ...prev, categories: [...prev.categories, cat] }));
     setNewCategoryText('');
     Keyboard.dismiss();
   }
@@ -513,6 +608,9 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
   function confirmDeleteCategory(categoryId: string) {
     const cat = data.categories.find((c) => c.id === categoryId);
     if (!cat) return;
+
+    // Only user-added categories can be deleted.
+    if (isCoreCategoryName(cat.name)) return;
 
     Alert.alert('Delete category?', `"${cat.name}" and all its items will be removed.`, [
       { text: 'Cancel', style: 'cancel' },
@@ -553,10 +651,6 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
   function quickAddItem() {
     if (!activeCategoryId) return;
     const text = quickAddText.trim();
-    if (!text) {
-      Keyboard.dismiss();
-      return;
-    }
 
     const now = Date.now();
     const newId = uid('item');
@@ -592,6 +686,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
 
     // Open item editor immediately so user can fill details.
     setActiveItemId(newId);
+    setNewItemId(newId);
     setMode('item');
   }
 
@@ -711,6 +806,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
                   <View style={styles.categoryList}>
                     {visibleCategories.map((cat, idx) => {
                       const isLast = idx === visibleCategories.length - 1;
+                      const isCore = isCoreCategoryName(cat.name);
                       const total = cat.items.length;
                       const inKitCount = cat.items.reduce((acc, it) => acc + (it.status === 'inKit' ? 1 : 0), 0);
                       const lowCount = cat.items.reduce((acc, it) => acc + (it.status === 'low' ? 1 : 0), 0);
@@ -747,7 +843,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
                                 </Text>
                               </View>
 
-                              <View style={styles.categoryRackBar}>
+                              <View style={[styles.categoryRackBar, !isCore ? styles.categoryRackBarShort : null]}>
                                 {fillUnits > 0 ? (
                                   <View style={[styles.categoryRackFill, { flex: fillUnits }]}>
                                     {inKitCount > 0 ? (
@@ -774,6 +870,19 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
                                 </Text>
                               ) : null}
                             </View>
+
+                            {!isCore ? (
+                              <View style={styles.categoryListRowActions}>
+                                <TouchableOpacity
+                                  style={styles.categoryDeleteBtn}
+                                  onPress={() => confirmDeleteCategory(cat.id)}
+                                  accessibilityRole="button"
+                                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                                >
+                                  <Ionicons name="trash-outline" size={18} color="#9ca3af" />
+                                </TouchableOpacity>
+                              </View>
+                            ) : null}
                           </TouchableOpacity>
                         </View>
                       );
@@ -1047,7 +1156,7 @@ const KitLog: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
             presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
             onRequestClose={closeItem}
           >
-            <SafeAreaView style={[styles.modalSafe, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
+            <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
               <View style={styles.modalContainer}>
                 <View style={styles.modalHeader}>
                   <TouchableOpacity style={styles.modalBack} onPress={closeItem} accessibilityRole="button">
@@ -1603,6 +1712,18 @@ const styles = StyleSheet.create({
     marginTop: 0,
   },
 
+  categoryDeleteBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  categoryDeletePlaceholder: {
+    width: 34,
+    height: 34,
+  },
+
   categoryCard: {
     borderWidth: 1,
     borderColor: '#e5e7eb',
@@ -1776,6 +1897,9 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     backgroundColor: '#f3f4f6',
     flexDirection: 'row',
+  },
+  categoryRackBarShort: {
+    marginRight: 8,
   },
   categoryRackFill: {
     flexDirection: 'row',
@@ -2199,4 +2323,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export default KitLog;
+export default YourKit;

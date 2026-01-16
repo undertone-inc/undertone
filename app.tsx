@@ -14,8 +14,8 @@ import { migrateLegacySecureStoreIfNeeded } from './src/localstore';
 import Login from './src/screens/login';
 import Upload from './src/screens/upload';
 import Account from './src/screens/account';
-import Catalog from './src/screens/catalog';
-import KitLog from './src/screens/kitlog';
+import Clients from './src/screens/clients';
+import YourKit from './src/screens/yourkit';
 import CameraScreen from './src/screens/camera';
 
 export type AuthStackParamList = {
@@ -24,8 +24,8 @@ export type AuthStackParamList = {
 
 export type AppTabParamList = {
   Upload: undefined;
-  Catalog: undefined;
-  KitLog: undefined;
+  Clients: undefined;
+  YourKit: undefined;
   Account: undefined;
 };
 
@@ -227,7 +227,7 @@ function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: Ap
       </Tabs.Screen>
 
       <Tabs.Screen
-        name="Catalog"
+        name="Clients"
         options={{
           tabBarLabel: 'clients',
           tabBarIcon: ({ color, size }) => (
@@ -235,11 +235,11 @@ function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: Ap
           ),
         }}
       >
-        {(props: any) => <Catalog {...props} email={userEmail} userId={userId} />}
+        {(props: any) => <Clients {...props} email={userEmail} userId={userId} />}
       </Tabs.Screen>
 
       <Tabs.Screen
-        name="KitLog"
+        name="YourKit"
         options={{
           tabBarLabel: 'your kit',
           tabBarIcon: ({ color, size }) => (
@@ -247,7 +247,7 @@ function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: Ap
           ),
         }}
       >
-        {(props: any) => <KitLog {...props} email={userEmail} userId={userId} />}
+        {(props: any) => <YourKit {...props} email={userEmail} userId={userId} />}
       </Tabs.Screen>
 
       <Tabs.Screen

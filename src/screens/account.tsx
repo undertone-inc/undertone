@@ -395,7 +395,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
 
   const showUploadUsage = matchesQuery('Usage', 'Upload usage', 'Upload', 'Uploads');
 
-  const showCatalog = matchesQuery('Catalog', 'clients', 'items', 'categories');
+  const showCatalog = matchesQuery('Clients', 'Catalog', 'clients', 'items', 'categories');
   const showYourKit = matchesQuery('Your kit', 'kit', 'items');
 
   const showEmailUpdates = matchesQuery('Email updates');
@@ -1159,10 +1159,10 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
                         <TouchableOpacity
                           style={styles.row}
                           activeOpacity={0.8}
-                          onPress={() => navigation.navigate('Catalog')}
+                          onPress={() => navigation.navigate('Clients')}
                           accessibilityRole="button"
                         >
-                          <Text style={styles.rowLabel}>Catalog</Text>
+                          <Text style={styles.rowLabel}>Clients</Text>
                           <Text style={styles.rowValue}>{catalogPercentValue}</Text>
                         </TouchableOpacity>
                       )}
@@ -1171,7 +1171,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
                         <TouchableOpacity
                           style={styles.row}
                           activeOpacity={0.8}
-                          onPress={() => navigation.navigate('KitLog')}
+                          onPress={() => navigation.navigate('YourKit')}
                           accessibilityRole="button"
                         >
                           <Text style={styles.rowLabel}>Your kit</Text>

@@ -32,11 +32,11 @@ const SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.8);
 // Default KitLog categories (used only if KitLog hasn't been opened yet)
 const DEFAULT_KITLOG_CATEGORIES = [
   // Match KitLog category ordering
-  'Base',
+  'Prep & Skin',
+  'Foundation',
   'Lips',
   'Cheeks',
   'Eyes',
-  'Prep & Skin',
   'Brows',
   'Lashes',
   'Tools',
@@ -44,7 +44,7 @@ const DEFAULT_KITLOG_CATEGORIES = [
   'Body / FX / Extras',
 ];
 
-const FALLBACK_CATEGORY_NAME = 'Base';
+const FALLBACK_CATEGORY_NAME = 'Foundation';
 
 // How the bottom bars sit when the keyboard is CLOSED
 // (Adds a little more breathing room above the bottom nav divider)
@@ -61,10 +61,18 @@ const MODAL_CLOSED_BOTTOM_PADDING = 56;
 const MODAL_KEYBOARD_GAP = 12;
 
 type Season4 = 'spring' | 'summer' | 'autumn' | 'winter';
-// 5-class undertone output:
-//   cool | neutral-cool | neutral | neutral-warm | warm
-// (Legacy values like "olive" are treated as neutral when loading older data.)
 type Undertone = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm' | 'unknown';
+
+const EVENT_TYPE_OPTIONS = [
+  'Wedding',
+  'Special occasion',
+  'Photoshoot',
+  'Fashion & editorial',
+  'TV',
+  'Corporate',
+] as const;
+
+type EventType = (typeof EVENT_TYPE_OPTIONS)[number];
 
 // Category is driven by KitLog (dynamic), so store it as a string (category name).
 type PlanCategory = string;
@@ -86,20 +94,21 @@ type ClientRecord = {
   season: Season4 | null;
   trialDate?: string; // YYYY-MM-DD
   finalDate?: string; // YYYY-MM-DD
+  eventType: EventType | '';
   notes?: string;
   products: ClientProduct[];
   createdAt: number;
   updatedAt: number;
 };
 
-type CatalogData = {
+type ClientsData = {
   version: 1;
   clients: ClientRecord[];
 };
 
-const EMPTY_CATALOG: CatalogData = { version: 1, clients: [] };
+const EMPTY_CATALOG: ClientsData = { version: 1, clients: [] };
 
-type CatalogScreenProps = {
+type ClientsScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
@@ -120,10 +129,10 @@ function seasonLabel(s: Season4 | null): string {
 
 function undertoneLabel(u: Undertone): string {
   if (u === 'cool') return 'Cool';
-  if (u === 'neutral-cool') return 'Neutral-Cool';
-  if (u === 'warm') return 'Warm';
+  if (u === 'neutral-cool') return 'Neutral-cool';
   if (u === 'neutral') return 'Neutral';
-  if (u === 'neutral-warm') return 'Neutral-Warm';
+  if (u === 'neutral-warm') return 'Neutral-warm';
+  if (u === 'warm') return 'Warm';
   return '—';
 }
 
@@ -214,8 +223,9 @@ function clientMatchesQuery(c: ClientRecord, q: string): boolean {
     .map((p) => `${categoryLabel(p.category)} ${p.name || ''} ${p.shade || ''} ${p.notes || ''}`.toLowerCase())
     .join(' ');
   const dates = `${c.trialDate || ''} ${c.finalDate || ''}`.toLowerCase();
+  const eventType = (String((c as any).eventType || '')).toLowerCase();
 
-  return [name, notes, undertone, season, dates, products].some((s) => s.includes(needle));
+  return [name, notes, undertone, season, dates, products, eventType].some((s) => s.includes(needle));
 }
 
 
@@ -228,6 +238,7 @@ function blankClient(): ClientRecord {
     season: null,
     trialDate: '',
     finalDate: '',
+    eventType: '',
     notes: '',
     products: [],
     createdAt: now,
@@ -241,7 +252,8 @@ function isBlankClient(c: ClientRecord): boolean {
   const noProducts = !Array.isArray(c.products) || c.products.length === 0;
   const noMatch = c.undertone === 'unknown' && !c.season;
   const datesEmpty = !(c.trialDate || '').trim() && !(c.finalDate || '').trim();
-  return nameEmpty && notesEmpty && noProducts && noMatch && datesEmpty;
+  const eventTypeEmpty = !(String((c as any).eventType || '')).trim();
+  return nameEmpty && notesEmpty && noProducts && noMatch && datesEmpty && eventTypeEmpty;
 }
 
 // Backwards compatibility:
@@ -249,8 +261,8 @@ function isBlankClient(c: ClientRecord): boolean {
 // We now store the category *name* from KitLog.
 const LEGACY_CATEGORY_CODES: Record<string, string> = {
   prep: 'Prep & Skin',
-  base: 'Base',
-  conceal: 'Base',
+  base: 'Foundation',
+  conceal: 'Foundation',
   cheek: 'Cheeks',
   brow: 'Brows',
   eye: 'Eyes',
@@ -267,6 +279,9 @@ function normalizeCategory(raw: any): PlanCategory {
     const trimmed = raw.trim();
     if (!trimmed) return FALLBACK_CATEGORY_NAME;
 
+    // Migration: older data used "Base"; it is now "Foundation".
+    if (trimmed.toLowerCase() === 'base') return 'Foundation';
+
     // Only map exact legacy codes.
     const legacyMapped = (LEGACY_CATEGORY_CODES as any)[trimmed];
     if (typeof legacyMapped === 'string') return legacyMapped;
@@ -276,8 +291,8 @@ function normalizeCategory(raw: any): PlanCategory {
   return FALLBACK_CATEGORY_NAME;
 }
 
-function normalizeData(input: any): CatalogData {
-  const base: CatalogData = { version: 1, clients: [] };
+function normalizeData(input: any): ClientsData {
+  const base: ClientsData = { version: 1, clients: [] };
 
   try {
     const clientsRaw = Array.isArray(input?.clients) ? input.clients : null;
@@ -288,20 +303,23 @@ function normalizeData(input: any): CatalogData {
         if (!c) return null;
         const id = typeof c.id === 'string' ? c.id : uid('client');
         const displayName = typeof c.displayName === 'string' ? c.displayName : '';
-        const undertone: Undertone =
-          c.undertone === 'cool' ||
-          c.undertone === 'neutral-cool' ||
-          c.undertone === 'neutral' ||
-          c.undertone === 'neutral-warm' ||
-          c.undertone === 'warm'
-            ? c.undertone
-            : c.undertone === 'olive'
-              ? 'neutral'
-              : 'unknown';
+        const utRaw = typeof c.undertone === 'string' ? String(c.undertone).trim().toLowerCase() : '';
+        let undertone: Undertone = 'unknown';
+        if (utRaw === 'olive') undertone = 'neutral';
+        else if (utRaw === 'cool' || utRaw === 'neutral-cool' || utRaw === 'neutral' || utRaw === 'neutral-warm' || utRaw === 'warm') {
+          undertone = utRaw as Undertone;
+        }
         const season: Season4 | null =
           c.season === 'spring' || c.season === 'summer' || c.season === 'autumn' || c.season === 'winter'
             ? c.season
             : null;
+
+        const rawEventType = typeof (c as any)?.eventType === 'string' ? String((c as any).eventType).trim() : '';
+        let eventType: EventType | '' = '';
+        if (rawEventType) {
+          const match = EVENT_TYPE_OPTIONS.find((opt) => opt.toLowerCase() === rawEventType.toLowerCase());
+          eventType = (match as any) || '';
+        }
 
         const createdAt = typeof c.createdAt === 'number' ? c.createdAt : Date.now();
         const updatedAt = typeof c.updatedAt === 'number' ? c.updatedAt : createdAt;
@@ -334,6 +352,7 @@ function normalizeData(input: any): CatalogData {
           season,
           trialDate: normalizeDateString((c as any)?.trialDate),
           finalDate: normalizeDateString((c as any)?.finalDate),
+          eventType,
           notes: typeof c.notes === 'string' ? c.notes : '',
           products,
           createdAt,
@@ -348,13 +367,13 @@ function normalizeData(input: any): CatalogData {
   }
 }
 
-const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) => {
+const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const catalogKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
   const kitlogKey = useMemo(() => makeScopedKey(KITLOG_STORAGE_KEY, scope), [scope]);
   const [hydrated, setHydrated] = useState(false);
-  const [data, setData] = useState<CatalogData>({ version: 1, clients: [] });
+  const [data, setData] = useState<ClientsData>({ version: 1, clients: [] });
   const persistTimer = useRef<any>(null);
 
   const [search, setSearch] = useState('');
@@ -367,6 +386,7 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
   const [kitlogCategories, setKitlogCategories] = useState<string[]>(DEFAULT_KITLOG_CATEGORIES);
   const [newProductCategory, setNewProductCategory] = useState<PlanCategory>(FALLBACK_CATEGORY_NAME);
   const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
+  const [eventTypePickerOpen, setEventTypePickerOpen] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const tabBarHeight = useBottomTabBarHeight();
 
@@ -412,7 +432,13 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
       }
       const catsRaw = Array.isArray(parsed?.categories) ? parsed.categories : [];
       const names = catsRaw
-        .map((c: any) => (typeof c?.name === 'string' ? c.name.trim() : ''))
+        .map((c: any) => {
+          const n = typeof c?.name === 'string' ? c.name.trim() : '';
+          if (!n) return '';
+          // Migration: "Base" -> "Foundation".
+          if (n.toLowerCase() === 'base') return 'Foundation';
+          return n;
+        })
         .filter(Boolean) as string[];
 
       // Deduplicate while preserving order.
@@ -565,13 +591,14 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
 
   function addClientFromBar() {
     const name = newClientText.trim();
-    if (!name) return;
     Keyboard.dismiss();
 
     const now = Date.now();
     const c = blankClient();
-    c.displayName = name;
-    c.updatedAt = now;
+    if (name) {
+      c.displayName = name;
+      c.updatedAt = now;
+    }
 
     setDraft(c);
     setIsDraftNew(true);
@@ -610,12 +637,15 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
   }
 
   function closeClient() {
+    setEventTypePickerOpen(false);
+    setCategoryPickerOpen(false);
     if (!draft) return;
     const cleaned: ClientRecord = {
       ...draft,
       displayName: (draft.displayName || '').trim(),
       trialDate: formatDateInput((draft.trialDate || '').trim()),
       finalDate: formatDateInput((draft.finalDate || '').trim()),
+      eventType: (draft.eventType || '') as any,
       notes: (draft.notes || '').trim(),
       products: Array.isArray(draft.products)
         ? draft.products
@@ -855,12 +885,12 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
           onRequestClose={closeClient}
         >
           <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-            <SafeAreaView style={[styles.modalSafe, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
+            <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
               <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
                 <View style={styles.modalHeader}>
                   <TouchableOpacity style={styles.modalBack} onPress={closeClient} accessibilityRole="button">
                     <Ionicons name="chevron-back" size={20} color="#111111" />
-                    <Text style={styles.modalBackText}>Catalog</Text>
+                    <Text style={styles.modalBackText}>Clients</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity style={styles.modalDelete} onPress={deleteClient} accessibilityRole="button">
@@ -871,7 +901,7 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
                 <ScrollView
                   style={{ flex: 1 }}
                   contentContainerStyle={{
-                    paddingTop: 14,
+                    paddingTop: 12,
                     paddingBottom: 24,
                   }}
                   keyboardShouldPersistTaps="handled"
@@ -909,7 +939,7 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
                       </View>
 
                       <View style={styles.dateField}>
-                        <Text style={styles.dateLabel}>Final date</Text>
+                        <Text style={styles.dateLabel}>Event date</Text>
                         <TextInput
                           value={draft?.finalDate ?? ''}
                           onChangeText={(v) =>
@@ -927,6 +957,31 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
                     </View>
 
 
+
+
+                    <TouchableOpacity
+                      style={styles.menuRow}
+                      activeOpacity={0.9}
+                      onPress={() => {
+                        Keyboard.dismiss();
+                        setEventTypePickerOpen(true);
+                      }}
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.menuRowLabel}>Event type</Text>
+                      <View style={styles.menuRowRight}>
+                        <Text
+                          style={[
+                            styles.menuRowValue,
+                            !(draft?.eventType || '').toString().trim() ? styles.menuRowValueMuted : null,
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {(draft?.eventType || '').toString().trim() ? (draft?.eventType as any) : 'Select'}
+                        </Text>
+                        <Ionicons name="chevron-down" size={14} color="#6b7280" style={{ marginLeft: 6 }} />
+                      </View>
+                    </TouchableOpacity>
                     <TextInput
                       value={draft?.notes ?? ''}
                       onChangeText={(v) => setDraft((prev) => (prev ? { ...prev, notes: v, updatedAt: Date.now() } : prev))}
@@ -1101,10 +1156,70 @@ const Catalog: React.FC<CatalogScreenProps> = ({ navigation, email, userId }) =>
                     </View>
                   </TouchableWithoutFeedback>
                 </Modal>
+
+                {/* Event type picker */}
+                <Modal
+                  visible={eventTypePickerOpen}
+                  transparent
+                  animationType="fade"
+                  onRequestClose={() => setEventTypePickerOpen(false)}
+                >
+                  <TouchableWithoutFeedback onPress={() => setEventTypePickerOpen(false)}>
+                    <View style={styles.sheetBackdrop}>
+                      <TouchableWithoutFeedback onPress={() => {}}>
+                        <View style={styles.sheetContainer}>
+                          <Text style={styles.sheetTitle}>Event type</Text>
+
+                          <View style={styles.sheetList}>
+                            <ScrollView
+                              style={styles.sheetScroll}
+                              showsVerticalScrollIndicator
+                              bounces={false}
+                              keyboardShouldPersistTaps="handled"
+                            >
+                              {[('None' as const), ...EVENT_TYPE_OPTIONS].map((name, idx) => {
+                                const value = name === 'None' ? '' : name;
+                                const on = (draft?.eventType || '') === value;
+                                const isLast = idx === EVENT_TYPE_OPTIONS.length;
+                                return (
+                                  <View key={String(name)}>
+                                    <TouchableOpacity
+                                      style={styles.sheetRow}
+                                      activeOpacity={0.9}
+                                      onPress={() => {
+                                        setDraft((prev) => (prev ? { ...prev, eventType: value as any, updatedAt: Date.now() } : prev));
+                                        setEventTypePickerOpen(false);
+                                      }}
+                                      accessibilityRole="button"
+                                    >
+                                      <Text style={styles.sheetRowText}>{name}</Text>
+                                      {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : null}
+                                    </TouchableOpacity>
+                                    {!isLast ? <View style={styles.sheetDivider} /> : null}
+                                  </View>
+                                );
+                              })}
+                            </ScrollView>
+                          </View>
+
+                          <TouchableOpacity
+                            style={styles.sheetCancel}
+                            activeOpacity={0.9}
+                            onPress={() => setEventTypePickerOpen(false)}
+                            accessibilityRole="button"
+                          >
+                            <Text style={styles.sheetCancelText}>Cancel</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </TouchableWithoutFeedback>
+                    </View>
+                  </TouchableWithoutFeedback>
+                </Modal>
               </View>
             </SafeAreaView>
           </TouchableWithoutFeedback>
         </Modal>
+
       </SafeAreaView>
     </TouchableWithoutFeedback>
   );
@@ -1354,6 +1469,42 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     backgroundColor: '#ffffff',
   },
+
+  menuRow: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#ffffff',
+  },
+  menuRowLabel: {
+    fontSize: 13,
+    color: '#6b7280',
+    fontWeight: '500',
+  },
+  menuRowRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    justifyContent: 'flex-end',
+    marginLeft: 12,
+    minWidth: 0,
+  },
+  menuRowValue: {
+    fontSize: 13,
+    color: '#111111',
+    fontWeight: '500',
+    flexShrink: 1,
+  },
+  menuRowValueMuted: {
+    color: '#9ca3af',
+    fontWeight: '400',
+  },
   notesInput: {
     marginTop: 10,
     fontSize: 13,
@@ -1551,4 +1702,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export default Catalog;
+export default Clients;
