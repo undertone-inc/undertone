@@ -1366,6 +1366,37 @@ function extractSephoraColorVariantsFromEmbeddedJson(html) {
   return out;
 }
 
+
+function extractSephoraDisplayedColorFromHtml(html) {
+  const s = String(html || "");
+  if (!s) return "";
+
+  const markers = ["Color:", "Shade:", "Colour:"];
+  for (const marker of markers) {
+    const idx = s.toLowerCase().indexOf(marker.toLowerCase());
+    if (idx < 0) continue;
+
+    // Take a small window after the marker, strip tags, then parse the value.
+    const window = s.slice(idx, idx + 1600);
+    const plain = compactSpaces(window.replace(/<[^>]*>/g, " "));
+
+    // Example plain text: "Color: Whiskey - rich brown matte Size 0.04 oz ..."
+    const escaped = marker.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const re = new RegExp(escaped + "\\s*([^\\n\\r]{1,220})", "i");
+    const m = re.exec(plain);
+    if (!m || !m[1]) continue;
+
+    let val = compactSpaces(m[1]);
+    // Stop at common next-field labels.
+    val = val.split(/\bSize\b|\bFinish\b|\bStandard size\b|\bMini size\b|\bTravel size\b|\bFormulation\b|\bCoverage\b|\bShipping\b|\bSign in\b/i)[0].trim();
+    val = val.replace(/\s*\|.*$/g, "").trim();
+
+    if (val && val.length <= 180) return val;
+  }
+
+  return "";
+}
+
 function extractSephoraColorVariantsFromHtml(html) {
   const s = String(html || "");
   if (!s) return [];
@@ -1444,6 +1475,15 @@ function extractSephoraColorVariantsFromHtml(html) {
       push(m?.[2], m?.[3]);
     }
   }
+
+  // 6) Last-resort fallback: capture the currently selected Color/Shade label from the page.
+  // Some Sephora pages don’t embed full variant lists in the initial HTML, but they do render
+  // the selected color as visible text (e.g., "Color: Fenty Glow - shimmering rose nude").
+  if (out.length < 1) {
+    const displayed = extractSephoraDisplayedColorFromHtml(s);
+    if (displayed) push(displayed, "");
+  }
+
 
   return out;
 }
