@@ -2114,6 +2114,7 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
     " For each recommendation, provide:" +
     " (1) product_name as listed on Sephora, (2) product_url to the Sephora product page, (3) color_name EXACTLY as shown in Sephora's Color selector (include numbers/codes and short descriptors if present)." +
     " IMPORTANT: return a real, verifiable color_name for ALL 4 categories." +
+    " If the full swatch list is not visible, open the Sephora product_url and use the on-page line that starts with 'Color:' or 'Shade:' as the verifiable color_name." +
     " If your first product pick in a category does not have a discoverable color selector or you cannot find an exact color_name, pick a different product from the supported list and try again." +
     " Only set color_name to '(unavailable)' if you tried at least TWO different products for that category and still cannot find a verifiable color_name. Never guess." +
     " Prefer products that clearly have many color options on Sephora (foundation shades, blush shades, eyeliner/eyeshadow stick shades, lipstick/gloss shades)." +
@@ -2269,6 +2270,7 @@ async function callOpenAIForSephoraCategoryRepair({
     " Use ONLY Sephora (sephora.com)." +
     " You MUST use web search to verify the exact color/variant name for the product on Sephora." +
     " Do NOT guess and do NOT invent color names." +
+    " If you cannot access the full swatch list, open the Sephora product_url and use the on-page line that starts with 'Color:' or 'Shade:' as the verifiable color_name." +
     ` You are fixing ONLY the ${title} recommendation.` +
     " You must choose ONE product from the Supported list." +
     " Prefer the Preferred product if provided, but if you cannot find a verifiable color for it, pick another supported product." +
@@ -2344,6 +2346,93 @@ async function callOpenAIForSephoraCategoryRepair({
     return JSON.parse(outText);
   } catch {
     throw new Error("OpenAI returned non-JSON output");
+  }
+}
+
+
+
+async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY on server");
+  }
+
+  const url = String(productUrl || "").trim();
+  if (!url) return "";
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      color_name: { type: "string" },
+    },
+    required: ["color_name"],
+  };
+
+  const systemPrompt =
+    "You are a strict data extractor." +
+    " Use ONLY Sephora (sephora.com) via web search." +
+    " Open the provided Sephora product URL." +
+    " Find the exact currently selected variant label on the page. Sephora pages usually show it as a line like 'Color: <value>' or 'Shade: <value>'." +
+    " Return ONLY the <value> part (exclude the 'Color:'/'Shade:' prefix)." +
+    " Keep the text EXACTLY as shown on Sephora (include codes/numbers and short descriptors if present)." +
+    " If you cannot find any Color/Shade line, return '(unavailable)'." +
+    " Output JSON only.";
+
+  const userPrompt = `Sephora product URL: ${url}`;
+
+  const payload = {
+    model: OPENAI_RECS_MODEL || "gpt-5-mini",
+    temperature: 0,
+    reasoning: { effort: "low" },
+    tools: [
+      {
+        type: "web_search",
+        filters: { allowed_domains: ["sephora.com"] },
+        user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+      },
+    ],
+    tool_choice: "auto",
+    max_tool_calls: Math.max(4, Math.min(12, OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8)),
+    max_output_tokens: 120,
+    input: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "sephora_color_extractor",
+        strict: true,
+        schema,
+      },
+    },
+  };
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.error?.message || data?.error || `OpenAI error HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+
+  const { text: outText, refusal } = extractOutputText(data);
+  if (refusal) throw new Error(refusal);
+  if (!outText) return "";
+
+  try {
+    const parsed = JSON.parse(outText);
+    const c = String(parsed?.color_name || "").trim();
+    return c;
+  } catch {
+    return "";
   }
 }
 
@@ -2431,6 +2520,27 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
           if (newUrl && isAllowedRetailerUrl(newUrl)) item.product_url = normalizeRetailerUrl(newUrl);
           if (newColor) item.color_name = newColor;
         }
+
+
+    // (3) Last-resort: extract the currently displayed Color/Shade label from the Sephora page via web_search.
+    // This avoids returning '(unavailable)' on categories where the full swatch list is not exposed.
+    const color2 = String(item?.color_name || "").trim();
+    isUnavailable = !color2 || /^\(unavailable\)$/i.test(color2);
+
+    if (isUnavailable && normUrl && OPENAI_RECS_REPAIR_ENABLED) {
+      try {
+        const extracted = await callOpenAIExtractSephoraDisplayedColor({ productUrl: normUrl });
+        const ex = String(extracted || "").trim();
+        if (ex && !/^\(unavailable\)$/i.test(ex)) {
+          item.color_name = ex;
+        }
+      } catch (e) {
+        if (OPENAI_RECS_DEBUG) {
+          console.warn(`Sephora displayed color extract failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
+        }
+      }
+    }
+
       } catch (e) {
         if (OPENAI_RECS_DEBUG) {
           console.warn(`Sephora color repair failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
