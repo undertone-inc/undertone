@@ -576,7 +576,7 @@ function foundationColorLabel(opts: { undertone: UndertoneKey; toneNumberRaw?: u
   const num = normalizeToneNumber(opts.toneNumberRaw) ?? 4.5;
   const depth = normalizeToneDepth(opts.toneDepthRaw) ?? toneDepthFromNumber(num);
   const desc = foundationDescriptor(opts.undertone);
-  return `Color ${formatHalf(num)}, ${depth}, ${desc}`;
+  return `${formatHalf(num)} - ${depth}, ${desc}`;
 }
 
 function colorHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, season: SeasonKey): string {
@@ -626,7 +626,7 @@ function buildBuyRecommendationsText(opts: {
   const buy = BUY_RECS[u] || BUY_RECS.neutral;
 
   const lines: string[] = [];
-  lines.push('Recommended products:');
+  lines.push('Recommended products (suggested colors):');
 
   const addBlock = (label: string, arr: string[], colorLabel: string) => {
     const list = Array.isArray(arr) ? arr.slice(0, 2) : [];
@@ -639,11 +639,11 @@ function buildBuyRecommendationsText(opts: {
   addBlock(
     'Foundation',
     buy.base,
-    foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })
+    `Suggested color: ${foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })}`
   );
-  addBlock('Cheeks', buy.cheeks, `Color: ${colorHint('cheeks', u, season)}`);
-  addBlock('Eyes', buy.eyes, `Color: ${colorHint('eyes', u, season)}`);
-  addBlock('Lips', buy.lips, `Color: ${colorHint('lips', u, season)}`);
+  addBlock('Cheeks', buy.cheeks, `Suggested color: ${colorHint('cheeks', u, season)}`);
+  addBlock('Eyes', buy.eyes, `Suggested color: ${colorHint('eyes', u, season)}`);
+  addBlock('Lips', buy.lips, `Suggested color: ${colorHint('lips', u, season)}`);
 
   return lines.join('\n');
 }

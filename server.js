@@ -26,6 +26,9 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const multer = require("multer");
 const jpeg = require("jpeg-js");
+const http = require("http");
+const https = require("https");
+const zlib = require("zlib");
 
 // Load server env vars from .env.server (preferred).
 // Falls back to .env for backwards compatibility.
@@ -772,6 +775,18 @@ function compactSpaces(s) {
     .trim();
 }
 
+function normalizeRetailerUrl(urlStr) {
+  try {
+    const u = new URL(String(urlStr || "").trim());
+    u.hash = "";
+    u.search = "";
+    return u.toString();
+  } catch {
+    return String(urlStr || "").trim();
+  }
+}
+
+
 function isAllowedRetailerUrl(urlStr) {
   try {
     const u = new URL(String(urlStr || ""));
@@ -786,23 +801,127 @@ function isAllowedRetailerUrl(urlStr) {
   }
 }
 
-async function fetchHtml(url) {
-  if (typeof fetch !== "function") throw new Error("fetch is not available in this Node runtime");
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "accept-language": "en-CA,en;q=0.9",
-    },
-  });
-  if (!res.ok) throw new Error(`Retailer fetch failed: ${res.status}`);
-  return await res.text();
+function defaultRetailerHeaders() {
+  return {
+    "user-agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept-language": "en-CA,en;q=0.9",
+    // Allow compression for faster downloads. Node HTTPS fallback will decompress.
+    "accept-encoding": "gzip, deflate, br",
+  };
 }
 
-function extractSephoraColorVariantsFromHtml(html) {
+async function fetchHtml(url, maxRedirects = 3) {
+  const target = String(url || "").trim();
+  if (!target) throw new Error("Missing retailer URL");
+
+  const headers = defaultRetailerHeaders();
+
+  // Node 18+ has global fetch. On older Node, fall back to native http/https.
+  if (typeof fetch === "function") {
+    const res = await fetch(target, { method: "GET", headers, redirect: "manual" });
+
+    if (res.status >= 300 && res.status < 400 && maxRedirects > 0) {
+      const loc = res.headers.get("location");
+      if (loc) {
+        const next = new URL(loc, target).toString();
+        return await fetchHtml(next, maxRedirects - 1);
+      }
+    }
+
+    if (!res.ok) throw new Error(`Retailer fetch failed: ${res.status}`);
+    return await res.text();
+  }
+
+  return await new Promise((resolve, reject) => {
+    let resolved = false;
+    try {
+      const u = new URL(target);
+      const lib = u.protocol === "https:" ? https : http;
+
+      const req = lib.request(
+        {
+          method: "GET",
+          hostname: u.hostname,
+          port: u.port ? Number(u.port) : undefined,
+          path: `${u.pathname}${u.search}`,
+          headers,
+        },
+        (res) => {
+          const status = Number(res.statusCode || 0);
+          const loc = res.headers?.location;
+
+          if (status >= 300 && status < 400 && loc && maxRedirects > 0) {
+            res.resume();
+            const next = new URL(String(loc), target).toString();
+            fetchHtml(next, maxRedirects - 1).then(resolve).catch(reject);
+            return;
+          }
+
+          if (status < 200 || status >= 300) {
+            res.resume();
+            reject(new Error(`Retailer fetch failed: ${status}`));
+            return;
+          }
+
+          let stream = res;
+          const enc = String(res.headers?.["content-encoding"] || "").toLowerCase();
+          try {
+            if (enc.includes("gzip")) stream = res.pipe(zlib.createGunzip());
+            else if (enc.includes("deflate")) stream = res.pipe(zlib.createInflate());
+            else if (enc.includes("br") && typeof zlib.createBrotliDecompress === "function") {
+              stream = res.pipe(zlib.createBrotliDecompress());
+            }
+          } catch {
+            stream = res;
+          }
+
+          let data = "";
+          stream.setEncoding("utf8");
+
+          stream.on("data", (chunk) => {
+            if (resolved) return;
+            data += String(chunk || "");
+            // Protect server memory: cap HTML size.
+            if (data.length > 6_000_000) {
+              resolved = true;
+              req.destroy();
+              reject(new Error("Retailer response too large"));
+            }
+          });
+
+          stream.on("end", () => {
+            if (resolved) return;
+            resolved = true;
+            resolve(data);
+          });
+
+          stream.on("error", (e) => {
+            if (resolved) return;
+            resolved = true;
+            reject(e);
+          });
+        }
+      );
+
+      req.on("error", (e) => {
+        if (resolved) return;
+        resolved = true;
+        reject(e);
+      });
+
+      req.end();
+    } catch (e) {
+      if (resolved) return;
+      resolved = true;
+      reject(e);
+    }
+  });
+}
+
+
+function extractSephoraColorVariantsFromEmbeddedJson(html) {
   const s = String(html || "");
   if (!s) return [];
 
@@ -817,7 +936,7 @@ function extractSephoraColorVariantsFromHtml(html) {
 
     // Filter out sizes and other non-color variations.
     if (/(\boz\b|\bml\b|\bg\b|standard size|mini size|travel size)/i.test(value)) return;
-    if (value.length > 80) return;
+    if (value.length > 120) return;
 
     const key = `${vLow}::${String(desc || "").toLowerCase()}`;
     if (seen.has(key)) return;
@@ -826,16 +945,104 @@ function extractSephoraColorVariantsFromHtml(html) {
     out.push({ value, desc: desc || undefined });
   };
 
-  // Primary: scrape embedded state blobs (most Sephora pages embed all color variants).
-  const reColorBlock = /"variationType"\s*:\s*"Color"[\s\S]{0,600}?"variationValue"\s*:\s*"([^\"]+)"(?:[\s\S]{0,300}?"variationDesc"\s*:\s*"([^\"]+)")?/g;
+  const walk = (node, depth = 0) => {
+    if (!node || depth > 32) return;
+    if (Array.isArray(node)) {
+      for (const it of node) walk(it, depth + 1);
+      return;
+    }
+    if (typeof node !== "object") return;
+
+    // Common Sephora sku structures
+    const vt = node.variationType ?? node.variation_type ?? node.variation_type_name;
+    const vv = node.variationValue ?? node.variation_value ?? node.variationName ?? node.variation_name;
+    const vd = node.variationDesc ?? node.variation_desc ?? node.variationDescription ?? node.variation_description;
+
+    const vtLow = String(vt || "").toLowerCase();
+    const isColorType = vtLow === "color" || vtLow === "colour" || vtLow === "shade";
+
+    if (vv && (!vt || isColorType)) {
+      push(vv, vd);
+    }
+
+    for (const k of Object.keys(node)) {
+      walk(node[k], depth + 1);
+    }
+  };
+
+  const tryParseJson = (jsonText) => {
+    const t = String(jsonText || "").trim();
+    if (!t) return;
+    try {
+      const parsed = JSON.parse(t);
+      walk(parsed, 0);
+    } catch {
+      // ignore
+    }
+  };
+
+  // Next.js payload (most common on Sephora)
+  const mNext = /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i.exec(s);
+  if (mNext?.[1]) tryParseJson(mNext[1]);
+
+  // Some pages embed a preloaded state object
+  const mPre = /__PRELOADED_STATE__\s*=\s*({[\s\S]*?})\s*;/.exec(s);
+  if (mPre?.[1]) tryParseJson(mPre[1]);
+
+  return out;
+}
+
+function extractSephoraColorVariantsFromHtml(html) {
+  const s = String(html || "");
+  if (!s) return [];
+
+  // 1) Try embedded JSON payloads first
+  const fromJson = extractSephoraColorVariantsFromEmbeddedJson(s);
+
+  const out = Array.isArray(fromJson) ? [...fromJson] : [];
+  const seen = new Set(out.map((x) => `${String(x?.value || "").toLowerCase()}::${String(x?.desc || "").toLowerCase()}`));
+
+  const push = (valueRaw, descRaw) => {
+    const value = compactSpaces(safeDecodeJsonString(valueRaw));
+    const desc = compactSpaces(safeDecodeJsonString(descRaw));
+    const vLow = value.toLowerCase();
+    if (!value) return;
+
+    // Filter out sizes and other non-color variations.
+    if (/(\boz\b|\bml\b|\bg\b|standard size|mini size|travel size)/i.test(value)) return;
+    if (value.length > 120) return;
+
+    const key = `${vLow}::${String(desc || "").toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    out.push({ value, desc: desc || undefined });
+  };
+
+  // If JSON already gave us a healthy list, stop here.
+  if (out.length >= 6) return out;
+
+  // 2) Scrape common embedded state blobs (unescaped)
+  const reColorBlock = /"variationType"\s*:\s*"Color"[\s\S]{0,2000}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,1200}?"variationDesc"\s*:\s*"([^"]+)")?/g;
   for (const m of s.matchAll(reColorBlock)) {
     push(m?.[1], m?.[2]);
   }
 
-  // Fallback: grab any sku blocks that include variationValue/variationDesc.
+  // 3) Scrape escaped JSON blobs (e.g., in attributes)
+  const reColorBlockEsc = /\"variationType\"\s*:\s*\"Color\"[\s\S]{0,2000}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,1200}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
+  for (const m of s.matchAll(reColorBlockEsc)) {
+    push(m?.[1], m?.[2]);
+  }
+
+  // 4) Fallback: grab any sku blocks that include variationValue/variationDesc.
   if (out.length < 2) {
-    const reSku = /"skuId"\s*:\s*"?(\d+)"?[\s\S]{0,400}?"variationValue"\s*:\s*"([^\"]+)"(?:[\s\S]{0,220}?"variationDesc"\s*:\s*"([^\"]+)")?/g;
+    const reSku = /"skuId"\s*:\s*"?(\d+)"?[\s\S]{0,1200}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,800}?"variationDesc"\s*:\s*"([^"]+)")?/g;
     for (const m of s.matchAll(reSku)) {
+      push(m?.[2], m?.[3]);
+    }
+
+    const reSkuEsc = /\"skuId\"\s*:\s*\"?(\d+)\"?[\s\S]{0,1200}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,800}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
+    for (const m of s.matchAll(reSkuEsc)) {
       push(m?.[2], m?.[3]);
     }
   }
@@ -905,10 +1112,10 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
   // Shared keyword intent
   const wantDir =
     dir === "warm"
-      ? ["warm", "gold", "golden", "yellow", "peach", "apricot", "olive", "bronze", "caramel"]
+      ? ["warm", "gold", "golden", "yellow", "peach", "apricot", "olive", "bronze", "caramel", "ginger", "honey", "melon", "terracotta", "brick", "chili", "coral"]
       : dir === "cool"
-        ? ["cool", "pink", "rosy", "rose", "berry", "plum", "blue", "red"]
-        : ["neutral", "beige", "balanced", "natural"];
+        ? ["cool", "pink", "rosy", "rose", "berry", "plum", "blue", "red", "pansy", "heather", "ballerina", "mauve", "cranberry"]
+        : ["neutral", "beige", "balanced", "natural", "nude", "taupe", "fig"];
   const avoidDir =
     dir === "warm"
       ? ["cool", "pink", "rosy", "blue"]
@@ -996,90 +1203,196 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
   return best;
 }
 
+
+
+// Curated fallbacks (real shade/color names) used if Sephora blocks scraping or the page structure changes.
+// We keep this small on purpose; the primary path is live extraction + caching.
+const STATIC_SEPHORA_SHADE_FALLBACK = {
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/cheek-pop-P384996')]: [
+    { value: 'Pansy Pop' },
+    { value: 'Peach Pop' },
+    { value: 'Melon Pop' },
+    { value: 'Ballerina Pop' },
+    { value: 'Heather Pop' },
+    { value: 'Ginger Pop' },
+    { value: 'Blush Pop' },
+    { value: 'Nude Pop' },
+    { value: 'Black Honey Pop' },
+    { value: 'Fig Pop' },
+    { value: 'Pink Honey Pop' },
+    { value: 'Cola Pop' },
+    { value: 'Pink Pop' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/rare-beauty-by-selena-gomez-soft-pinch-liquid-blush-P97989778')]: [
+    { value: 'Hope', desc: 'nude mauve (dewy)' },
+    { value: 'Joy', desc: 'muted peach (dewy)' },
+    { value: 'Happy', desc: 'cool pink (dewy)' },
+    { value: 'Encourage', desc: 'soft neutral pink (dewy)' },
+    { value: 'Believe', desc: 'true mauve (dewy)' },
+    { value: 'Virtue', desc: 'beige peach (dewy)' },
+    { value: 'Grateful', desc: 'true red (dewy)' },
+    { value: 'Faith', desc: 'deep berry (matte)' },
+    { value: 'Bliss', desc: 'nude pink (matte)' },
+    { value: 'Love', desc: 'terracotta (matte)' },
+    { value: 'Grace', desc: 'bright rose mauve (matte)' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/backstage-face-body-foundation-P432500')]: [
+    { value: '0W', desc: 'WARM - Very fair skin with golden undertones' },
+    { value: '0.5N', desc: 'NEUTRAL - Very fair skin with neutral undertones' },
+    { value: '1C', desc: 'COOL - Fair skin with cool undertones' },
+    { value: '1N', desc: 'NEUTRAL - Fair skin with neutral undertones' },
+    { value: '1W', desc: 'WARM - Fair skin with golden undertones' },
+    { value: '2N', desc: 'NEUTRAL - Light skin with neutral undertones' },
+    { value: '2W', desc: 'WARM - Light skin with golden undertones' },
+    { value: '3N', desc: 'NEUTRAL - Light to medium skin with neutral undertones' },
+    { value: '3W', desc: 'WARM - Light to medium skin with golden undertones' },
+    { value: '4WP', desc: 'WARM PEACH - Medium skin with peach undertones' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/product/luminous-silk-natural-glow-blurring-liquid-foundation-with-24-hour-wear-P519887')]: [
+    { value: '4.5', desc: 'light, neutral peach' },
+    { value: '5', desc: 'light, neutral pink' },
+    { value: '5.1', desc: 'light, cool pink' },
+    { value: '6', desc: 'light to medium, warm peach' },
+    { value: '6.25', desc: 'medium, warm peach' },
+    { value: '6.5', desc: 'medium, neutral' },
+    { value: '7', desc: 'medium to tan with a peach undertone' },
+    { value: '7.5', desc: 'tan with a peach undertone' },
+  ],
+};
+
 async function getSephoraShadesForUrl(url) {
-  const u = String(url || "").trim();
-  if (!u) return [];
+  const uRaw = String(url || '').trim();
+  if (!uRaw) return [];
+
+  const u = normalizeRetailerUrl(uRaw);
+
   const cached = shadeCache.get(u);
   const now = Date.now();
   if (cached && now - (cached.fetchedAt || 0) < SHADE_CACHE_TTL_MS) {
     return Array.isArray(cached.shades) ? cached.shades : [];
   }
 
-  const html = await fetchHtml(u);
-  const shades = extractSephoraColorVariantsFromHtml(html);
+  let shades = [];
+  try {
+    const html = await fetchHtml(u);
+    shades = extractSephoraColorVariantsFromHtml(html);
+  } catch {
+    shades = [];
+  }
+
+  const fallback = STATIC_SEPHORA_SHADE_FALLBACK?.[u];
+  if (Array.isArray(fallback) && fallback.length) {
+    const merged = [];
+    const seen = new Set();
+    const add = (sh) => {
+      const v = String(sh?.value || '').trim();
+      const d = String(sh?.desc || '').trim();
+      if (!v) return;
+      const key = `${v.toLowerCase()}::${d.toLowerCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      merged.push({ value: v, desc: d || undefined });
+    };
+    (Array.isArray(shades) ? shades : []).forEach(add);
+    fallback.forEach(add);
+    shades = merged;
+  }
+
   shadeCache.set(u, { fetchedAt: now, shades });
   return shades;
 }
 
-// Product lists (kept intentionally small + stable)
+// Product lists (expanded; picked deterministically per scan)
+// We keep a larger pool so thousands of faces can yield varied recommendations,
+// while always attaching *real* retailer color names.
+const FOUNDATION_POOL = [
+  "Estée Lauder Double Wear Stay-in-Place Foundation",
+  "NARS Light Reflecting Foundation",
+  "Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation",
+  "Dior Backstage Face & Body Foundation",
+  "Giorgio Armani Luminous Silk Foundation",
+  "Make Up For Ever HD Skin Foundation",
+  "Charlotte Tilbury Beautiful Skin Foundation",
+  "Rare Beauty Liquid Touch Weightless Foundation",
+  "Too Faced Born This Way Undetectable Medium-To-Full Coverage Foundation",
+  "HUDA BEAUTY Easy Blur Natural Airbrush Foundation with Niacinamide",
+];
+
+const CHEEKS_POOL = [
+  "Clinique Cheek Pop Blush",
+  "Rare Beauty Soft Pinch Liquid Blush",
+  "NARS Talc-Free Powder Blush",
+  "Fenty Beauty Cheeks Out Freestyle Cream Blush",
+  "MAKEUP BY MARIO Soft Pop Cream Blush Stick",
+  "MILK MAKEUP Lip + Cheek Non-Comedogenic Cream Blush Stick",
+  "Benefit Cosmetics Silky-Soft Powder Blush",
+  "Hourglass Ambient Lighting Blush Collection",
+  "DIOR Rosy Glow Powder Blush",
+  "PAT McGRATH LABS Skin Fetish: Divine Powder Blush",
+];
+
+const EYES_POOL = [
+  "Urban Decay 24/7 Glide-On Waterproof Eyeliner Pencil",
+  "Charlotte Tilbury Rock 'N' Kohl Long-Lasting Eyeliner Pencil",
+  "MAKE UP FOR EVER Artist Color Pencil Longwear Eyeliner",
+  "Bobbi Brown Long-Wear Waterproof Cream Eyeshadow Stick",
+  "Laura Mercier Caviar Stick Cream Eyeshadow",
+];
+
+const LIPS_POOL = [
+  "MAC Cosmetics MACximal Silky Matte Lipstick",
+  "Charlotte Tilbury Matte Revolution Lipstick",
+  "Fenty Beauty Gloss Bomb Universal Lip Luminizer",
+  "Rare Beauty by Selena Gomez Kind Words Matte Lipstick",
+];
+
 const BUY_RECS_SERVER = {
-  cool: {
-    foundation: [
-      "Estée Lauder Double Wear Stay-in-Place Foundation",
-      "NARS Light Reflecting Foundation",
-      "Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation",
-    ],
-    cheeks: ["Rare Beauty Soft Pinch Liquid Blush", "Clinique Cheek Pop", "NARS Blush"],
-    eyes: ["Natasha Denona Glam Palette", "Urban Decay Naked2 Basics Palette", "Make Up For Ever Artist Color Pencil"],
-    lips: ["MAC Matte Lipstick", "Charlotte Tilbury Matte Revolution Lipstick", "Fenty Beauty Gloss Bomb"],
-  },
-  "neutral-cool": {
-    foundation: ["Dior Backstage Face & Body Foundation", "NARS Light Reflecting Foundation", "Fenty Beauty Pro Filt'r Foundation"],
-    cheeks: ["Clinique Cheek Pop", "Rare Beauty Soft Pinch Liquid Blush", "NARS Blush"],
-    eyes: ["Natasha Denona Glam Palette", "Urban Decay Naked2 Basics Palette", "Make Up For Ever Artist Color Pencil"],
-    lips: ["MAC Satin Lipstick", "Charlotte Tilbury Matte Revolution Lipstick", "Fenty Beauty Gloss Bomb"],
-  },
-  neutral: {
-    foundation: ["Dior Backstage Face & Body Foundation", "Fenty Beauty Eaze Drop Blurring Skin Tint", "NARS Light Reflecting Foundation"],
-    cheeks: ["Rare Beauty Soft Pinch Liquid Blush", "Clinique Cheek Pop", "NARS Blush"],
-    eyes: ["Natasha Denona Glam Palette", "Urban Decay Naked3 Palette", "Make Up For Ever Artist Color Pencil"],
-    lips: ["Charlotte Tilbury Matte Revolution Lipstick", "MAC Satin Lipstick", "Fenty Beauty Gloss Bomb"],
-  },
-  "neutral-warm": {
-    foundation: ["Giorgio Armani Luminous Silk Foundation", "Dior Backstage Face & Body Foundation", "Make Up For Ever HD Skin Foundation"],
-    cheeks: ["Rare Beauty Soft Pinch Liquid Blush", "Fenty Beauty Cheeks Out Cream Blush", "NARS Blush"],
-    eyes: ["Natasha Denona Bronze Palette", "Huda Beauty Nude Obsessions Palette", "Make Up For Ever Artist Color Pencil"],
-    lips: ["Charlotte Tilbury K.I.S.S.I.N.G Lipstick", "MAC Matte Lipstick", "Fenty Beauty Gloss Bomb"],
-  },
-  warm: {
-    foundation: ["Giorgio Armani Luminous Silk Foundation", "Charlotte Tilbury Beautiful Skin Foundation", "Make Up For Ever HD Skin Foundation"],
-    cheeks: ["Fenty Beauty Cheeks Out Cream Blush", "Rare Beauty Soft Pinch Liquid Blush", "NARS Blush"],
-    eyes: ["Natasha Denona Bronze Palette", "Huda Beauty Nude Obsessions Palette", "Too Faced Natural Eyes Palette"],
-    lips: ["Charlotte Tilbury K.I.S.S.I.N.G Lipstick", "MAC Matte Lipstick", "Fenty Beauty Gloss Bomb"],
-  },
+  cool: { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
+  "neutral-cool": { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
+  neutral: { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
+  "neutral-warm": { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
+  warm: { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
 };
 
-// Sephora product URLs (best-effort; if a URL is missing, we fall back to generic color guidance).
-// NOTE: Some products are US-only; those still work for shade names.
+// Sephora product URLs (preferred when known). If missing, we resolve via Sephora keyword search.
+// NOTE: Some products may resolve to US pages; those still provide real shade names.
 const PRODUCT_URLS = {
+  // Foundation
   "Estée Lauder Double Wear Stay-in-Place Foundation": "https://www.sephora.com/ca/en/product/double-wear-stay-in-place-makeup-P378284",
   "NARS Light Reflecting Foundation": "https://www.sephora.com/ca/en/product/nars-light-reflecting-advance-skincare-foundation-P479338",
   "Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation": "https://www.sephora.com/ca/en/product/pro-filtr-soft-matte-longwear-foundation-P87985432",
-  "Fenty Beauty Pro Filt'r Foundation": "https://www.sephora.com/ca/en/product/pro-filtr-soft-matte-longwear-foundation-P87985432",
   "Dior Backstage Face & Body Foundation": "https://www.sephora.com/ca/en/product/backstage-face-body-foundation-P432500",
-  "Fenty Beauty Eaze Drop Blurring Skin Tint": "https://www.sephora.com/ca/en/product/fenty-beauty-rihanna-eaze-drop-blurring-skin-tint-P470025",
   "Giorgio Armani Luminous Silk Foundation": "https://www.sephora.com/product/luminous-silk-natural-glow-blurring-liquid-foundation-with-24-hour-wear-P519887",
   "Make Up For Ever HD Skin Foundation": "https://www.sephora.com/ca/en/product/make-up-for-ever-hd-skin-foundation-P479712",
   "Charlotte Tilbury Beautiful Skin Foundation": "https://www.sephora.com/ca/en/product/charlotte-tilbury-beautiful-skin-medium-coverage-liquid-foundation-with-hyaluronic-acid-P480286",
+  "Rare Beauty Liquid Touch Weightless Foundation": "https://www.sephora.com/ca/en/product/rare-beauty-by-selena-gomez-liquid-touch-weightless-foundation-P49848448",
+  "Too Faced Born This Way Undetectable Medium-To-Full Coverage Foundation": "https://www.sephora.com/ca/en/product/too-faced-born-this-way-natural-finish-foundation-P517843",
+  "HUDA BEAUTY Easy Blur Natural Airbrush Foundation with Niacinamide": "https://www.sephora.com/ca/en/product/huda-beauty-easy-blur-smoothing-foundation-P512640",
 
+  // Cheeks
+  "Clinique Cheek Pop Blush": "https://www.sephora.com/ca/en/product/cheek-pop-P384996",
   "Rare Beauty Soft Pinch Liquid Blush": "https://www.sephora.com/ca/en/product/rare-beauty-by-selena-gomez-soft-pinch-liquid-blush-P97989778",
-  "Clinique Cheek Pop": "https://www.sephora.com/ca/en/product/cheek-pop-P384996",
-  "NARS Blush": "https://www.sephora.com/ca/en/product/blush-P2855",
-  "Fenty Beauty Cheeks Out Cream Blush": "https://www.sephora.com/ca/en/product/fenty-beauty-rihanna-cheeks-out-freestyle-cream-blush-P19700127",
+  "NARS Talc-Free Powder Blush": "https://www.sephora.com/ca/en/product/blush-P2855",
+  "Fenty Beauty Cheeks Out Freestyle Cream Blush": "https://www.sephora.com/ca/en/product/fenty-beauty-rihanna-cheeks-out-freestyle-cream-blush-P19700127",
+  "MAKEUP BY MARIO Soft Pop Cream Blush Stick": "https://www.sephora.com/ca/en/product/soft-pop-blush-stick-P516566",
+  "MILK MAKEUP Lip + Cheek Non-Comedogenic Cream Blush Stick": "https://www.sephora.com/ca/en/product/milk-lip-cheek-cream-blush-stick-P437097",
+  "Benefit Cosmetics Silky-Soft Powder Blush": "https://www.sephora.com/ca/en/product/box-o-powder-blush-P500253",
+  "Hourglass Ambient Lighting Blush Collection": "https://www.sephora.com/ca/en/product/ambient-lighting-blush-collection-P384963",
+  "DIOR Rosy Glow Powder Blush": "https://www.sephora.com/ca/en/product/dior-rosy-glow-blush-P454762",
+  "PAT McGRATH LABS Skin Fetish: Divine Powder Blush": "https://www.sephora.com/ca/en/product/pat-mcgrath-labs-skin-fetish-divine-powder-blush-P472489",
 
-  "Natasha Denona Glam Palette": "https://www.sephora.com/product/natasha-denona-glam-eyeshadow-palette-P461188",
-  "Natasha Denona Bronze Palette": "https://www.sephora.com/brand/natasha-denona/eyeshadow-palettes",
-  "Urban Decay Naked2 Basics Palette": "https://www.sephora.com/ca/en/product/naked2-basics-P388225",
-  "Urban Decay Naked3 Palette": "https://www.sephora.com/ca/en/product/naked3-P384099",
-  "Huda Beauty Nude Obsessions Palette": "https://www.sephora.com/product/nude-obsessions-eyeshadow-palette-P450887",
-  "Too Faced Natural Eyes Palette": "https://www.sephora.com/ca/en/product/too-faced-born-this-way-natural-nudes-eyeshadow-palette-P455201",
-  "Make Up For Ever Artist Color Pencil": "https://www.sephora.com/ca/en/product/artist-color-pencil-P430969",
+  // Eyes
+  "Urban Decay 24/7 Glide-On Waterproof Eyeliner Pencil": "https://www.sephora.com/ca/en/product/24-7-glide-on-eye-pencil-P133707",
+  "Charlotte Tilbury Rock 'N' Kohl Long-Lasting Eyeliner Pencil": "https://www.sephora.com/ca/en/product/rock-n-kohl-long-lasting-eye-pencils-P516579",
+  "MAKE UP FOR EVER Artist Color Pencil Longwear Eyeliner": "https://www.sephora.com/ca/en/product/make-up-for-ever-artist-color-pencil-longwear-eyeliner-P511574",
+  "Bobbi Brown Long-Wear Waterproof Cream Eyeshadow Stick": "https://www.sephora.com/ca/en/product/long-wear-waterproof-cream-eyeshadow-stick-P378145",
+  "Laura Mercier Caviar Stick Cream Eyeshadow": "https://www.sephora.com/ca/en/product/laura-mercier-caviar-shimmer-eyeshadow-stick-reform-P512549",
 
-  "MAC Matte Lipstick": "https://www.sephora.com/ca/en/product/mac-cosmetics-m-a-cximal-silky-matte-lipstick-P510799",
-  "MAC Satin Lipstick": "https://www.sephora.com/ca/en/product/mac-cosmetics-macximal-sleek-satin-lipstick-P513655",
+  // Lips
+  "MAC Cosmetics MACximal Silky Matte Lipstick": "https://www.sephora.com/ca/en/product/P510799",
   "Charlotte Tilbury Matte Revolution Lipstick": "https://www.sephora.com/ca/en/product/matte-revolution-lipstick-P433530",
-  "Charlotte Tilbury K.I.S.S.I.N.G Lipstick": "https://www.sephora.com/ca/en/product/P433531",
-  "Fenty Beauty Gloss Bomb": "https://www.sephora.com/ca/en/product/gloss-bomb-universal-lip-luminizer-P67988453",
+  "Fenty Beauty Gloss Bomb Universal Lip Luminizer": "https://www.sephora.com/ca/en/product/gloss-bomb-universal-lip-luminizer-P67988453",
+  "Rare Beauty by Selena Gomez Kind Words Matte Lipstick": "https://www.sephora.com/ca/en/product/kind-words-matte-lipstick-P500637",
 };
 
 function buildFallbackColorLabelServer({ category, undertone, season, toneNumber, toneDepth }) {
@@ -1117,14 +1430,126 @@ function buildFallbackColorLabelServer({ category, undertone, season, toneNumber
   return pick("blue-red/cranberry", "classic red", "true red");
 }
 
+function hash32FNV1a(str) {
+  const s = String(str || "");
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function pickStable(list, count, seed) {
+  const arr = Array.isArray(list) ? list : [];
+  const seen = new Set();
+  const uniq = [];
+  for (const x of arr) {
+    const v = String(x || "").trim();
+    if (!v) continue;
+    const k = v.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(v);
+  }
+  const s = String(seed || "");
+  uniq.sort((a, b) => {
+    const ha = hash32FNV1a(`${s}|${a}`);
+    const hb = hash32FNV1a(`${s}|${b}`);
+    if (ha !== hb) return ha < hb ? -1 : 1;
+    return a.localeCompare(b);
+  });
+  const n = Number.isFinite(Number(count)) ? Math.max(0, Math.floor(Number(count))) : 0;
+  return uniq.slice(0, n);
+}
+
+const PRODUCT_URL_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const productUrlCache = new Map(); // nameLower -> { url: string, fetchedAt: number }
+
+async function resolveSephoraProductUrlByName(name) {
+  const key = String(name || "").trim();
+  if (!key) return "";
+  const kLow = key.toLowerCase();
+
+  const cached = productUrlCache.get(kLow);
+  const now = Date.now();
+  if (cached?.url && now - (cached.fetchedAt || 0) < PRODUCT_URL_CACHE_TTL_MS) {
+    return String(cached.url || "");
+  }
+
+  // Try keyword search pages (works without needing Sephora internal APIs).
+  // CA-EN is preferred because the app is Canada-first, but the US site can
+  // carry SKUs that aren't listed on Sephora.ca.
+  const searchUrls = [
+    `https://www.sephora.com/ca/en/search?keyword=${encodeURIComponent(key)}`,
+    `https://www.sephora.com/search?keyword=${encodeURIComponent(key)}`,
+  ];
+
+  let html = "";
+  for (const u of searchUrls) {
+    try {
+      html = await fetchHtml(u);
+    } catch {
+      html = "";
+    }
+    if (html) break;
+  }
+
+  const candidates = [];
+  const push = (path) => {
+    const p = String(path || "").trim();
+    if (!p) return;
+    if (!/\b-P\d+\b/i.test(p)) return;
+    candidates.push(p);
+  };
+
+  if (html) {
+    // Common: href="/ca/en/product/...-P123456"
+    const reHref = /href\s*=\s*"(\/(?:ca\/en\/)?product\/[^"?#]+-P\d+[^"?#]*)"/gi;
+    for (const m of html.matchAll(reHref)) push(m?.[1]);
+
+    // Some responses include JSON with targetUrl / productUrl.
+    const reUrl = /"(?:targetUrl|productUrl|url)"\s*:\s*"(\/(?:ca\/en\/)?product\/[^"?#]+-P\d+[^"?#]*)"/gi;
+    for (const m of html.matchAll(reUrl)) push(m?.[1]);
+
+    // Last resort: any /product/...-P123456 path.
+    const reAny = /(\/(?:ca\/en\/)?product\/[^\s"'#]+-P\d+[^\s"'#]*)/gi;
+    for (const m of html.matchAll(reAny)) push(m?.[1]);
+  }
+
+  // Pick the first unique candidate.
+  const seen = new Set();
+  const first = candidates.find((p) => {
+    const u = normalizeRetailerUrl(new URL(p, "https://www.sephora.com").toString());
+    if (seen.has(u)) return false;
+    seen.add(u);
+    return true;
+  });
+
+  const resolved = first ? normalizeRetailerUrl(new URL(first, "https://www.sephora.com").toString()) : "";
+  if (resolved) productUrlCache.set(kLow, { url: resolved, fetchedAt: now });
+  return resolved;
+}
+
 async function buildProductLines({ products, category, undertone, season, toneNumber, toneDepth }) {
   const out = [];
   const list = Array.isArray(products) ? products : [];
-  const picks = list.slice(0, 2);
+  const seed = `${String(category || '').toLowerCase()}|${undertone}|${season}|${String(toneNumber ?? '')}|${String(toneDepth ?? '')}`;
+  const picks = pickStable(list, 2, seed);
 
   for (const name of picks) {
-    const url = PRODUCT_URLS[name] || "";
+    let url = PRODUCT_URLS[name] || "";
+    if (!url) {
+      try {
+        url = await resolveSephoraProductUrlByName(name);
+      } catch {
+        url = "";
+      }
+    }
+
     let label = "";
+    let labelKind = "color"; // color | unavailable
+
     try {
       if (url && isAllowedRetailerUrl(url)) {
         const shades = await getSephoraShadesForUrl(url);
@@ -1143,10 +1568,10 @@ async function buildProductLines({ products, category, undertone, season, toneNu
     }
 
     if (!label) {
-      label = buildFallbackColorLabelServer({ category, undertone, season, toneNumber, toneDepth });
+      labelKind = "unavailable";
     }
 
-    const tail = label ? ` — ${label}` : "";
+    const tail = labelKind === "color" && label ? ` — Color: ${label}` : " — Color: (unavailable)";
     out.push(`- ${name}${tail}`);
   }
 
