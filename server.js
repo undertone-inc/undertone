@@ -57,6 +57,14 @@ const OPENAI_MODEL_FALLBACK = String(process.env.OPENAI_MODEL_FALLBACK || "").tr
 const OPENAI_IMAGE_DETAIL = String(process.env.OPENAI_IMAGE_DETAIL || "high").trim();
 const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 120);
 
+// OpenAI (product recommendations via Sephora web search)
+// Default to a reasoning model that is cost-efficient and strong at agentic web search.
+const OPENAI_RECS_MODEL = String(process.env.OPENAI_RECS_MODEL || "gpt-5-mini").trim();
+const OPENAI_RECS_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_MAX_OUTPUT_TOKENS || 500);
+// Keep tool calls bounded so costs are predictable (search/open/find all count).
+const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 8);
+const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "true").toLowerCase() !== "false";
+
 // Upload constraints
 const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8);
 
@@ -712,6 +720,33 @@ app.post("/start-subscription", authRequired, async (req, res) => {
 //
 // IMPORTANT: We only scrape/parse from a small allowlist of retailer domains to avoid SSRF.
 // Today we support Sephora product pages.
+// Optional: enable robust shade/color extraction via Apify (recommended for reliability at scale).
+// Set APIFY_TOKEN in .env.server to enable. Actor default: autofacts/sephora (Sephora Scraper).
+let APIFY_TOKEN = String(process.env.APIFY_TOKEN || process.env.APIFY_API_TOKEN || "").trim();
+// Don't accidentally treat placeholder values as a real token.
+if (!APIFY_TOKEN || /^YOUR_TOKEN$/i.test(APIFY_TOKEN) || /<YOUR/i.test(APIFY_TOKEN)) {
+  APIFY_TOKEN = "";
+}
+const APIFY_SEPHORA_ACTOR_ID = String(process.env.APIFY_SEPHORA_ACTOR_ID || "autofacts~sephora").trim();
+const APIFY_SEPHORA_USE_RESIDENTIAL = String(process.env.APIFY_SEPHORA_USE_RESIDENTIAL || "true").toLowerCase() !== "false";
+
+// Debug logging for Apify calls (server-side only). Set to true to print
+// the reason variants couldn't be fetched.
+const APIFY_DEBUG = String(process.env.APIFY_DEBUG || "").toLowerCase() === "true";
+
+// If your Apify account doesn't include the RESIDENTIAL proxy group, set
+// APIFY_SEPHORA_USE_RESIDENTIAL=false. The actor may still work on datacenter
+// proxies but can be less reliable.
+
+// Tuning knobs (kept conservative; can be overridden in .env.server)
+// NOTE: The actor default for maxRequestsPerCrawl is 0 (unlimited). Setting this
+// too low can cause missing/empty `variants`.
+const APIFY_SEPHORA_MAX_CONCURRENCY = Math.max(1, Math.min(20, Number(process.env.APIFY_SEPHORA_MAX_CONCURRENCY || 2)));
+const APIFY_SEPHORA_MAX_REQUESTS_PER_CRAWL = Math.max(0, Math.min(500, Number(process.env.APIFY_SEPHORA_MAX_REQUESTS_PER_CRAWL || 0)));
+
+// If we scrape fewer than this many shades from raw HTML, try Apify to fill in.
+const APIFY_MIN_SHADES_THRESHOLD = Math.max(1, Math.min(50, Number(process.env.APIFY_MIN_SHADES_THRESHOLD || 5)));
+
 
 const SHADE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const shadeCache = new Map(); // url -> { fetchedAt: number, shades: Array<{ value: string, desc?: string }> }
@@ -787,6 +822,242 @@ function normalizeRetailerUrl(urlStr) {
 }
 
 
+async function fetchJsonPost(url, bodyObj, extraHeaders = {}) {
+  const target = String(url || "").trim();
+  if (!target) throw new Error("Missing URL");
+
+  const headers = {
+    accept: "application/json",
+    "content-type": "application/json",
+    ...extraHeaders,
+  };
+
+  if (typeof fetch === "function") {
+    const res = await fetch(target, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(bodyObj ?? {}),
+    });
+    if (!res.ok) {
+      let body = "";
+      try {
+        body = String(await res.text());
+      } catch {
+        body = "";
+      }
+      const snippet = body ? body.slice(0, 1000) : "";
+      throw new Error(`JSON POST failed: ${res.status}${snippet ? ` :: ${snippet}` : ""}`);
+    }
+    return await res.json();
+  }
+
+  return await new Promise((resolve, reject) => {
+    let resolved = false;
+    try {
+      const u = new URL(target);
+      const lib = u.protocol === "https:" ? https : http;
+
+      const payload = Buffer.from(JSON.stringify(bodyObj ?? {}), "utf8");
+
+      const req = lib.request(
+        {
+          method: "POST",
+          hostname: u.hostname,
+          port: u.port ? Number(u.port) : undefined,
+          path: `${u.pathname}${u.search}`,
+          headers: {
+            ...headers,
+            "content-length": String(payload.length),
+          },
+        },
+        (res) => {
+          const status = Number(res.statusCode || 0);
+
+          let data = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            if (resolved) return;
+            data += String(chunk || "");
+            if (data.length > 8_000_000) {
+              resolved = true;
+              req.destroy();
+              reject(new Error("JSON response too large"));
+            }
+          });
+          res.on("end", () => {
+            if (resolved) return;
+            resolved = true;
+
+            if (status < 200 || status >= 300) {
+              const snippet = data ? data.slice(0, 1000) : "";
+              reject(new Error(`JSON POST failed: ${status}${snippet ? ` :: ${snippet}` : ""}`));
+              return;
+            }
+
+            try {
+              resolve(JSON.parse(data || "{}"));
+            } catch (e) {
+              reject(e);
+            }
+          });
+          res.on("error", (e) => {
+            if (resolved) return;
+            resolved = true;
+            reject(e);
+          });
+        }
+      );
+
+      req.on("error", (e) => {
+        if (resolved) return;
+        resolved = true;
+        reject(e);
+      });
+
+      req.write(payload);
+      req.end();
+    } catch (e) {
+      if (resolved) return;
+      resolved = true;
+      reject(e);
+    }
+  });
+}
+
+function extractColorLabelFromApifyVariant(variant) {
+  const v = variant && typeof variant === "object" ? variant : {};
+
+  // 1) Options array: [{ name: 'Color', value: 'Heather Pop' }, ...]
+  const options = Array.isArray(v.options) ? v.options : [];
+  for (const opt of options) {
+    const n = String(opt?.name || opt?.type || "").toLowerCase();
+    if (/(color|colour|shade)/i.test(n)) {
+      const val = String(opt?.value || opt?.label || "").trim();
+      if (val) return cleanVariantValue(val);
+    }
+  }
+
+  // 2) Attributes object
+  const attrs = v.attributes && typeof v.attributes === "object" ? v.attributes : null;
+  if (attrs) {
+    for (const k of Object.keys(attrs)) {
+      if (!/(color|colour|shade)/i.test(k)) continue;
+      const val = String(attrs?.[k] || "").trim();
+      if (val) return cleanVariantValue(val);
+    }
+  }
+
+  // 3) Common top-level keys
+  const tryKeys = [
+    "color",
+    "colour",
+    "shade",
+    "colorName",
+    "colourName",
+    "shadeName",
+    "swatchName",
+    "skuSwatchName",
+    "variant",
+    "variantName",
+    "variantTitle",
+    "title",
+    "name",
+    "displayName",
+    "label",
+  ];
+  for (const k of tryKeys) {
+    const val = v?.[k];
+    if (typeof val === "string" && val.trim()) {
+      const cleaned = cleanVariantValue(val);
+      if (!cleaned) continue;
+      // Avoid returning product titles that are overly long.
+      if (cleaned.length > 140) continue;
+      return cleaned;
+    }
+  }
+
+  return "";
+}
+
+async function getSephoraShadesViaApify(url) {
+  const token = String(APIFY_TOKEN || "").trim();
+  if (!token) return [];
+
+  const actorId = encodeURIComponent(String(APIFY_SEPHORA_ACTOR_ID || "autofacts~sephora").trim());
+  const endpoint = `https://api.apify.com/v2/acts/${actorId}/run-sync-get-dataset-items?token=${encodeURIComponent(token)}`;
+
+  const startUrl = String(url || "").trim();
+
+  const run = async (useResidential) => {
+    const input = {
+      startUrls: [{ url: startUrl }],
+      proxy: {
+        useApifyProxy: true,
+        ...(useResidential ? { apifyProxyGroups: ["RESIDENTIAL"] } : {}),
+      },
+      maxConcurrency: APIFY_SEPHORA_MAX_CONCURRENCY,
+      // 0 = unlimited (actor default). A value that's too low can cause empty/missing variants.
+      maxRequestsPerCrawl: APIFY_SEPHORA_MAX_REQUESTS_PER_CRAWL,
+    };
+    return await fetchJsonPost(endpoint, input);
+  };
+
+  // Apify returns dataset items (array) for the finished run.
+  // We try with residential proxies first (recommended), and if that fails due to
+  // proxy availability, we retry once without specifying proxy group.
+  let items;
+  try {
+    items = await run(APIFY_SEPHORA_USE_RESIDENTIAL);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (APIFY_DEBUG) console.warn("Apify Sephora run failed:", msg.slice(0, 500));
+
+    const looksProxyGroupRelated = /RESIDENTIAL|proxy group|apifyProxyGroups|proxy/i.test(msg);
+    if (APIFY_SEPHORA_USE_RESIDENTIAL && looksProxyGroupRelated) {
+      try {
+        if (APIFY_DEBUG) console.warn("Retrying Apify Sephora run without RESIDENTIAL proxy group...");
+        items = await run(false);
+      } catch (e2) {
+        if (APIFY_DEBUG) console.warn("Apify retry failed:", String(e2?.message || e2).slice(0, 500));
+        throw e2;
+      }
+    } else {
+      throw e;
+    }
+  }
+
+  const first = Array.isArray(items) ? items[0] : null;
+  const variants = Array.isArray(first?.variants) ? first.variants : [];
+
+  if (APIFY_DEBUG) {
+    const title = String(first?.title || first?.name || "").trim();
+    console.log(
+      `Apify Sephora: ${variants.length} variants${title ? ` for ${title}` : ""} (${startUrl})`
+    );
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const v of variants) {
+    const label = extractColorLabelFromApifyVariant(v);
+    if (!label) continue;
+
+    // Filter out sizes.
+    if (/(\boz\b|\bml\b|\bg\b|standard size|mini size|travel size)/i.test(label)) continue;
+
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ value: label });
+
+    if (out.length >= 200) break;
+  }
+
+  return out;
+}
+
+
 function isAllowedRetailerUrl(urlStr) {
   try {
     const u = new URL(String(urlStr || ""));
@@ -801,7 +1072,8 @@ function isAllowedRetailerUrl(urlStr) {
   }
 }
 
-function defaultRetailerHeaders() {
+
+function retailerHeadersDesktop() {
   return {
     "user-agent":
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -809,24 +1081,66 @@ function defaultRetailerHeaders() {
     "accept-language": "en-CA,en;q=0.9",
     // Allow compression for faster downloads. Node HTTPS fallback will decompress.
     "accept-encoding": "gzip, deflate, br",
+    "upgrade-insecure-requests": "1",
   };
 }
 
-async function fetchHtml(url, maxRedirects = 3) {
-  const target = String(url || "").trim();
-  if (!target) throw new Error("Missing retailer URL");
+function retailerHeadersMobile() {
+  return {
+    "user-agent":
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-CA,en;q=0.9",
+    "accept-encoding": "gzip, deflate, br",
+    "upgrade-insecure-requests": "1",
+  };
+}
 
-  const headers = defaultRetailerHeaders();
+function retailerHeadersMinimal() {
+  return {
+    "user-agent": "Mozilla/5.0",
+    accept: "text/html,*/*;q=0.8",
+    "accept-language": "en-CA,en;q=0.9",
+    "accept-encoding": "gzip, deflate",
+  };
+}
+
+function looksBlockedRetailerHtml(html) {
+  const t = String(html || "").toLowerCase();
+  if (!t) return true;
+
+  // Common bot/consent/blocked pages.
+  const needles = [
+    "access denied",
+    "request blocked",
+    "pardon our interruption",
+    "are you a robot",
+    "captcha",
+    "enable cookies",
+    "attention required",
+    "forbidden",
+  ];
+  if (needles.some((n) => t.includes(n))) return true;
+
+  // Some block pages render as a tiny HTML shell.
+  if (t.length < 800 && (t.includes("error") || t.includes("blocked"))) return true;
+
+  return false;
+}
+
+async function fetchHtmlOnce(target, headers, maxRedirects = 3) {
+  const urlStr = String(target || "").trim();
+  if (!urlStr) throw new Error("Missing retailer URL");
 
   // Node 18+ has global fetch. On older Node, fall back to native http/https.
   if (typeof fetch === "function") {
-    const res = await fetch(target, { method: "GET", headers, redirect: "manual" });
+    const res = await fetch(urlStr, { method: "GET", headers, redirect: "manual" });
 
     if (res.status >= 300 && res.status < 400 && maxRedirects > 0) {
       const loc = res.headers.get("location");
       if (loc) {
-        const next = new URL(loc, target).toString();
-        return await fetchHtml(next, maxRedirects - 1);
+        const next = new URL(loc, urlStr).toString();
+        return await fetchHtmlOnce(next, headers, maxRedirects - 1);
       }
     }
 
@@ -837,7 +1151,7 @@ async function fetchHtml(url, maxRedirects = 3) {
   return await new Promise((resolve, reject) => {
     let resolved = false;
     try {
-      const u = new URL(target);
+      const u = new URL(urlStr);
       const lib = u.protocol === "https:" ? https : http;
 
       const req = lib.request(
@@ -854,8 +1168,8 @@ async function fetchHtml(url, maxRedirects = 3) {
 
           if (status >= 300 && status < 400 && loc && maxRedirects > 0) {
             res.resume();
-            const next = new URL(String(loc), target).toString();
-            fetchHtml(next, maxRedirects - 1).then(resolve).catch(reject);
+            const next = new URL(String(loc), urlStr).toString();
+            fetchHtmlOnce(next, headers, maxRedirects - 1).then(resolve).catch(reject);
             return;
           }
 
@@ -920,6 +1234,36 @@ async function fetchHtml(url, maxRedirects = 3) {
   });
 }
 
+async function fetchHtml(url, maxRedirects = 3) {
+  const target = String(url || "").trim();
+  if (!target) throw new Error("Missing retailer URL");
+
+  const profiles = [retailerHeadersDesktop(), retailerHeadersMobile(), retailerHeadersMinimal()];
+
+  let lastErr = null;
+  for (const headers of profiles) {
+    try {
+      const html = await fetchHtmlOnce(target, headers, maxRedirects);
+      if (looksBlockedRetailerHtml(html)) throw new Error("Retailer returned blocked/consent HTML");
+      return html;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  throw lastErr || new Error("Retailer fetch failed");
+}
+
+
+function cleanVariantValue(raw) {
+  let s = compactSpaces(safeDecodeJsonString(raw));
+  if (!s) return "";
+
+  // Remove common trailing marketing tokens.
+  s = s.replace(/\bNew\b\s*$/i, "").trim();
+  s = s.replace(/\b(online only|limited edition|exclusive)\b\s*$/i, "").trim();
+  return s;
+}
 
 function extractSephoraColorVariantsFromEmbeddedJson(html) {
   const s = String(html || "");
@@ -929,14 +1273,14 @@ function extractSephoraColorVariantsFromEmbeddedJson(html) {
   const seen = new Set();
 
   const push = (valueRaw, descRaw) => {
-    const value = compactSpaces(safeDecodeJsonString(valueRaw));
+    const value = cleanVariantValue(valueRaw);
     const desc = compactSpaces(safeDecodeJsonString(descRaw));
     const vLow = value.toLowerCase();
     if (!value) return;
 
     // Filter out sizes and other non-color variations.
     if (/(\boz\b|\bml\b|\bg\b|standard size|mini size|travel size)/i.test(value)) return;
-    if (value.length > 120) return;
+    if (value.length > 140) return;
 
     const key = `${vLow}::${String(desc || "").toLowerCase()}`;
     if (seen.has(key)) return;
@@ -946,22 +1290,52 @@ function extractSephoraColorVariantsFromEmbeddedJson(html) {
   };
 
   const walk = (node, depth = 0) => {
-    if (!node || depth > 32) return;
+    if (!node || depth > 40) return;
     if (Array.isArray(node)) {
       for (const it of node) walk(it, depth + 1);
       return;
     }
     if (typeof node !== "object") return;
 
-    // Common Sephora sku structures
-    const vt = node.variationType ?? node.variation_type ?? node.variation_type_name;
-    const vv = node.variationValue ?? node.variation_value ?? node.variationName ?? node.variation_name;
-    const vd = node.variationDesc ?? node.variation_desc ?? node.variationDescription ?? node.variation_description;
+    const vt =
+      node.variationType ??
+      node.variation_type ??
+      node.variation_type_name ??
+      node.variationTypeName ??
+      node.variationTypeDisplayName;
+
+    const vd =
+      node.variationDesc ??
+      node.variation_desc ??
+      node.variationDescription ??
+      node.variation_description ??
+      node.colorDescription ??
+      node.shadeDescription;
+
+    const vv =
+      node.variationValue ??
+      node.variation_value ??
+      node.variationName ??
+      node.variation_name ??
+      node.variationValueName ??
+      node.colorName ??
+      node.colourName ??
+      node.shadeName ??
+      node.skuSwatchName ??
+      node.swatchName;
 
     const vtLow = String(vt || "").toLowerCase();
-    const isColorType = vtLow === "color" || vtLow === "colour" || vtLow === "shade";
+    const isColorType = /(color|colour|shade)/i.test(vtLow);
 
-    if (vv && (!vt || isColorType)) {
+    const hasSku =
+      node.skuId ||
+      node.sku_id ||
+      node.skuID ||
+      node.sku ||
+      node.skuType ||
+      node.sku_type;
+
+    if (vv && (isColorType || (!vt && hasSku))) {
       push(vv, vd);
     }
 
@@ -981,7 +1355,7 @@ function extractSephoraColorVariantsFromEmbeddedJson(html) {
     }
   };
 
-  // Next.js payload (most common on Sephora)
+  // Next.js payload (common on Sephora)
   const mNext = /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i.exec(s);
   if (mNext?.[1]) tryParseJson(mNext[1]);
 
@@ -1003,14 +1377,14 @@ function extractSephoraColorVariantsFromHtml(html) {
   const seen = new Set(out.map((x) => `${String(x?.value || "").toLowerCase()}::${String(x?.desc || "").toLowerCase()}`));
 
   const push = (valueRaw, descRaw) => {
-    const value = compactSpaces(safeDecodeJsonString(valueRaw));
+    const value = cleanVariantValue(valueRaw);
     const desc = compactSpaces(safeDecodeJsonString(descRaw));
     const vLow = value.toLowerCase();
     if (!value) return;
 
     // Filter out sizes and other non-color variations.
     if (/(\boz\b|\bml\b|\bg\b|standard size|mini size|travel size)/i.test(value)) return;
-    if (value.length > 120) return;
+    if (value.length > 140) return;
 
     const key = `${vLow}::${String(desc || "").toLowerCase()}`;
     if (seen.has(key)) return;
@@ -1022,26 +1396,50 @@ function extractSephoraColorVariantsFromHtml(html) {
   // If JSON already gave us a healthy list, stop here.
   if (out.length >= 6) return out;
 
-  // 2) Scrape common embedded state blobs (unescaped)
-  const reColorBlock = /"variationType"\s*:\s*"Color"[\s\S]{0,2000}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,1200}?"variationDesc"\s*:\s*"([^"]+)")?/g;
+  // 2) Extract from aria-label/title attributes (often used on swatches)
+  const reAria = /aria-label\s*=\s*"([^"]*(?:Color|Shade)[^"]*)"/gi;
+  for (const m of s.matchAll(reAria)) {
+    const label = compactSpaces(String(m?.[1] || ""));
+    const m2 = /(?:color|shade)\s*:?\s*(.+)/i.exec(label);
+    if (!m2?.[1]) continue;
+    let val = String(m2[1] || "");
+    // Trim common trailing tokens.
+    val = val.replace(/\bNew\b\s*$/i, "").trim();
+    val = val.replace(/\b(Size|Standard size|Mini size)\b.*$/i, "").trim();
+    push(val, "");
+  }
+
+  const reTitle = /title\s*=\s*"([^"]*(?:Color|Shade)[^"]*)"/gi;
+  for (const m of s.matchAll(reTitle)) {
+    const label = compactSpaces(String(m?.[1] || ""));
+    const m2 = /(?:color|shade)\s*:?\s*(.+)/i.exec(label);
+    if (!m2?.[1]) continue;
+    let val = String(m2[1] || "");
+    val = val.replace(/\bNew\b\s*$/i, "").trim();
+    val = val.replace(/\b(Size|Standard size|Mini size)\b.*$/i, "").trim();
+    push(val, "");
+  }
+
+  // 3) Scrape common embedded sku blocks (unescaped)
+  const reColorBlock = /"variationType"\s*:\s*"(?:Color|Shade|Colour)"[\s\S]{0,3000}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,1600}?"variationDesc"\s*:\s*"([^"]+)")?/g;
   for (const m of s.matchAll(reColorBlock)) {
     push(m?.[1], m?.[2]);
   }
 
-  // 3) Scrape escaped JSON blobs (e.g., in attributes)
-  const reColorBlockEsc = /\"variationType\"\s*:\s*\"Color\"[\s\S]{0,2000}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,1200}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
+  // 4) Scrape escaped JSON blobs (e.g., in attributes)
+  const reColorBlockEsc = /\"variationType\"\s*:\s*\"(?:Color|Shade|Colour)\"[\s\S]{0,3000}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,1600}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
   for (const m of s.matchAll(reColorBlockEsc)) {
     push(m?.[1], m?.[2]);
   }
 
-  // 4) Fallback: grab any sku blocks that include variationValue/variationDesc.
+  // 5) Fallback: grab any sku blocks that include variationValue/variationDesc.
   if (out.length < 2) {
-    const reSku = /"skuId"\s*:\s*"?(\d+)"?[\s\S]{0,1200}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,800}?"variationDesc"\s*:\s*"([^"]+)")?/g;
+    const reSku = /"skuId"\s*:\s*"?(\d+)"?[\s\S]{0,2000}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,1200}?"variationDesc"\s*:\s*"([^"]+)")?/g;
     for (const m of s.matchAll(reSku)) {
       push(m?.[2], m?.[3]);
     }
 
-    const reSkuEsc = /\"skuId\"\s*:\s*\"?(\d+)\"?[\s\S]{0,1200}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,800}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
+    const reSkuEsc = /\"skuId\"\s*:\s*\"?(\d+)\"?[\s\S]{0,2000}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,1200}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
     for (const m of s.matchAll(reSkuEsc)) {
       push(m?.[2], m?.[3]);
     }
@@ -1260,8 +1658,9 @@ const STATIC_SEPHORA_SHADE_FALLBACK = {
   ],
 };
 
+
 async function getSephoraShadesForUrl(url) {
-  const uRaw = String(url || '').trim();
+  const uRaw = String(url || "").trim();
   if (!uRaw) return [];
 
   const u = normalizeRetailerUrl(uRaw);
@@ -1273,6 +1672,8 @@ async function getSephoraShadesForUrl(url) {
   }
 
   let shades = [];
+
+  // (1) Fast path: fetch product HTML directly and extract variants
   try {
     const html = await fetchHtml(u);
     shades = extractSephoraColorVariantsFromHtml(html);
@@ -1280,13 +1681,38 @@ async function getSephoraShadesForUrl(url) {
     shades = [];
   }
 
+  // (2) Reliability fallback: Apify actor (optional)
+  // This is the only approach that tends to work consistently across Sephora's anti-bot changes.
+  if ((!Array.isArray(shades) || shades.length < APIFY_MIN_SHADES_THRESHOLD) && APIFY_TOKEN && isAllowedRetailerUrl(u)) {
+    try {
+      const apifyShades = await getSephoraShadesViaApify(u);
+      const merged = [];
+      const seen = new Set();
+      const add = (sh) => {
+        const v = String(sh?.value || "").trim();
+        const d = String(sh?.desc || "").trim();
+        if (!v) return;
+        const key = `${v.toLowerCase()}::${d.toLowerCase()}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push({ value: v, desc: d || undefined });
+      };
+      (Array.isArray(shades) ? shades : []).forEach(add);
+      (Array.isArray(apifyShades) ? apifyShades : []).forEach(add);
+      shades = merged;
+    } catch (e) {
+      if (APIFY_DEBUG) console.warn("Apify shades fetch failed:", String(e?.message || e).slice(0, 500));
+    }
+  }
+
+  // (3) Curated static fallbacks (kept small; only used if live extraction fails)
   const fallback = STATIC_SEPHORA_SHADE_FALLBACK?.[u];
   if (Array.isArray(fallback) && fallback.length) {
     const merged = [];
     const seen = new Set();
     const add = (sh) => {
-      const v = String(sh?.value || '').trim();
-      const d = String(sh?.desc || '').trim();
+      const v = String(sh?.value || "").trim();
+      const d = String(sh?.desc || "").trim();
       if (!v) return;
       const key = `${v.toLowerCase()}::${d.toLowerCase()}`;
       if (seen.has(key)) return;
@@ -1531,24 +1957,36 @@ async function resolveSephoraProductUrlByName(name) {
   return resolved;
 }
 
+
 async function buildProductLines({ products, category, undertone, season, toneNumber, toneDepth }) {
   const out = [];
   const list = Array.isArray(products) ? products : [];
-  const seed = `${String(category || '').toLowerCase()}|${undertone}|${season}|${String(toneNumber ?? '')}|${String(toneDepth ?? '')}`;
-  const picks = pickStable(list, 2, seed);
 
-  for (const name of picks) {
-    let url = PRODUCT_URLS[name] || "";
+  const desiredCount = 1;
+  const seed = `${String(category || "").toLowerCase()}|${undertone}|${season}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
+
+  // Try more candidates so we can avoid returning "(unavailable)" whenever possible.
+  const candidates = pickStable(list, Math.min(list.length, desiredCount * 6), seed);
+
+  const tried = new Set();
+  const chosen = [];
+  const fallbacks = [];
+
+  for (const name of candidates) {
+    const n = String(name || "").trim();
+    if (!n || tried.has(n)) continue;
+    tried.add(n);
+
+    let url = PRODUCT_URLS[n] || "";
     if (!url) {
       try {
-        url = await resolveSephoraProductUrlByName(name);
+        url = await resolveSephoraProductUrlByName(n);
       } catch {
         url = "";
       }
     }
 
     let label = "";
-    let labelKind = "color"; // color | unavailable
 
     try {
       if (url && isAllowedRetailerUrl(url)) {
@@ -1567,17 +2005,133 @@ async function buildProductLines({ products, category, undertone, season, toneNu
       label = "";
     }
 
-    if (!label) {
-      labelKind = "unavailable";
+    if (label) {
+      chosen.push(`- ${n} — Color: ${label}`);
+    } else {
+      fallbacks.push(`- ${n} — Color: (unavailable)`);
     }
 
-    const tail = labelKind === "color" && label ? ` — Color: ${label}` : " — Color: (unavailable)";
-    out.push(`- ${name}${tail}`);
+    if (chosen.length >= desiredCount) break;
   }
 
-  return out;
+  // If we couldn't find enough with colors, fill remaining with unavailable ones.
+  while (chosen.length < desiredCount && fallbacks.length) {
+    chosen.push(fallbacks.shift());
+  }
+
+  return chosen;
 }
 
+
+
+async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumber }) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY on server");
+  }
+
+  const recItem = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      product_name: { type: "string" },
+      product_url: { type: "string" },
+      color_name: { type: "string" },
+    },
+    required: ["product_name", "product_url", "color_name"],
+  };
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      foundation: recItem,
+      cheeks: recItem,
+      eyes: recItem,
+      lips: recItem,
+    },
+    required: ["foundation", "cheeks", "eyes", "lips"],
+  };
+
+  const undertoneTxt = String(undertone || "neutral");
+  const seasonTxt = String(season || "summer");
+  const depthTxt = String(toneDepth || "").trim();
+  const numberTxt = typeof toneNumber === "number" && Number.isFinite(toneNumber) ? String(toneNumber) : String(toneNumber || "").trim();
+
+  const systemPrompt =
+    "You are a professional makeup artist assistant." +
+    " Use ONLY Sephora (sephora.com) to choose products and their exact color/variant names." +
+    " You MUST use web search to verify that the recommended color/variant exists for that specific product." +
+    " Choose exactly ONE recommendation for each category: foundation, cheeks, eyes, lips." +
+    " For each recommendation, provide:" +
+    " (1) product_name as listed on Sephora, (2) product_url to the Sephora product page, (3) color_name EXACTLY as shown in Sephora's Color selector (include numbers/codes/description if present)." +
+    " If you cannot confidently find an exact color_name for a product from Sephora, set color_name to '(unavailable)' (do not guess)." +
+    " Prefer products that have multiple color variants (so a color selector exists)." +
+    " Do not include any extra keys. Output JSON that matches the provided schema.";
+
+  const userPrompt =
+    `Person attributes:\n` +
+    `- undertone: ${undertoneTxt}\n` +
+    `- season: ${seasonTxt}\n` +
+    (depthTxt ? `- depth: ${depthTxt}\n` : "") +
+    (numberTxt ? `- tone_number (approx 1-10): ${numberTxt}\n` : "") +
+    "\nTask:\n" +
+    "1) Using Sephora only, choose ONE good product per category (foundation, cheeks, eyes, lips).\n" +
+    "2) For each chosen product, look up its Sephora color/variant list and choose the best matching variant name for the person above.\n" +
+    "3) Return JSON only.";
+
+  const payload = {
+    model: OPENAI_RECS_MODEL || "gpt-5-mini",
+    temperature: 0,
+    reasoning: { effort: "low" },
+    tools: [
+      {
+        type: "web_search",
+        filters: { allowed_domains: ["sephora.com"] },
+        user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+      },
+    ],
+    tool_choice: "required",
+    max_tool_calls: OPENAI_RECS_MAX_TOOL_CALLS,
+    max_output_tokens: OPENAI_RECS_MAX_OUTPUT_TOKENS,
+    input: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "undertone_sephora_recommendations",
+        strict: true,
+        schema,
+      },
+    },
+  };
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.error?.message || data?.error || `OpenAI error HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+
+  const { text: outText, refusal } = extractOutputText(data);
+  if (refusal) throw new Error(refusal);
+  if (!outText) throw new Error("OpenAI returned no text output");
+
+  try {
+    return JSON.parse(outText);
+  } catch {
+    throw new Error("OpenAI returned non-JSON output");
+  }
+}
 app.post("/recommend-products", authRequired, async (req, res) => {
   try {
     const undertone = normalizeUndertoneKeyServer(req?.body?.undertone);
@@ -1585,6 +2139,53 @@ app.post("/recommend-products", authRequired, async (req, res) => {
     const toneNumber = req?.body?.tone_number;
     const toneDepth = req?.body?.tone_depth;
 
+    // Primary path: reasoning model + web_search (Sephora only)
+    if (OPENAI_RECS_USE_WEB_SEARCH) {
+      try {
+        const recs = await callOpenAIForSephoraRecs({
+          undertone,
+          season,
+          toneDepth,
+          toneNumber,
+        });
+
+        if (recs && typeof recs === "object") {
+          const lines = [];
+          lines.push("Recommended products:");
+
+          const sections = [
+            { title: "Foundation", key: "foundation" },
+            { title: "Cheeks", key: "cheeks" },
+            { title: "Eyes", key: "eyes" },
+            { title: "Lips", key: "lips" },
+          ];
+
+          for (const sec of sections) {
+            const item = recs?.[sec.key] || null;
+            const name = String(item?.product_name || "").trim();
+            const url = String(item?.product_url || "").trim();
+            const color = String(item?.color_name || "").trim() || "(unavailable)";
+
+            lines.push("");
+            lines.push(`${sec.title}:`);
+            if (name) {
+              // Include URL so the variant name is auditable.
+              const urlPart = url ? ` (Sephora: ${url})` : "";
+              lines.push(`- ${name} — Color: ${color}${urlPart}`);
+            } else {
+              lines.push(`- (unavailable) — Color: ${color}`);
+            }
+          }
+
+          return res.json({ ok: true, text: lines.join("\n"), source: "sephora_web_search" });
+        }
+      } catch (e) {
+        console.error("recommend-products (web_search) failed:", e);
+        // Fall through to legacy fallback.
+      }
+    }
+
+    // Fallback path: curated product pools + best-effort shade extraction.
     const list = BUY_RECS_SERVER[undertone] || BUY_RECS_SERVER.neutral;
 
     const lines = [];
@@ -1614,7 +2215,7 @@ app.post("/recommend-products", authRequired, async (req, res) => {
       block.forEach((l) => lines.push(l));
     }
 
-    return res.json({ ok: true, text: lines.join("\n") });
+    return res.json({ ok: true, text: lines.join("\n"), source: "fallback" });
   } catch (e) {
     console.error("recommend-products error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
