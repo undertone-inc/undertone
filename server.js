@@ -62,8 +62,16 @@ const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 
 const OPENAI_RECS_MODEL = String(process.env.OPENAI_RECS_MODEL || "gpt-5-mini").trim();
 const OPENAI_RECS_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_MAX_OUTPUT_TOKENS || 500);
 // Keep tool calls bounded so costs are predictable (search/open/find all count).
-const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 12);
+const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 20);
 const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "true").toLowerCase() !== "false";
+
+// Recs repair: if any category returns '(unavailable)', we do a small targeted follow-up
+// web search to fill the exact Sephora color/variant name. This runs only when needed.
+const OPENAI_RECS_REPAIR_ENABLED = String(process.env.OPENAI_RECS_REPAIR_ENABLED || "true").toLowerCase() !== "false";
+const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8);
+const OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250);
+const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCase() === "true";
+
 
 // Upload constraints
 const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8);
@@ -2154,7 +2162,7 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
         user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
       },
     ],
-    tool_choice: "required",
+    tool_choice: "auto",
     max_tool_calls: OPENAI_RECS_MAX_TOOL_CALLS,
     max_output_tokens: OPENAI_RECS_MAX_OUTPUT_TOKENS,
     input: [
@@ -2197,6 +2205,149 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
   }
 }
 
+async function callOpenAIForSephoraCategoryRepair({
+  categoryKey,
+  categoryTitle,
+  undertone,
+  season,
+  toneDepth,
+  toneNumber,
+  preferredName,
+  preferredUrl,
+}) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY on server");
+  }
+
+  const pools = {
+    foundation: FOUNDATION_POOL,
+    cheeks: CHEEKS_POOL,
+    eyes: EYES_POOL,
+    lips: LIPS_POOL,
+  };
+
+  const pool = Array.isArray(pools?.[categoryKey]) ? pools[categoryKey] : [];
+  const title = String(categoryTitle || categoryKey || "").trim() || "Category";
+
+  const recItem = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      product_name: { type: "string" },
+      product_url: { type: "string" },
+      color_name: { type: "string" },
+    },
+    required: ["product_name", "product_url", "color_name"],
+  };
+
+  const undertoneTxt = String(undertone || "neutral");
+  const seasonTxt = String(season || "summer");
+  const depthTxt = String(toneDepth || "").trim();
+  const numberTxt =
+    typeof toneNumber === "number" && Number.isFinite(toneNumber)
+      ? String(toneNumber)
+      : String(toneNumber || "").trim();
+
+  const formatSupportedList = (names) => {
+    const arr = Array.isArray(names) ? names : [];
+    const lines = [];
+    for (const raw of arr) {
+      const name = String(raw || "").trim();
+      if (!name) continue;
+      const url = String(PRODUCT_URLS?.[name] || "").trim();
+      if (url) lines.push(`- ${name} — ${url}`);
+      else lines.push(`- ${name}`);
+    }
+    return lines.join("\n");
+  };
+
+  const preferredNameTxt = String(preferredName || "").trim();
+  const preferredUrlTxt = String(preferredUrl || "").trim();
+
+  const systemPrompt =
+    "You are a professional makeup artist assistant." +
+    " Use ONLY Sephora (sephora.com)." +
+    " You MUST use web search to verify the exact color/variant name for the product on Sephora." +
+    " Do NOT guess and do NOT invent color names." +
+    ` You are fixing ONLY the ${title} recommendation.` +
+    " You must choose ONE product from the Supported list." +
+    " Prefer the Preferred product if provided, but if you cannot find a verifiable color for it, pick another supported product." +
+    " Return JSON ONLY matching the provided schema.";
+
+  const userPrompt =
+    `Person attributes:\n` +
+    `- undertone: ${undertoneTxt}\n` +
+    `- season: ${seasonTxt}\n` +
+    (depthTxt ? `- depth: ${depthTxt}\n` : "") +
+    (numberTxt ? `- tone_number (approx 1-10): ${numberTxt}\n` : "") +
+    (preferredNameTxt ? `\nPreferred product: ${preferredNameTxt}\n` : "") +
+    (preferredUrlTxt ? `Preferred URL: ${preferredUrlTxt}\n` : "") +
+    `\nTask:\n` +
+    `1) Choose ONE supported Sephora product for ${title}.\n` +
+    `2) Find its EXACT Sephora color/variant name (from the Color/Shade selector) that best fits the person.\n` +
+    `3) Return JSON only.\n\n` +
+    `Supported Sephora products for ${title} (choose ONLY from these; use the listed URL as product_url):\n` +
+    formatSupportedList(pool);
+
+  const payload = {
+    model: OPENAI_RECS_MODEL || "gpt-5-mini",
+    temperature: 0,
+    reasoning: { effort: "low" },
+    tools: [
+      {
+        type: "web_search",
+        filters: { allowed_domains: ["sephora.com"] },
+        user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+      },
+    ],
+    tool_choice: "auto",
+    max_tool_calls: OPENAI_RECS_REPAIR_MAX_TOOL_CALLS,
+    max_output_tokens: OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS,
+    input: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "undertone_sephora_category_repair",
+        strict: true,
+        schema: recItem,
+      },
+    },
+  };
+
+  if (OPENAI_RECS_DEBUG) {
+    payload.include = ["web_search_call.action.sources"];
+  }
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.error?.message || data?.error || `OpenAI error HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+
+  const { text: outText, refusal } = extractOutputText(data);
+  if (refusal) throw new Error(refusal);
+  if (!outText) throw new Error("OpenAI returned no text output");
+
+  try {
+    return JSON.parse(outText);
+  } catch {
+    throw new Error("OpenAI returned non-JSON output");
+  }
+}
+
+
 async function repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber }) {
   const obj = recs && typeof recs === "object" ? recs : null;
   if (!obj) return;
@@ -2227,27 +2378,62 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
       }
     }
 
-    if (url && isAllowedRetailerUrl(url)) {
-      const normUrl = normalizeRetailerUrl(url);
-      item.product_url = normUrl;
+    const color0 = String(item?.color_name || "").trim();
+    let isUnavailable = !color0 || /^\(unavailable\)$/i.test(color0);
 
-      const color = String(item?.color_name || "").trim();
-      const isUnavailable = !color || /^\(unavailable\)$/i.test(color);
-      if (isUnavailable) {
-        try {
-          const shades = await getSephoraShadesForUrl(normUrl);
-          const best = pickBestShadeForCategory({
-            shades,
-            category: sec.title,
-            undertone,
-            season,
-            toneNumber,
-            toneDepth,
-          });
-          const label = best ? shadeLabel(best) : "";
-          if (label) item.color_name = label;
-        } catch {
-          // leave as unavailable
+    const hasRetailerUrl = Boolean(url && isAllowedRetailerUrl(url));
+    const normUrl = hasRetailerUrl ? normalizeRetailerUrl(url) : "";
+    if (normUrl) item.product_url = normUrl;
+
+    // (1) Try server-side HTML extraction (fast when it works, but can be blocked)
+    if (isUnavailable && normUrl) {
+      try {
+        const shades = await getSephoraShadesForUrl(normUrl);
+        const best = pickBestShadeForCategory({
+          shades,
+          category: sec.title,
+          undertone,
+          season,
+          toneNumber,
+          toneDepth,
+        });
+        const label = best ? shadeLabel(best) : "";
+        if (label) item.color_name = label;
+      } catch {
+        // ignore
+      }
+    }
+
+    const color1 = String(item?.color_name || "").trim();
+    isUnavailable = !color1 || /^\(unavailable\)$/i.test(color1);
+
+    // (2) Reliability: if still unavailable, do a small targeted web_search repair call.
+    if (isUnavailable && OPENAI_RECS_REPAIR_ENABLED) {
+      try {
+        const fixed = await callOpenAIForSephoraCategoryRepair({
+          categoryKey: sec.key,
+          categoryTitle: sec.title,
+          undertone,
+          season,
+          toneDepth,
+          toneNumber,
+          preferredName: name,
+          preferredUrl: normUrl || url || "",
+        });
+
+        const f = fixed && typeof fixed === "object" ? fixed : null;
+        if (f) {
+          const newName = String(f.product_name || "").trim();
+          const newUrl = String(f.product_url || "").trim();
+          const newColor = String(f.color_name || "").trim();
+
+          if (newName) item.product_name = newName;
+          if (newUrl && isAllowedRetailerUrl(newUrl)) item.product_url = normalizeRetailerUrl(newUrl);
+          if (newColor) item.color_name = newColor;
+        }
+      } catch (e) {
+        if (OPENAI_RECS_DEBUG) {
+          console.warn(`Sephora color repair failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
         }
       }
     }
