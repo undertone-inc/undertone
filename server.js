@@ -704,6 +704,498 @@ app.post("/start-subscription", authRequired, async (req, res) => {
   });
 });
 
+// ---- Product recommendations (best-match color names) ----
+// This endpoint powers the “Recommend products” button after a scan.
+//
+// IMPORTANT: We only scrape/parse from a small allowlist of retailer domains to avoid SSRF.
+// Today we support Sephora product pages.
+
+const SHADE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const shadeCache = new Map(); // url -> { fetchedAt: number, shades: Array<{ value: string, desc?: string }> }
+
+function normalizeUndertoneKeyServer(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "cool" || s === "neutral-cool" || s === "neutral" || s === "neutral-warm" || s === "warm") return s;
+  if (s === "olive") return "neutral";
+  return "neutral";
+}
+
+function normalizeSeasonKeyServer(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "spring" || s === "summer" || s === "autumn" || s === "winter") return s;
+  return "summer";
+}
+
+function undertoneDirectionServer(u) {
+  if (u === "warm" || u === "neutral-warm") return "warm";
+  if (u === "cool" || u === "neutral-cool") return "cool";
+  return "neutral";
+}
+
+function toneDepthFromNumberServer(n) {
+  if (!Number.isFinite(n)) return "light";
+  if (n <= 2) return "very fair";
+  if (n <= 3.5) return "fair";
+  if (n <= 5) return "light";
+  if (n <= 6.5) return "medium";
+  if (n <= 8) return "tan";
+  return "deep";
+}
+
+function normalizeToneDepthServer(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (!s) return null;
+  if (s === "very fair" || s === "very_fair" || s === "very-fair") return "very fair";
+  if (s === "fair") return "fair";
+  if (s === "light") return "light";
+  if (s === "medium") return "medium";
+  if (s === "tan") return "tan";
+  if (s === "deep") return "deep";
+  return null;
+}
+
+function safeDecodeJsonString(s) {
+  const raw = String(s ?? "");
+  if (!raw) return "";
+  const esc = raw.replace(/"/g, "\\\"");
+  try {
+    return JSON.parse(`"${esc}"`);
+  } catch {
+    return raw;
+  }
+}
+
+function compactSpaces(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+-\s+/g, " - ")
+    .trim();
+}
+
+function isAllowedRetailerUrl(urlStr) {
+  try {
+    const u = new URL(String(urlStr || ""));
+    const host = String(u.hostname || "").toLowerCase();
+    // Allow Sephora (US + CA domains)
+    if (host === "www.sephora.com" || host === "sephora.com" || host === "sephora.ca" || host === "www.sephora.ca") {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchHtml(url) {
+  if (typeof fetch !== "function") throw new Error("fetch is not available in this Node runtime");
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "accept-language": "en-CA,en;q=0.9",
+    },
+  });
+  if (!res.ok) throw new Error(`Retailer fetch failed: ${res.status}`);
+  return await res.text();
+}
+
+function extractSephoraColorVariantsFromHtml(html) {
+  const s = String(html || "");
+  if (!s) return [];
+
+  const out = [];
+  const seen = new Set();
+
+  const push = (valueRaw, descRaw) => {
+    const value = compactSpaces(safeDecodeJsonString(valueRaw));
+    const desc = compactSpaces(safeDecodeJsonString(descRaw));
+    const vLow = value.toLowerCase();
+    if (!value) return;
+
+    // Filter out sizes and other non-color variations.
+    if (/(\boz\b|\bml\b|\bg\b|standard size|mini size|travel size)/i.test(value)) return;
+    if (value.length > 80) return;
+
+    const key = `${vLow}::${String(desc || "").toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    out.push({ value, desc: desc || undefined });
+  };
+
+  // Primary: scrape embedded state blobs (most Sephora pages embed all color variants).
+  const reColorBlock = /"variationType"\s*:\s*"Color"[\s\S]{0,600}?"variationValue"\s*:\s*"([^\"]+)"(?:[\s\S]{0,300}?"variationDesc"\s*:\s*"([^\"]+)")?/g;
+  for (const m of s.matchAll(reColorBlock)) {
+    push(m?.[1], m?.[2]);
+  }
+
+  // Fallback: grab any sku blocks that include variationValue/variationDesc.
+  if (out.length < 2) {
+    const reSku = /"skuId"\s*:\s*"?(\d+)"?[\s\S]{0,400}?"variationValue"\s*:\s*"([^\"]+)"(?:[\s\S]{0,220}?"variationDesc"\s*:\s*"([^\"]+)")?/g;
+    for (const m of s.matchAll(reSku)) {
+      push(m?.[2], m?.[3]);
+    }
+  }
+
+  return out;
+}
+
+function shadeLabel(shade) {
+  const value = compactSpaces(String(shade?.value || ""));
+  const desc = compactSpaces(String(shade?.desc || ""));
+  if (!value) return "";
+  if (!desc) return value;
+  // Avoid doubling when the description is already baked into the value.
+  const vLow = value.toLowerCase();
+  const dLow = desc.toLowerCase();
+  if (vLow.includes(dLow)) return value;
+  return `${value} - ${desc}`;
+}
+
+function parseDepthFromText(text) {
+  const t = String(text || "").toLowerCase();
+  if (!t) return null;
+  if (t.includes("very fair")) return "very fair";
+  if (t.includes("fair")) return "fair";
+  if (t.includes("light medium")) return "medium";
+  if (t.includes("light")) return "light";
+  if (t.includes("medium")) return "medium";
+  if (t.includes("tan")) return "tan";
+  if (t.includes("deep")) return "deep";
+  return null;
+}
+
+function depthRank(depth) {
+  const d = String(depth || "").toLowerCase();
+  if (d === "very fair") return 0;
+  if (d === "fair") return 1;
+  if (d === "light") return 2;
+  if (d === "medium") return 3;
+  if (d === "tan") return 4;
+  if (d === "deep") return 5;
+  return 2;
+}
+
+function scoreByKeywords(text, want = [], avoid = []) {
+  const t = String(text || "").toLowerCase();
+  let score = 0;
+  want.forEach((w) => {
+    if (!w) return;
+    if (t.includes(String(w).toLowerCase())) score += 1;
+  });
+  avoid.forEach((w) => {
+    if (!w) return;
+    if (t.includes(String(w).toLowerCase())) score -= 1;
+  });
+  return score;
+}
+
+function pickBestShadeForCategory({ shades, category, undertone, season, toneNumber, toneDepth }) {
+  const list = Array.isArray(shades) ? shades : [];
+  if (!list.length) return null;
+
+  const dir = undertoneDirectionServer(undertone);
+  const seasonKey = normalizeSeasonKeyServer(season);
+  const desiredDepth = normalizeToneDepthServer(toneDepth) || toneDepthFromNumberServer(Number(toneNumber));
+  const desiredDepthRank = depthRank(desiredDepth);
+
+  // Shared keyword intent
+  const wantDir =
+    dir === "warm"
+      ? ["warm", "gold", "golden", "yellow", "peach", "apricot", "olive", "bronze", "caramel"]
+      : dir === "cool"
+        ? ["cool", "pink", "rosy", "rose", "berry", "plum", "blue", "red"]
+        : ["neutral", "beige", "balanced", "natural"];
+  const avoidDir =
+    dir === "warm"
+      ? ["cool", "pink", "rosy", "blue"]
+      : dir === "cool"
+        ? ["warm", "gold", "golden", "yellow", "peach", "orange"]
+        : [];
+
+  const wantSeason =
+    seasonKey === "spring"
+      ? ["coral", "peach", "apricot", "fresh", "bright", "golden", "warm rose"]
+      : seasonKey === "summer"
+        ? ["soft", "dusty", "mauve", "rose", "cool pink", "taupe", "muted"]
+        : seasonKey === "autumn"
+          ? ["terracotta", "brick", "copper", "bronze", "spice", "warm brown", "apricot"]
+          : ["bold", "deep", "berry", "cranberry", "true red", "plum", "wine"];
+
+  const avoidSeason =
+    seasonKey === "spring"
+      ? ["deep", "dark", "plum", "wine"]
+      : seasonKey === "summer"
+        ? ["bright orange", "neon", "brick"]
+        : seasonKey === "autumn"
+          ? ["icy", "cool pink", "fuchsia"]
+          : ["beige", "nude beige"];
+
+  const isFoundation = String(category || "").toLowerCase() === "foundation";
+  const tNum = Number(toneNumber);
+  const targetP = Number.isFinite(tNum) ? Math.min(1, Math.max(0, (tNum - 1) / 9)) : 0.4;
+
+  // Pre-sort for foundation by first number we can extract (helps pick a similar depth index).
+  const withNum = list
+    .map((sh, idx) => {
+      const label = shadeLabel(sh);
+      const m = /\b(\d+(?:\.\d+)?)\b/.exec(label);
+      const num = m ? Number(m[1]) : NaN;
+      return { sh, idx, label, num };
+    })
+    .sort((a, b) => {
+      const an = a.num;
+      const bn = b.num;
+      const aOk = Number.isFinite(an);
+      const bOk = Number.isFinite(bn);
+      if (aOk && bOk) return an - bn;
+      if (aOk && !bOk) return -1;
+      if (!aOk && bOk) return 1;
+      return a.idx - b.idx;
+    });
+
+  const targetIdx = Math.round(targetP * Math.max(0, withNum.length - 1));
+
+  let best = null;
+  let bestScore = -1e9;
+
+  for (let i = 0; i < withNum.length; i++) {
+    const item = withNum[i];
+    const label = item.label;
+    if (!label) continue;
+
+    let score = 0;
+    const text = `${label}`;
+
+    // Undertone + season cues
+    score += 2 * scoreByKeywords(text, wantDir, avoidDir);
+    score += 1 * scoreByKeywords(text, wantSeason, avoidSeason);
+
+    if (isFoundation) {
+      const depth = parseDepthFromText(label);
+      if (depth) {
+        score += 6 - Math.abs(depthRank(depth) - desiredDepthRank);
+      } else {
+        // Depth fallback: closeness to target index (using numeric ordering if available)
+        score += 4 - Math.min(4, Math.abs(i - targetIdx));
+      }
+    }
+
+    // Mild preference for shades that look like a real “color name”
+    if (/\bcolor\b/i.test(text)) score -= 1;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = item.sh;
+    }
+  }
+
+  return best;
+}
+
+async function getSephoraShadesForUrl(url) {
+  const u = String(url || "").trim();
+  if (!u) return [];
+  const cached = shadeCache.get(u);
+  const now = Date.now();
+  if (cached && now - (cached.fetchedAt || 0) < SHADE_CACHE_TTL_MS) {
+    return Array.isArray(cached.shades) ? cached.shades : [];
+  }
+
+  const html = await fetchHtml(u);
+  const shades = extractSephoraColorVariantsFromHtml(html);
+  shadeCache.set(u, { fetchedAt: now, shades });
+  return shades;
+}
+
+// Product lists (kept intentionally small + stable)
+const BUY_RECS_SERVER = {
+  cool: {
+    foundation: [
+      "Estée Lauder Double Wear Stay-in-Place Foundation",
+      "NARS Light Reflecting Foundation",
+      "Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation",
+    ],
+    cheeks: ["Rare Beauty Soft Pinch Liquid Blush", "Clinique Cheek Pop", "NARS Blush"],
+    eyes: ["Natasha Denona Glam Palette", "Urban Decay Naked2 Basics Palette", "Make Up For Ever Artist Color Pencil"],
+    lips: ["MAC Matte Lipstick", "Charlotte Tilbury Matte Revolution Lipstick", "Fenty Beauty Gloss Bomb"],
+  },
+  "neutral-cool": {
+    foundation: ["Dior Backstage Face & Body Foundation", "NARS Light Reflecting Foundation", "Fenty Beauty Pro Filt'r Foundation"],
+    cheeks: ["Clinique Cheek Pop", "Rare Beauty Soft Pinch Liquid Blush", "NARS Blush"],
+    eyes: ["Natasha Denona Glam Palette", "Urban Decay Naked2 Basics Palette", "Make Up For Ever Artist Color Pencil"],
+    lips: ["MAC Satin Lipstick", "Charlotte Tilbury Matte Revolution Lipstick", "Fenty Beauty Gloss Bomb"],
+  },
+  neutral: {
+    foundation: ["Dior Backstage Face & Body Foundation", "Fenty Beauty Eaze Drop Blurring Skin Tint", "NARS Light Reflecting Foundation"],
+    cheeks: ["Rare Beauty Soft Pinch Liquid Blush", "Clinique Cheek Pop", "NARS Blush"],
+    eyes: ["Natasha Denona Glam Palette", "Urban Decay Naked3 Palette", "Make Up For Ever Artist Color Pencil"],
+    lips: ["Charlotte Tilbury Matte Revolution Lipstick", "MAC Satin Lipstick", "Fenty Beauty Gloss Bomb"],
+  },
+  "neutral-warm": {
+    foundation: ["Giorgio Armani Luminous Silk Foundation", "Dior Backstage Face & Body Foundation", "Make Up For Ever HD Skin Foundation"],
+    cheeks: ["Rare Beauty Soft Pinch Liquid Blush", "Fenty Beauty Cheeks Out Cream Blush", "NARS Blush"],
+    eyes: ["Natasha Denona Bronze Palette", "Huda Beauty Nude Obsessions Palette", "Make Up For Ever Artist Color Pencil"],
+    lips: ["Charlotte Tilbury K.I.S.S.I.N.G Lipstick", "MAC Matte Lipstick", "Fenty Beauty Gloss Bomb"],
+  },
+  warm: {
+    foundation: ["Giorgio Armani Luminous Silk Foundation", "Charlotte Tilbury Beautiful Skin Foundation", "Make Up For Ever HD Skin Foundation"],
+    cheeks: ["Fenty Beauty Cheeks Out Cream Blush", "Rare Beauty Soft Pinch Liquid Blush", "NARS Blush"],
+    eyes: ["Natasha Denona Bronze Palette", "Huda Beauty Nude Obsessions Palette", "Too Faced Natural Eyes Palette"],
+    lips: ["Charlotte Tilbury K.I.S.S.I.N.G Lipstick", "MAC Matte Lipstick", "Fenty Beauty Gloss Bomb"],
+  },
+};
+
+// Sephora product URLs (best-effort; if a URL is missing, we fall back to generic color guidance).
+// NOTE: Some products are US-only; those still work for shade names.
+const PRODUCT_URLS = {
+  "Estée Lauder Double Wear Stay-in-Place Foundation": "https://www.sephora.com/ca/en/product/double-wear-stay-in-place-makeup-P378284",
+  "NARS Light Reflecting Foundation": "https://www.sephora.com/ca/en/product/nars-light-reflecting-advance-skincare-foundation-P479338",
+  "Fenty Beauty Pro Filt'r Soft Matte Longwear Foundation": "https://www.sephora.com/ca/en/product/pro-filtr-soft-matte-longwear-foundation-P87985432",
+  "Fenty Beauty Pro Filt'r Foundation": "https://www.sephora.com/ca/en/product/pro-filtr-soft-matte-longwear-foundation-P87985432",
+  "Dior Backstage Face & Body Foundation": "https://www.sephora.com/ca/en/product/backstage-face-body-foundation-P432500",
+  "Fenty Beauty Eaze Drop Blurring Skin Tint": "https://www.sephora.com/ca/en/product/fenty-beauty-rihanna-eaze-drop-blurring-skin-tint-P470025",
+  "Giorgio Armani Luminous Silk Foundation": "https://www.sephora.com/product/luminous-silk-natural-glow-blurring-liquid-foundation-with-24-hour-wear-P519887",
+  "Make Up For Ever HD Skin Foundation": "https://www.sephora.com/ca/en/product/make-up-for-ever-hd-skin-foundation-P479712",
+  "Charlotte Tilbury Beautiful Skin Foundation": "https://www.sephora.com/ca/en/product/charlotte-tilbury-beautiful-skin-medium-coverage-liquid-foundation-with-hyaluronic-acid-P480286",
+
+  "Rare Beauty Soft Pinch Liquid Blush": "https://www.sephora.com/ca/en/product/rare-beauty-by-selena-gomez-soft-pinch-liquid-blush-P97989778",
+  "Clinique Cheek Pop": "https://www.sephora.com/ca/en/product/cheek-pop-P384996",
+  "NARS Blush": "https://www.sephora.com/ca/en/product/blush-P2855",
+  "Fenty Beauty Cheeks Out Cream Blush": "https://www.sephora.com/ca/en/product/fenty-beauty-rihanna-cheeks-out-freestyle-cream-blush-P19700127",
+
+  "Natasha Denona Glam Palette": "https://www.sephora.com/product/natasha-denona-glam-eyeshadow-palette-P461188",
+  "Natasha Denona Bronze Palette": "https://www.sephora.com/brand/natasha-denona/eyeshadow-palettes",
+  "Urban Decay Naked2 Basics Palette": "https://www.sephora.com/ca/en/product/naked2-basics-P388225",
+  "Urban Decay Naked3 Palette": "https://www.sephora.com/ca/en/product/naked3-P384099",
+  "Huda Beauty Nude Obsessions Palette": "https://www.sephora.com/product/nude-obsessions-eyeshadow-palette-P450887",
+  "Too Faced Natural Eyes Palette": "https://www.sephora.com/ca/en/product/too-faced-born-this-way-natural-nudes-eyeshadow-palette-P455201",
+  "Make Up For Ever Artist Color Pencil": "https://www.sephora.com/ca/en/product/artist-color-pencil-P430969",
+
+  "MAC Matte Lipstick": "https://www.sephora.com/ca/en/product/mac-cosmetics-m-a-cximal-silky-matte-lipstick-P510799",
+  "MAC Satin Lipstick": "https://www.sephora.com/ca/en/product/mac-cosmetics-macximal-sleek-satin-lipstick-P513655",
+  "Charlotte Tilbury Matte Revolution Lipstick": "https://www.sephora.com/ca/en/product/matte-revolution-lipstick-P433530",
+  "Charlotte Tilbury K.I.S.S.I.N.G Lipstick": "https://www.sephora.com/ca/en/product/P433531",
+  "Fenty Beauty Gloss Bomb": "https://www.sephora.com/ca/en/product/gloss-bomb-universal-lip-luminizer-P67988453",
+};
+
+function buildFallbackColorLabelServer({ category, undertone, season, toneNumber, toneDepth }) {
+  const dir = undertoneDirectionServer(undertone);
+  const s = normalizeSeasonKeyServer(season);
+  const depth = normalizeToneDepthServer(toneDepth) || toneDepthFromNumberServer(Number(toneNumber));
+
+  const pick = (cool, neutral, warm) => (dir === "cool" ? cool : dir === "warm" ? warm : neutral);
+
+  if (String(category || "").toLowerCase() === "foundation") {
+    const desc = pick("cool rosy", "neutral", "warm/peach");
+    const num = Number.isFinite(Number(toneNumber)) ? Number(toneNumber) : 4.5;
+    const rounded = Math.round(num * 2) / 2;
+    return `${rounded} - ${depth}, ${desc}`;
+  }
+
+  if (String(category || "").toLowerCase() === "cheeks") {
+    if (s === "spring") return pick("cool pink", "peach-pink", "peach/coral");
+    if (s === "summer") return pick("soft rose", "dusty rose", "soft peach");
+    if (s === "autumn") return pick("mauve-rose", "rose-bronze", "apricot/terracotta");
+    return pick("berry", "deep rose", "warm red");
+  }
+
+  if (String(category || "").toLowerCase() === "eyes") {
+    if (s === "spring") return pick("cool champagne", "taupe-champagne", "golden champagne");
+    if (s === "summer") return pick("cool taupe", "soft taupe", "warm taupe");
+    if (s === "autumn") return pick("cool brown", "mushroom brown", "bronze/olive");
+    return pick("charcoal/plum", "deep taupe", "deep bronze");
+  }
+
+  // lips
+  if (s === "spring") return pick("raspberry pink", "warm rose", "coral");
+  if (s === "summer") return pick("mauve", "rose", "warm rose");
+  if (s === "autumn") return pick("berry-brown", "rose-brown", "brick/terracotta");
+  return pick("blue-red/cranberry", "classic red", "true red");
+}
+
+async function buildProductLines({ products, category, undertone, season, toneNumber, toneDepth }) {
+  const out = [];
+  const list = Array.isArray(products) ? products : [];
+  const picks = list.slice(0, 2);
+
+  for (const name of picks) {
+    const url = PRODUCT_URLS[name] || "";
+    let label = "";
+    try {
+      if (url && isAllowedRetailerUrl(url)) {
+        const shades = await getSephoraShadesForUrl(url);
+        const best = pickBestShadeForCategory({
+          shades,
+          category,
+          undertone,
+          season,
+          toneNumber,
+          toneDepth,
+        });
+        label = best ? shadeLabel(best) : "";
+      }
+    } catch {
+      label = "";
+    }
+
+    if (!label) {
+      label = buildFallbackColorLabelServer({ category, undertone, season, toneNumber, toneDepth });
+    }
+
+    const tail = label ? ` — ${label}` : "";
+    out.push(`- ${name}${tail}`);
+  }
+
+  return out;
+}
+
+app.post("/recommend-products", authRequired, async (req, res) => {
+  try {
+    const undertone = normalizeUndertoneKeyServer(req?.body?.undertone);
+    const season = normalizeSeasonKeyServer(req?.body?.season);
+    const toneNumber = req?.body?.tone_number;
+    const toneDepth = req?.body?.tone_depth;
+
+    const list = BUY_RECS_SERVER[undertone] || BUY_RECS_SERVER.neutral;
+
+    const lines = [];
+    lines.push("Recommended products:");
+
+    const sections = [
+      { title: "Foundation", key: "foundation" },
+      { title: "Cheeks", key: "cheeks" },
+      { title: "Eyes", key: "eyes" },
+      { title: "Lips", key: "lips" },
+    ];
+
+    for (const sec of sections) {
+      const products = list?.[sec.key] || [];
+      const block = await buildProductLines({
+        products,
+        category: sec.title,
+        undertone,
+        season,
+        toneNumber,
+        toneDepth,
+      });
+
+      if (!block.length) continue;
+      lines.push("");
+      lines.push(`${sec.title}:`);
+      block.forEach((l) => lines.push(l));
+    }
+
+    return res.json({ ok: true, text: lines.join("\n") });
+  } catch (e) {
+    console.error("recommend-products error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 // ---- Face photo analysis ----
 const upload = multer({
   storage: multer.memoryStorage(),

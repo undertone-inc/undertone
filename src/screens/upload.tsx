@@ -1359,25 +1359,63 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const recommendToBuy = async () => {
     if (!analysisId) return;
-    const text = buildBuyRecommendationsText({
-      undertoneRaw: analysis?.undertone,
-      seasonRaw: analysis?.season,
-      toneNumberRaw: (analysis as any)?.tone_number,
-      toneDepthRaw: (analysis as any)?.tone_depth,
-    });
-    const t = String(text || '').trim();
-    if (!t) return;
+    if (!tokenTrimmed) {
+      Alert.alert('Not logged in', 'Please log in again.');
+      return;
+    }
+    if (chatLoading) return;
 
-    const assistantMsg: ChatMessage = {
-      id: makeId(),
-      role: 'assistant',
-      kind: 'buy_recs',
-      text: t,
-      createdAt: new Date().toISOString(),
-    };
+    setChatLoading(true);
+    try {
+      // Prefer server-side recommendations so we can attach real retailer color names.
+      let serverText = '';
+      try {
+        const resp = await fetch(`${API_BASE}/recommend-products`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${tokenTrimmed}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            undertone: analysis?.undertone,
+            season: analysis?.season,
+            tone_number: (analysis as any)?.tone_number,
+            tone_depth: (analysis as any)?.tone_depth,
+          }),
+        });
 
-    const current = getChatFor(analysisId);
-    await upsertChatFor(analysisId, [...current, assistantMsg]);
+        const json = await resp.json().catch(() => null);
+        if (resp.ok && json?.ok && typeof json?.text === 'string') {
+          serverText = String(json.text || '').trim();
+        }
+      } catch {
+        serverText = '';
+      }
+
+      // Fallback: local color guidance (no retailer shade names).
+      const fallback = buildBuyRecommendationsText({
+        undertoneRaw: analysis?.undertone,
+        seasonRaw: analysis?.season,
+        toneNumberRaw: (analysis as any)?.tone_number,
+        toneDepthRaw: (analysis as any)?.tone_depth,
+      });
+
+      const t = String(serverText || fallback || '').trim();
+      if (!t) return;
+
+      const assistantMsg: ChatMessage = {
+        id: makeId(),
+        role: 'assistant',
+        kind: 'buy_recs',
+        text: t,
+        createdAt: new Date().toISOString(),
+      };
+
+      const current = getChatFor(analysisId);
+      await upsertChatFor(analysisId, [...current, assistantMsg]);
+    } finally {
+      setChatLoading(false);
+    }
   };
 
   const saveKitRecsToClients = async (kitMsgId: string) => {
