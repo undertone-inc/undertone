@@ -62,7 +62,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 
 const OPENAI_RECS_MODEL = String(process.env.OPENAI_RECS_MODEL || "gpt-5-mini").trim();
 const OPENAI_RECS_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_MAX_OUTPUT_TOKENS || 500);
 // Keep tool calls bounded so costs are predictable (search/open/find all count).
-const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 8);
+const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 12);
 const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "true").toLowerCase() !== "false";
 
 // Upload constraints
@@ -2060,13 +2060,37 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
   const systemPrompt =
     "You are a professional makeup artist assistant." +
     " Use ONLY Sephora (sephora.com) to choose products and their exact color/variant names." +
-    " You MUST use web search to verify that the recommended color/variant exists for that specific product." +
+    " You must choose products ONLY from the Supported Sephora products list provided in the user message." +
+    " You MUST use web search to verify that each recommended color/variant exists for that specific product on Sephora." +
     " Choose exactly ONE recommendation for each category: foundation, cheeks, eyes, lips." +
     " For each recommendation, provide:" +
-    " (1) product_name as listed on Sephora, (2) product_url to the Sephora product page, (3) color_name EXACTLY as shown in Sephora's Color selector (include numbers/codes/description if present)." +
-    " If you cannot confidently find an exact color_name for a product from Sephora, set color_name to '(unavailable)' (do not guess)." +
-    " Prefer products that have multiple color variants (so a color selector exists)." +
+    " (1) product_name as listed on Sephora, (2) product_url to the Sephora product page, (3) color_name EXACTLY as shown in Sephora's Color selector (include numbers/codes and short descriptors if present)." +
+    " IMPORTANT: return a real, verifiable color_name for ALL 4 categories." +
+    " If your first product pick in a category does not have a discoverable color selector or you cannot find an exact color_name, pick a different product from the supported list and try again." +
+    " Only set color_name to '(unavailable)' if you tried at least TWO different products for that category and still cannot find a verifiable color_name. Never guess." +
+    " Prefer products that clearly have many color options on Sephora (foundation shades, blush shades, eyeliner/eyeshadow stick shades, lipstick/gloss shades)." +
     " Do not include any extra keys. Output JSON that matches the provided schema.";
+
+  const formatSupportedList = (title, names) => {
+    const arr = Array.isArray(names) ? names : [];
+    const lines = [];
+    lines.push(`${title}:`);
+    for (const raw of arr) {
+      const name = String(raw || "").trim();
+      if (!name) continue;
+      const url = String(PRODUCT_URLS?.[name] || "").trim();
+      if (url) lines.push(`- ${name} — ${url}`);
+      else lines.push(`- ${name}`);
+    }
+    return lines.join("\n");
+  };
+
+  const supportedProductsText =
+    "\nSupported Sephora products (choose ONLY from these; use the listed URL as product_url):\n" +
+    `${formatSupportedList("Foundation", FOUNDATION_POOL)}\n` +
+    `${formatSupportedList("Cheeks", CHEEKS_POOL)}\n` +
+    `${formatSupportedList("Eyes", EYES_POOL)}\n` +
+    `${formatSupportedList("Lips", LIPS_POOL)}\n`;
 
   const userPrompt =
     `Person attributes:\n` +
@@ -2077,7 +2101,7 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
     "\nTask:\n" +
     "1) Using Sephora only, choose ONE good product per category (foundation, cheeks, eyes, lips).\n" +
     "2) For each chosen product, look up its Sephora color/variant list and choose the best matching variant name for the person above.\n" +
-    "3) Return JSON only.";
+    "3) Return JSON only." + supportedProductsText;
 
   const payload = {
     model: OPENAI_RECS_MODEL || "gpt-5-mini",
@@ -2132,6 +2156,64 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
     throw new Error("OpenAI returned non-JSON output");
   }
 }
+
+async function repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber }) {
+  const obj = recs && typeof recs === "object" ? recs : null;
+  if (!obj) return;
+
+  const sections = [
+    { key: "foundation", title: "Foundation" },
+    { key: "cheeks", title: "Cheeks" },
+    { key: "eyes", title: "Eyes" },
+    { key: "lips", title: "Lips" },
+  ];
+
+  for (const sec of sections) {
+    const item = obj?.[sec.key];
+    if (!item || typeof item !== "object") continue;
+
+    const name = String(item?.product_name || "").trim();
+    let url = String(item?.product_url || "").trim();
+
+    // Ensure we have a valid Sephora product URL.
+    if ((!url || !isAllowedRetailerUrl(url)) && name) {
+      url = String(PRODUCT_URLS?.[name] || "").trim();
+      if (!url) {
+        try {
+          url = await resolveSephoraProductUrlByName(name);
+        } catch {
+          url = "";
+        }
+      }
+    }
+
+    if (url && isAllowedRetailerUrl(url)) {
+      const normUrl = normalizeRetailerUrl(url);
+      item.product_url = normUrl;
+
+      const color = String(item?.color_name || "").trim();
+      const isUnavailable = !color || /^\(unavailable\)$/i.test(color);
+      if (isUnavailable) {
+        try {
+          const shades = await getSephoraShadesForUrl(normUrl);
+          const best = pickBestShadeForCategory({
+            shades,
+            category: sec.title,
+            undertone,
+            season,
+            toneNumber,
+            toneDepth,
+          });
+          const label = best ? shadeLabel(best) : "";
+          if (label) item.color_name = label;
+        } catch {
+          // leave as unavailable
+        }
+      }
+    }
+  }
+}
+
 app.post("/recommend-products", authRequired, async (req, res) => {
   try {
     const undertone = normalizeUndertoneKeyServer(req?.body?.undertone);
@@ -2148,6 +2230,8 @@ app.post("/recommend-products", authRequired, async (req, res) => {
           toneDepth,
           toneNumber,
         });
+
+        await repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber });
 
         if (recs && typeof recs === "object") {
           const lines = [];
