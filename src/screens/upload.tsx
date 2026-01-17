@@ -516,21 +516,70 @@ function undertoneDirection(u: UndertoneKey): 'cool' | 'neutral' | 'warm' {
   return 'neutral';
 }
 
-function baseShadeHint(u: UndertoneKey, season: SeasonKey): string {
-  const dir = undertoneDirection(u);
-  const tone =
-    dir === 'warm'
-      ? 'warm/golden'
-      : dir === 'cool'
-      ? 'cool/rosy'
-      : 'neutral';
-
-  // Season nuance (kept subtle for complexion products).
-  const nuance = season === 'winter' ? 'clear' : season === 'autumn' ? 'rich' : season === 'spring' ? 'fresh' : 'soft';
-  return `${tone} (${season}, ${nuance})`;
+function seasonNuance(season: SeasonKey): string {
+  return season === 'winter' ? 'clear' : season === 'autumn' ? 'rich' : season === 'spring' ? 'fresh' : 'soft';
 }
 
-function colorShadeHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, season: SeasonKey): string {
+function clampNumber(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, n));
+}
+
+function roundToHalf(n: number): number {
+  return Math.round(n * 2) / 2;
+}
+
+function formatHalf(n: number): string {
+  const x = roundToHalf(n);
+  return Number.isInteger(x) ? String(x) : x.toFixed(1);
+}
+
+function normalizeToneNumber(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(n)) return null;
+  return clampNumber(roundToHalf(n), 1, 10);
+}
+
+type ToneDepth = 'very fair' | 'fair' | 'light' | 'medium' | 'tan' | 'deep';
+
+function toneDepthFromNumber(n: number): ToneDepth {
+  if (n <= 2) return 'very fair';
+  if (n <= 3.5) return 'fair';
+  if (n <= 5) return 'light';
+  if (n <= 6.5) return 'medium';
+  if (n <= 8) return 'tan';
+  return 'deep';
+}
+
+function normalizeToneDepth(raw: unknown): ToneDepth | null {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return null;
+  if (s === 'very fair' || s === 'very_fair' || s === 'very-fair') return 'very fair';
+  if (s === 'fair') return 'fair';
+  if (s === 'light') return 'light';
+  if (s === 'medium') return 'medium';
+  if (s === 'tan') return 'tan';
+  if (s === 'deep') return 'deep';
+  return null;
+}
+
+function foundationDescriptor(u: UndertoneKey): string {
+  if (u === 'warm') return 'golden peach';
+  if (u === 'neutral-warm') return 'neutral peach';
+  if (u === 'neutral-cool') return 'neutral rosy';
+  if (u === 'cool') return 'cool rosy';
+  return 'neutral beige';
+}
+
+function foundationColorLabel(opts: { undertone: UndertoneKey; toneNumberRaw?: unknown; toneDepthRaw?: unknown }): string {
+  const num = normalizeToneNumber(opts.toneNumberRaw) ?? 4.5;
+  const depth = normalizeToneDepth(opts.toneDepthRaw) ?? toneDepthFromNumber(num);
+  const desc = foundationDescriptor(opts.undertone);
+  return `Color ${formatHalf(num)}, ${depth}, ${desc}`;
+}
+
+function colorHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, season: SeasonKey): string {
   const dir = undertoneDirection(u);
 
   const pick = (cool: string, neutral: string, warm: string) => (dir === 'cool' ? cool : dir === 'warm' ? warm : neutral);
@@ -543,7 +592,7 @@ function colorShadeHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, s
     else if (season === 'autumn') base = pick('mauve-rose', 'rose-bronze', 'apricot/terracotta');
     else base = pick('berry', 'deep rose', 'warm red');
 
-    return `${base} (${season})`;
+    return base;
   }
 
   if (category === 'eyes') {
@@ -552,7 +601,7 @@ function colorShadeHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, s
     else if (season === 'autumn') base = pick('cool brown', 'mushroom brown', 'bronze/olive');
     else base = pick('charcoal/plum', 'deep taupe', 'deep bronze');
 
-    return `${base} (${season})`;
+    return base;
   }
 
   // lips
@@ -561,10 +610,15 @@ function colorShadeHint(category: 'cheeks' | 'eyes' | 'lips', u: UndertoneKey, s
   else if (season === 'autumn') base = pick('berry-brown', 'rose-brown', 'brick/terracotta');
   else base = pick('blue-red/cranberry', 'classic red', 'true red');
 
-  return `${base} (${season})`;
+  return base;
 }
 
-function buildBuyRecommendationsText(opts: { undertoneRaw: unknown; seasonRaw: unknown }): string {
+function buildBuyRecommendationsText(opts: {
+  undertoneRaw: unknown;
+  seasonRaw: unknown;
+  toneNumberRaw?: unknown;
+  toneDepthRaw?: unknown;
+}): string {
   const u = normalizeUndertoneKey(opts.undertoneRaw);
   if (!u) return '';
 
@@ -572,27 +626,32 @@ function buildBuyRecommendationsText(opts: { undertoneRaw: unknown; seasonRaw: u
   const buy = BUY_RECS[u] || BUY_RECS.neutral;
 
   const lines: string[] = [];
-  lines.push('Recommended to buy:');
+  lines.push('Recommended products:');
 
-  const addBlock = (label: string, arr: string[], shadeHint: string) => {
+  const addBlock = (label: string, arr: string[], colorLabel: string) => {
     const list = Array.isArray(arr) ? arr.slice(0, 2) : [];
     if (!list.length) return;
     lines.push('');
-    lines.push(`${label} (shade: ${shadeHint}):`);
-    list.forEach((x) => lines.push(`- ${x} — Shade: ${shadeHint}`));
+    lines.push(`${label}:`);
+    list.forEach((x) => lines.push(`- ${x} — ${colorLabel}`));
   };
 
-  addBlock('Foundation', buy.base, baseShadeHint(u, season));
-  addBlock('Cheeks', buy.cheeks, colorShadeHint('cheeks', u, season));
-  addBlock('Eyes', buy.eyes, colorShadeHint('eyes', u, season));
-  addBlock('Lips', buy.lips, colorShadeHint('lips', u, season));
+  addBlock(
+    'Foundation',
+    buy.base,
+    foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })
+  );
+  addBlock('Cheeks', buy.cheeks, `Color: ${colorHint('cheeks', u, season)}`);
+  addBlock('Eyes', buy.eyes, `Color: ${colorHint('eyes', u, season)}`);
+  addBlock('Lips', buy.lips, `Color: ${colorHint('lips', u, season)}`);
 
   return lines.join('\n');
 }
 
 function formatAnalysisToText(analysis: any): string {
   const undertone = displayUndertone(analysis?.undertone) || 'Unknown';
-  const season = normalizeSeasonKey(analysis?.season);
+  const seasonKey = normalizeSeasonKey(analysis?.season);
+  const seasonLabel = seasonKey ? `${seasonKey} (${seasonNuance(seasonKey)})` : 'unknown';
 
   const bestNeutrals = compactList(analysis?.recommendations?.best_neutrals);
   const accentColors = compactList(analysis?.recommendations?.accent_colors);
@@ -606,7 +665,7 @@ function formatAnalysisToText(analysis: any): string {
 
   const lines: string[] = [];
   lines.push(`Undertone: ${undertone}`);
-  lines.push(`Season: ${season || 'unknown'}`);
+  lines.push(`Season: ${seasonLabel}`);
 
   if (analysis?.photo_quality?.notes) {
     const q = String(analysis.photo_quality.notes).trim();
@@ -1300,7 +1359,12 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const recommendToBuy = async () => {
     if (!analysisId) return;
-    const text = buildBuyRecommendationsText({ undertoneRaw: analysis?.undertone, seasonRaw: analysis?.season });
+    const text = buildBuyRecommendationsText({
+      undertoneRaw: analysis?.undertone,
+      seasonRaw: analysis?.season,
+      toneNumberRaw: (analysis as any)?.tone_number,
+      toneDepthRaw: (analysis as any)?.tone_depth,
+    });
     const t = String(text || '').trim();
     if (!t) return;
 
@@ -1562,7 +1626,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend from kit</Text>
+                      <Text style={styles.recommendBtnText}>Recommend items from kit</Text>
                     </TouchableOpacity>
                   ) : null}
 
@@ -1576,7 +1640,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend to buy</Text>
+                      <Text style={styles.recommendBtnText}>Recommend products</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
@@ -1827,7 +1891,7 @@ const styles = StyleSheet.create({
   },
   recommendBtnText: {
     color: '#111827',
-    fontWeight: '700',
+    fontWeight: '500',
     fontSize: 13,
   },
   kitSaveRow: {
@@ -1848,7 +1912,7 @@ const styles = StyleSheet.create({
   },
   kitSaveBtnText: {
     color: '#ffffff',
-    fontWeight: '800',
+    fontWeight: '600',
     fontSize: 13,
   },
   loadingBubble: {

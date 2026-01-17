@@ -954,6 +954,7 @@ function guessUndertoneFromJpeg(jpegBuffer) {
     let count = 0;
     let skinCount = 0;
     let sumLum = 0;
+    let sumSkinLum = 0;
     let sumR = 0;
     let sumG = 0;
     let sumB = 0;
@@ -979,6 +980,7 @@ function guessUndertoneFromJpeg(jpegBuffer) {
 
         if (isSkin(r, g, b)) {
           skinCount++;
+          sumSkinLum += lum;
           sumR += r;
           sumG += g;
           sumB += b;
@@ -1004,6 +1006,23 @@ function guessUndertoneFromJpeg(jpegBuffer) {
     const avgR = sumR / Math.max(1, skinCount);
     const avgG = sumG / Math.max(1, skinCount);
     const avgB = sumB / Math.max(1, skinCount);
+
+    const skinLum = sumSkinLum / Math.max(1, skinCount);
+    const roundHalf = (n) => Math.round(n * 2) / 2;
+    const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+    const tone_number = clamp(roundHalf(((255 - skinLum) / 255) * 9 + 1), 1, 10);
+    const tone_depth =
+      tone_number <= 2
+        ? 'very fair'
+        : tone_number <= 3.5
+        ? 'fair'
+        : tone_number <= 5
+        ? 'light'
+        : tone_number <= 6.5
+        ? 'medium'
+        : tone_number <= 8
+        ? 'tan'
+        : 'deep';
 
     const denom = meanLum + 1;
     const castRB = (avgR - avgB) / denom; // +warm, -cool
@@ -1032,6 +1051,8 @@ function guessUndertoneFromJpeg(jpegBuffer) {
       confidence,
       lighting,
       white_balance,
+      tone_number,
+      tone_depth,
       face_visible: true,
       notes: "Best-effort estimate; brighter, neutral daylight improves accuracy.",
     };
@@ -1423,6 +1444,19 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
     }
 
 
+
+
+    // Add a best-effort complexion "color" hint (number + depth) from the image.
+    // This is used client-side as: "Color 4.5, light, neutral peach".
+    try {
+      const tone = guessUndertoneFromJpeg(file.buffer);
+      if (tone && typeof tone.tone_number === "number" && Number.isFinite(tone.tone_number)) {
+        analysis.tone_number = tone.tone_number;
+        if (tone.tone_depth) analysis.tone_depth = tone.tone_depth;
+      }
+    } catch {
+      // ignore
+    }
     const source = String(req.body?.source || "").trim();
     const analysisId = await insertFaceAnalysisRow({ userId, sha256: sha, source, analysis });
 
