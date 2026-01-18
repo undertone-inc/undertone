@@ -2437,6 +2437,15 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
 }
 
 
+function isUnavailableColorName(value) {
+  const s = String(value || "").trim();
+  if (!s) return true;
+  const low = s.toLowerCase();
+  if (low === "(unavailable)" || low === "unavailable" || low === "n/a" || low === "na") return true;
+  if (low.includes("unavailable") || low.includes("not available") || low.includes("not found")) return true;
+  return false;
+}
+
 async function repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber }) {
   const obj = recs && typeof recs === "object" ? recs : null;
   if (!obj) return;
@@ -2448,10 +2457,9 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
     { key: "lips", title: "Lips" },
   ];
 
-  const isUnavailable = (v) => {
-    const s = String(v || "").trim();
-    return !s || /^\(unavailable\)$/i.test(s);
-  };
+  const isUnavailable = isUnavailableColorName;
+
+
 
   for (const sec of sections) {
     const item = obj?.[sec.key];
@@ -2582,7 +2590,8 @@ app.post("/recommend-products", authRequired, async (req, res) => {
             const item = recs?.[sec.key] || null;
             const name = String(item?.product_name || "").trim();
             const url = String(item?.product_url || "").trim();
-            const color = String(item?.color_name || "").trim() || "(unavailable)";
+            const colorRaw = String(item?.color_name || "").trim();
+            const color = isUnavailableColorName(colorRaw) ? "(unavailable)" : colorRaw;
 
             lines.push("");
             lines.push(`${sec.title}:`);
