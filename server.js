@@ -2448,6 +2448,11 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
     { key: "lips", title: "Lips" },
   ];
 
+  const isUnavailable = (v) => {
+    const s = String(v || "").trim();
+    return !s || /^\(unavailable\)$/i.test(s);
+  };
+
   for (const sec of sections) {
     const item = obj?.[sec.key];
     if (!item || typeof item !== "object") continue;
@@ -2467,15 +2472,11 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
       }
     }
 
-    const color0 = String(item?.color_name || "").trim();
-    let isUnavailable = !color0 || /^\(unavailable\)$/i.test(color0);
-
-    const hasRetailerUrl = Boolean(url && isAllowedRetailerUrl(url));
-    const normUrl = hasRetailerUrl ? normalizeRetailerUrl(url) : "";
+    let normUrl = url && isAllowedRetailerUrl(url) ? normalizeRetailerUrl(url) : "";
     if (normUrl) item.product_url = normUrl;
 
     // (1) Try server-side HTML extraction (fast when it works, but can be blocked)
-    if (isUnavailable && normUrl) {
+    if (isUnavailable(item?.color_name) && normUrl) {
       try {
         const shades = await getSephoraShadesForUrl(normUrl);
         const best = pickBestShadeForCategory({
@@ -2493,11 +2494,8 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
       }
     }
 
-    const color1 = String(item?.color_name || "").trim();
-    isUnavailable = !color1 || /^\(unavailable\)$/i.test(color1);
-
-    // (2) Reliability: if still unavailable, do a small targeted web_search repair call.
-    if (isUnavailable && OPENAI_RECS_REPAIR_ENABLED) {
+    // (2) If still unavailable, do a targeted web_search repair call (may also swap product/url).
+    if (isUnavailable(item?.color_name) && OPENAI_RECS_REPAIR_ENABLED) {
       try {
         const fixed = await callOpenAIForSephoraCategoryRepair({
           categoryKey: sec.key,
@@ -2520,14 +2518,21 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
           if (newUrl && isAllowedRetailerUrl(newUrl)) item.product_url = normalizeRetailerUrl(newUrl);
           if (newColor) item.color_name = newColor;
         }
+      } catch (e) {
+        if (OPENAI_RECS_DEBUG) {
+          console.warn(`Sephora color repair failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
+        }
+      }
+    }
 
+    // Refresh normalized URL in case the repair swapped it.
+    url = String(item?.product_url || "").trim();
+    normUrl = url && isAllowedRetailerUrl(url) ? normalizeRetailerUrl(url) : "";
+    if (normUrl) item.product_url = normUrl;
 
     // (3) Last-resort: extract the currently displayed Color/Shade label from the Sephora page via web_search.
     // This avoids returning '(unavailable)' on categories where the full swatch list is not exposed.
-    const color2 = String(item?.color_name || "").trim();
-    isUnavailable = !color2 || /^\(unavailable\)$/i.test(color2);
-
-    if (isUnavailable && normUrl && OPENAI_RECS_REPAIR_ENABLED) {
+    if (isUnavailable(item?.color_name) && normUrl && OPENAI_RECS_REPAIR_ENABLED) {
       try {
         const extracted = await callOpenAIExtractSephoraDisplayedColor({ productUrl: normUrl });
         const ex = String(extracted || "").trim();
@@ -2537,13 +2542,6 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
       } catch (e) {
         if (OPENAI_RECS_DEBUG) {
           console.warn(`Sephora displayed color extract failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
-        }
-      }
-    }
-
-      } catch (e) {
-        if (OPENAI_RECS_DEBUG) {
-          console.warn(`Sephora color repair failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
         }
       }
     }
@@ -2654,8 +2652,16 @@ const upload = multer({
 });
 
 function extractOutputText(resp) {
-  let text = typeof resp?.output_text === "string" ? resp.output_text : "";
-  let refusal = typeof resp?.refusal === "string" ? resp.refusal : "";
+  // Avoid double-counting: `output_text` is already the aggregated assistant text.
+  const directText = typeof resp?.output_text === "string" ? String(resp.output_text || "").trim() : "";
+  const directRefusal = typeof resp?.refusal === "string" ? String(resp.refusal || "").trim() : "";
+
+  if (directText) {
+    return { text: directText, refusal: directRefusal };
+  }
+
+  let text = "";
+  let refusal = directRefusal;
 
   const output = Array.isArray(resp?.output) ? resp.output : [];
   for (const item of output) {
