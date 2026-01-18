@@ -72,6 +72,9 @@ const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_
 const OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250);
 const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCase() === "true";
 
+// Log active OpenAI models at startup (helps confirm which models are in use)
+console.log(`[openai] analysis_model=${OPENAI_MODEL} recs_model=${OPENAI_RECS_MODEL} web_search=${OPENAI_RECS_USE_WEB_SEARCH} max_tool_calls=${OPENAI_RECS_MAX_TOOL_CALLS}`);
+
 
 // Upload constraints
 const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8);
@@ -2154,7 +2157,6 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
 
   const payload = {
     model: OPENAI_RECS_MODEL || "gpt-5-mini",
-    temperature: 0,
     reasoning: { effort: "low" },
     tools: [
       {
@@ -2293,7 +2295,6 @@ async function callOpenAIForSephoraCategoryRepair({
 
   const payload = {
     model: OPENAI_RECS_MODEL || "gpt-5-mini",
-    temperature: 0,
     reasoning: { effort: "low" },
     tools: [
       {
@@ -2382,7 +2383,6 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
 
   const payload = {
     model: OPENAI_RECS_MODEL || "gpt-5-mini",
-    temperature: 0,
     reasoning: { effort: "low" },
     tools: [
       {
