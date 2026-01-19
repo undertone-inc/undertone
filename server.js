@@ -63,7 +63,7 @@ const OPENAI_RECS_MODEL = String(process.env.OPENAI_RECS_MODEL || "gpt-5-mini").
 const OPENAI_RECS_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_MAX_OUTPUT_TOKENS || 500);
 // Keep tool calls bounded so costs are predictable (search/open/find all count).
 const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 20);
-const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "true").toLowerCase() !== "false";
+const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "false").toLowerCase() === "true";
 
 // Recs repair: if any category returns '(unavailable)', we do a small targeted follow-up
 // web search to fill the exact Sephora color/variant name. This runs only when needed.
@@ -71,6 +71,18 @@ const OPENAI_RECS_REPAIR_ENABLED = String(process.env.OPENAI_RECS_REPAIR_ENABLED
 const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 12);
 const OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250);
 const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCase() === "true";
+
+// Timeouts (ms) to keep recommendations responsive.
+// If OpenAI web_search is enabled and takes too long, we fall back to the fast local recommender.
+const OPENAI_RECS_TIMEOUT_MS = Math.max(8000, Math.min(90000, Number(process.env.OPENAI_RECS_TIMEOUT_MS || 25000)));
+// Shade extraction (Sephora HTML/Apify) timeout; when exceeded we fall back to curated/static shades.
+const SEPHORA_SHADE_TIMEOUT_MS = Math.max(3000, Math.min(45000, Number(process.env.SEPHORA_SHADE_TIMEOUT_MS || 12000)));
+// Apify actor run timeout (only relevant if APIFY_TOKEN is set).
+const APIFY_TIMEOUT_MS = Math.max(6000, Math.min(60000, Number(process.env.APIFY_TIMEOUT_MS || 12000)));
+
+// In-memory cache for full recommendation responses (helps when users tap twice or revisit the same scan).
+const RECS_CACHE_TTL_MS = Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Number(process.env.RECS_CACHE_TTL_MS || 6 * 60 * 60 * 1000)));
+const recsTextCache = new Map(); // key -> { fetchedAt:number, payload:{ ok:true, text:string, source:string } }
 
 // Recommendation model fallback order (used only if the primary recs call fails).
 // Keeps the system resilient to transient model/tool errors.
@@ -99,6 +111,51 @@ function recsModelCandidates() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, label = 'operation') {
+  const timeoutMs = Number(ms);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.resolve(promise);
+
+  let t = null;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => {
+      const err = new Error(`${label} timed out after ${timeoutMs}ms`);
+      err.code = 'ETIMEDOUT';
+      reject(err);
+    }, timeoutMs);
+  });
+
+  return Promise.race([
+    Promise.resolve(promise).finally(() => {
+      if (t) clearTimeout(t);
+    }),
+    timeout,
+  ]);
+}
+
+async function mapLimit(items, limit, fn) {
+  const arr = Array.isArray(items) ? items : [];
+  const n = Number(limit);
+  const concurrency = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+
+  const results = new Array(arr.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= arr.length) break;
+      results[i] = await fn(arr[i], i);
+    }
+  }
+
+  const workers = [];
+  for (let i = 0; i < Math.min(concurrency, arr.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  return results;
 }
 
 async function openaiResponsesCreateRaw(payload, { retries = 2, label = "openai" } = {}) {
@@ -1848,43 +1905,9 @@ async function getSephoraShadesForUrl(url) {
     return Array.isArray(cached.shades) ? cached.shades : [];
   }
 
-  let shades = [];
-
-  // (1) Fast path: fetch product HTML directly and extract variants
-  try {
-    const html = await fetchHtml(u);
-    shades = extractSephoraColorVariantsFromHtml(html);
-  } catch {
-    shades = [];
-  }
-
-  // (2) Reliability fallback: Apify actor (optional)
-  // This is the only approach that tends to work consistently across Sephora's anti-bot changes.
-  if ((!Array.isArray(shades) || shades.length < APIFY_MIN_SHADES_THRESHOLD) && APIFY_TOKEN && isAllowedRetailerUrl(u)) {
-    try {
-      const apifyShades = await getSephoraShadesViaApify(u);
-      const merged = [];
-      const seen = new Set();
-      const add = (sh) => {
-        const v = String(sh?.value || "").trim();
-        const d = String(sh?.desc || "").trim();
-        if (!v) return;
-        const key = `${v.toLowerCase()}::${d.toLowerCase()}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        merged.push({ value: v, desc: d || undefined });
-      };
-      (Array.isArray(shades) ? shades : []).forEach(add);
-      (Array.isArray(apifyShades) ? apifyShades : []).forEach(add);
-      shades = merged;
-    } catch (e) {
-      if (APIFY_DEBUG) console.warn("Apify shades fetch failed:", String(e?.message || e).slice(0, 500));
-    }
-  }
-
-  // (3) Curated static fallbacks (kept small; only used if live extraction fails)
   const fallback = STATIC_SEPHORA_SHADE_FALLBACK?.[u];
-  if (Array.isArray(fallback) && fallback.length) {
+
+  const mergeUnique = (base, addList) => {
     const merged = [];
     const seen = new Set();
     const add = (sh) => {
@@ -1896,9 +1919,41 @@ async function getSephoraShadesForUrl(url) {
       seen.add(key);
       merged.push({ value: v, desc: d || undefined });
     };
-    (Array.isArray(shades) ? shades : []).forEach(add);
-    fallback.forEach(add);
-    shades = merged;
+    (Array.isArray(base) ? base : []).forEach(add);
+    (Array.isArray(addList) ? addList : []).forEach(add);
+    return merged;
+  };
+
+  let shades = [];
+
+  // (1) Fast path: fetch product HTML directly and extract variants (bounded by timeout)
+  try {
+    const htmlTimeout = Array.isArray(fallback) && fallback.length ? Math.min(SEPHORA_SHADE_TIMEOUT_MS, 4000) : SEPHORA_SHADE_TIMEOUT_MS;
+    const html = await withTimeout(fetchHtml(u), htmlTimeout, "Sephora HTML fetch");
+    shades = extractSephoraColorVariantsFromHtml(html);
+  } catch {
+    shades = [];
+  }
+
+  // (2) Merge curated static fallbacks early (prevents unnecessary Apify calls)
+  if (Array.isArray(fallback) && fallback.length) {
+    shades = mergeUnique(shades, fallback);
+  }
+
+  // (3) Reliability fallback: Apify actor (optional + bounded by timeout)
+  // Only try Apify if we still couldn't extract enough shades.
+  if ((!Array.isArray(shades) || shades.length < APIFY_MIN_SHADES_THRESHOLD) && APIFY_TOKEN && isAllowedRetailerUrl(u)) {
+    try {
+      const apifyShades = await withTimeout(getSephoraShadesViaApify(u), APIFY_TIMEOUT_MS, "Apify Sephora shades");
+      shades = mergeUnique(shades, apifyShades);
+    } catch (e) {
+      if (APIFY_DEBUG) console.warn("Apify shades fetch failed:", String(e?.message || e).slice(0, 500));
+    }
+  }
+
+  // (4) Ensure fallback shades are present even if Apify returns nothing
+  if (Array.isArray(fallback) && fallback.length) {
+    shades = mergeUnique(shades, fallback);
   }
 
   shadeCache.set(u, { fetchedAt: now, shades });
@@ -2963,134 +3018,17 @@ app.post("/recommend-products", authRequired, async (req, res) => {
     const toneNumber = req?.body?.tone_number;
     const toneDepth = req?.body?.tone_depth;
 
-    // Primary path: reasoning model + web_search (Sephora only)
-    if (OPENAI_RECS_USE_WEB_SEARCH) {
-      try {
-        const recs = await callOpenAIForSephoraRecs({
-          undertone,
-          season,
-          toneDepth,
-          toneNumber,
-        });
+    // Response cache (per undertone/season/depth bucket) so repeat taps return instantly.
+    const tn = Number(toneNumber);
+    const tnBucket = Number.isFinite(tn) ? Math.round(tn * 2) / 2 : "";
+    const depthKey = normalizeToneDepthServer(toneDepth) || (Number.isFinite(tn) ? toneDepthFromNumberServer(tn) : "");
+    const cacheKey = `${undertone}|${season}|${depthKey}|${tnBucket}`;
 
-        await fillMissingCategoriesWithCategoryRepair(recs, { undertone, season, toneDepth, toneNumber });
-        await repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber });
-
-        if (recs && typeof recs === "object") {
-          const lines = [];
-          lines.push("Recommended products:");
-
-          const sections = [
-            { title: "Foundation", key: "foundation" },
-            { title: "Cheeks", key: "cheeks" },
-            { title: "Eyes", key: "eyes" },
-            { title: "Lips", key: "lips" },
-          ];
-
-          for (const sec of sections) {
-            const item = recs?.[sec.key] || null;
-            const name = String(item?.product_name || "").trim();
-            const url = String(item?.product_url || "").trim();
-            const colorRaw = String(item?.color_name || "").trim();
-            const color = isUnavailableColorName(colorRaw)
-              ? buildFallbackColorLabelServer({
-                  category: sec.title,
-                  undertone,
-                  season,
-                  toneNumber,
-                  toneDepth,
-                })
-              : colorRaw;
-
-            lines.push("");
-            lines.push(`${sec.title}:`);
-            if (name) {
-              lines.push(`- ${name} — Color: ${color}`);
-            } else {
-              lines.push(`- (unavailable) — Color: ${color}`);
-            }
-          }
-
-          return res.json({ ok: true, text: lines.join("\n"), source: "sephora_web_search" });
-        }
-      } catch (e) {
-        console.error("recommend-products (web_search) failed:", e);
-        // Secondary path: if the combined multi-category call fails, fall back to 4 smaller
-        // category calls (much more reliable and usually avoids transient processing errors).
-        try {
-          const sections = [
-            { title: "Foundation", key: "foundation" },
-            { title: "Cheeks", key: "cheeks" },
-            { title: "Eyes", key: "eyes" },
-            { title: "Lips", key: "lips" },
-          ];
-
-          const recs2 = {};
-          for (const sec of sections) {
-            try {
-              recs2[sec.key] = await callOpenAIForSephoraCategoryRepair({
-                categoryKey: sec.key,
-                categoryTitle: sec.title,
-                undertone,
-                season,
-                toneDepth,
-                toneNumber,
-                preferredName: "",
-                preferredUrl: "",
-              });
-            } catch (e2) {
-              console.warn(
-                `recommend-products (web_search:category_fallback) failed for ${sec.title}:`,
-                String(e2?.message || e2).slice(0, 240)
-              );
-              recs2[sec.key] = { product_name: "", product_url: "", color_name: "(unavailable)" };
-            }
-          }
-
-          await fillMissingCategoriesWithCategoryRepair(recs2, { undertone, season, toneDepth, toneNumber });
-
-          await repairMissingSephoraColorNames(recs2, { undertone, season, toneDepth, toneNumber });
-
-          const lines2 = [];
-          lines2.push("Recommended products:");
-          for (const sec of sections) {
-            const item = recs2?.[sec.key] || null;
-            const name = String(item?.product_name || "").trim();
-            const url = String(item?.product_url || "").trim();
-            const colorRaw = String(item?.color_name || "").trim();
-            const color = isUnavailableColorName(colorRaw)
-              ? buildFallbackColorLabelServer({
-                  category: sec.title,
-                  undertone,
-                  season,
-                  toneNumber,
-                  toneDepth,
-                })
-              : colorRaw;
-
-            lines2.push("");
-            lines2.push(`${sec.title}:`);
-            if (name) {
-              lines2.push(`- ${name} — Color: ${color}`);
-            } else {
-              lines2.push(`- (unavailable) — Color: ${color}`);
-            }
-          }
-
-          return res.json({ ok: true, text: lines2.join("\n"), source: "sephora_web_search_category_fallback" });
-        } catch (e3) {
-          console.error("recommend-products (web_search:category_fallback) failed:", e3);
-        }
-
-        // Fall through to legacy fallback.
-      }
+    const cached = recsTextCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && now - (cached.fetchedAt || 0) < RECS_CACHE_TTL_MS) {
+      return res.json(cached.payload);
     }
-
-    // Fallback path: curated product pools + best-effort shade extraction.
-    const list = BUY_RECS_SERVER[undertone] || BUY_RECS_SERVER.neutral;
-
-    const lines = [];
-    lines.push("Recommended products:");
 
     const sections = [
       { title: "Foundation", key: "foundation" },
@@ -3099,24 +3037,108 @@ app.post("/recommend-products", authRequired, async (req, res) => {
       { title: "Lips", key: "lips" },
     ];
 
-    for (const sec of sections) {
-      const products = list?.[sec.key] || [];
-      const block = await buildProductLines({
-        products,
-        category: sec.title,
-        undertone,
-        season,
-        toneNumber,
-        toneDepth,
-      });
+    const toTextPayloadFromRecs = (recsObj, source) => {
+      const recs = recsObj && typeof recsObj === "object" ? recsObj : {};
+      const lines = [];
+      lines.push("Recommended products:");
 
-      if (!block.length) continue;
+      for (const sec of sections) {
+        const item = recs?.[sec.key] || null;
+        const name = String(item?.product_name || "").trim();
+        const colorRaw = String(item?.color_name || "").trim();
+        const color = isUnavailableColorName(colorRaw)
+          ? buildFallbackColorLabelServer({
+              category: sec.title,
+              undertone,
+              season,
+              toneNumber,
+              toneDepth,
+            })
+          : colorRaw;
+
+        lines.push("");
+        lines.push(`${sec.title}:`);
+        if (name) lines.push(`- ${name} — Color: ${color}`);
+        else lines.push(`- (unavailable) — Color: ${color}`);
+      }
+
+      return { ok: true, text: lines.join("\n"), source: String(source || "fallback") };
+    };
+
+    // Optional: OpenAI + Sephora web_search (slow, but can be enabled for higher-quality product selection).
+    // We bound this path with a timeout so the UI doesn't hang for 1–2 minutes.
+    if (OPENAI_RECS_USE_WEB_SEARCH) {
+      try {
+        const recs = await withTimeout(
+          callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumber }),
+          OPENAI_RECS_TIMEOUT_MS,
+          "OpenAI Sephora recommender"
+        );
+
+        // Try repairs, but don't allow them to block the response for too long.
+        try {
+          await withTimeout(
+            fillMissingCategoriesWithCategoryRepair(recs, { undertone, season, toneDepth, toneNumber }),
+            Math.max(8000, Math.min(OPENAI_RECS_TIMEOUT_MS, 20000)),
+            "Recs category repair"
+          );
+        } catch {
+          // ignore
+        }
+
+        try {
+          await withTimeout(
+            repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber }),
+            Math.max(8000, Math.min(OPENAI_RECS_TIMEOUT_MS, 25000)),
+            "Recs color repair"
+          );
+        } catch {
+          // ignore
+        }
+
+        const payload = toTextPayloadFromRecs(recs, "sephora_web_search");
+        recsTextCache.set(cacheKey, { fetchedAt: Date.now(), payload });
+        return res.json(payload);
+      } catch (e) {
+        console.error("recommend-products (web_search) failed or timed out:", String(e?.message || e));
+        // Fall through to fast local recommender.
+      }
+    }
+
+    // Fast path: curated product pools + verifiable shade picking.
+    // This avoids OpenAI web_search latency and returns in seconds in most cases.
+    const list = BUY_RECS_SERVER[undertone] || BUY_RECS_SERVER.neutral;
+
+    const blocks = await mapLimit(
+      sections,
+      2,
+      async (sec) => {
+        const products = list?.[sec.key] || [];
+        const block = await buildProductLines({
+          products,
+          category: sec.title,
+          undertone,
+          season,
+          toneNumber,
+          toneDepth,
+        });
+        return { sec, block };
+      }
+    );
+
+    const lines = [];
+    lines.push("Recommended products:");
+
+    for (const { sec, block } of blocks) {
+      if (!block || !Array.isArray(block) || !block.length) continue;
       lines.push("");
       lines.push(`${sec.title}:`);
       block.forEach((l) => lines.push(l));
     }
 
-    return res.json({ ok: true, text: lines.join("\n"), source: "fallback" });
+    const payload = { ok: true, text: lines.join("\n"), source: "fallback_fast" };
+    recsTextCache.set(cacheKey, { fetchedAt: Date.now(), payload });
+    return res.json(payload);
   } catch (e) {
     console.error("recommend-products error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
