@@ -75,6 +75,73 @@ const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCas
 // Log active OpenAI models at startup (helps confirm which models are in use)
 console.log(`[openai] analysis_model=${OPENAI_MODEL} recs_model=${OPENAI_RECS_MODEL} web_search=${OPENAI_RECS_USE_WEB_SEARCH} max_tool_calls=${OPENAI_RECS_MAX_TOOL_CALLS}`);
 
+// --- OpenAI request helpers (avoid flaky web_search failures) ---
+function isReasoningModelId(model) {
+  const m = String(model || "").trim().toLowerCase();
+  // gpt-5* and o-series are reasoning models. See Responses API docs.
+  return m.startsWith("gpt-5") || m.startsWith("o");
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryOpenAI(status, msg) {
+  const s = Number(status || 0);
+  const m = String(msg || "").toLowerCase();
+  if ([408, 409, 425, 429, 500, 502, 503, 504].includes(s)) return true;
+  if (m.includes("processing your request")) return true;
+  if (m.includes("server had an error")) return true;
+  if (m.includes("overloaded")) return true;
+  if (m.includes("timeout")) return true;
+  return false;
+}
+
+async function openaiResponsesCreateRaw(payload, { retries = 1, label = "openai" } = {}) {
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await r.json().catch(() => ({}));
+      const reqId = data?.error?.request_id || data?.request_id || r.headers.get("x-request-id") || "";
+
+      if (!r.ok) {
+        const msg = data?.error?.message || data?.error || `OpenAI error HTTP ${r.status}`;
+        const err = new Error(`${msg}${reqId ? ` (request_id ${reqId})` : ""}`);
+        err.status = r.status;
+        err.request_id = reqId;
+        err.openai = data?.error || data;
+        throw err;
+      }
+
+      return { status: r.status, request_id: reqId, data };
+    } catch (e) {
+      lastErr = e;
+      const status = Number(e?.status || e?.response?.status || 0);
+      const msg = String(e?.message || e);
+
+      if (attempt < retries && shouldRetryOpenAI(status, msg)) {
+        await sleepMs(350 * (attempt + 1));
+        continue;
+      }
+
+      throw e;
+    }
+  }
+
+  throw lastErr || new Error(`${label} failed`);
+}
+
+
 
 // Upload constraints
 const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8);
@@ -2437,6 +2504,372 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
 }
 
 
+
+
+// --- Robust Sephora recommendations via OpenAI web_search ---
+// We keep the original functions above for compatibility, but the routes below use these
+// robust versions which:
+//   * use the Responses API `instructions` field (more reliable with gpt-5*)
+//   * retry transient 5xx/overload errors
+//   * fall back across models and cached web search mode when needed
+
+function uniqueList(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const x of arr) {
+    const v = String(x || "").trim();
+    if (!v) continue;
+    const k = v.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(v);
+  }
+  return out;
+}
+
+function makeSephoraWebSearchTool({ external_web_access }) {
+  const tool = {
+    type: "web_search",
+    filters: { allowed_domains: ["sephora.com", "www.sephora.com"] },
+    user_location: { type: "approximate", country: "CA" },
+  };
+  // If set, controls whether we fetch live pages or use only cached/indexed results.
+  // See Web search docs.
+  tool.external_web_access = Boolean(external_web_access);
+  return tool;
+}
+
+async function callOpenAIForSephoraRecsRobust({ undertone, season, toneDepth, toneNumber }) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY on server");
+
+  const recItem = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      product_name: { type: "string" },
+      product_url: { type: "string" },
+      color_name: { type: "string" },
+    },
+    required: ["product_name", "product_url", "color_name"],
+  };
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      foundation: recItem,
+      cheeks: recItem,
+      eyes: recItem,
+      lips: recItem,
+    },
+    required: ["foundation", "cheeks", "eyes", "lips"],
+  };
+
+  const undertoneTxt = String(undertone || "neutral");
+  const seasonTxt = String(season || "summer");
+  const depthTxt = String(toneDepth || "").trim();
+  const numberTxt =
+    typeof toneNumber === "number" && Number.isFinite(toneNumber) ? String(toneNumber) : String(toneNumber || "").trim();
+
+  const systemPrompt =
+    "You are a professional makeup artist assistant." +
+    " Use ONLY Sephora (sephora.com) to choose products and their exact color/variant names." +
+    " You must choose products ONLY from the Supported Sephora products list provided in the user message." +
+    " You MUST use web search to verify that each recommended color/variant exists for that specific product on Sephora." +
+    " Choose exactly ONE recommendation for each category: foundation, cheeks, eyes, lips." +
+    " For each recommendation, provide: product_name, product_url, color_name." +
+    " color_name must match Sephora's displayed Color/Shade label (include codes/numbers and short descriptors if present)." +
+    " Never guess. If you cannot verify a color name after trying at least two products in a category, use '(unavailable)'." +
+    " Output JSON only.";
+
+  const formatSupportedList = (title, names) => {
+    const arr = Array.isArray(names) ? names : [];
+    const lines = [];
+    lines.push(`${title}:`);
+    for (const raw of arr) {
+      const name = String(raw || "").trim();
+      if (!name) continue;
+      const url = String(PRODUCT_URLS?.[name] || "").trim();
+      if (url) lines.push(`- ${name} — ${url}`);
+      else lines.push(`- ${name}`);
+    }
+    return lines.join("\n");
+  };
+
+  const supportedProductsText =
+    "\nSupported Sephora products (choose ONLY from these; use the listed URL as product_url):\n" +
+    `${formatSupportedList("Foundation", FOUNDATION_POOL)}\n` +
+    `${formatSupportedList("Cheeks", CHEEKS_POOL)}\n` +
+    `${formatSupportedList("Eyes", EYES_POOL)}\n` +
+    `${formatSupportedList("Lips", LIPS_POOL)}\n`;
+
+  const userPrompt =
+    `Person attributes:\n` +
+    `- undertone: ${undertoneTxt}\n` +
+    `- season: ${seasonTxt}\n` +
+    (depthTxt ? `- depth: ${depthTxt}\n` : "") +
+    (numberTxt ? `- tone_number (approx 1-10): ${numberTxt}\n` : "") +
+    "\nTask:\n" +
+    "1) Choose ONE good product per category (foundation, cheeks, eyes, lips).\n" +
+    "2) For each product, find an EXACT Sephora color/variant name that best matches the person.\n" +
+    "3) Return JSON only." +
+    supportedProductsText;
+
+  const modelsToTry = uniqueList([OPENAI_RECS_MODEL || "gpt-5-mini", "gpt-5", "o4-mini"]);
+  const externalModes = [true, false];
+  const formats = ["json_schema", "json_object"]; // fall back if strict schema trips server-side errors
+
+  let lastErr = null;
+
+  for (const model of modelsToTry) {
+    for (const external_web_access of externalModes) {
+      for (const fmt of formats) {
+        const payload = {
+          model,
+          tools: [makeSephoraWebSearchTool({ external_web_access })],
+          tool_choice: "auto",
+          max_tool_calls: OPENAI_RECS_MAX_TOOL_CALLS,
+          max_output_tokens: OPENAI_RECS_MAX_OUTPUT_TOKENS,
+          parallel_tool_calls: false,
+          instructions: systemPrompt,
+          input: userPrompt,
+          text:
+            fmt === "json_schema"
+              ? { format: { type: "json_schema", name: "undertone_sephora_recommendations", strict: true, schema } }
+              : { format: { type: "json_object" } },
+        };
+
+        if (isReasoningModelId(model)) payload.reasoning = { effort: "low" };
+
+        try {
+          const { data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:${model}` });
+          const { text: outText, refusal } = extractOutputText(data);
+          if (refusal) throw new Error(refusal);
+          if (!outText) throw new Error("OpenAI returned no text output");
+
+          const parsed = JSON.parse(outText);
+
+          // If using json_object, validate minimal shape.
+          if (fmt === "json_object") {
+            const keys = ["foundation", "cheeks", "eyes", "lips"];
+            for (const k of keys) {
+              if (!parsed?.[k] || typeof parsed[k] !== "object") {
+                throw new Error(`OpenAI returned invalid JSON object (missing ${k})`);
+              }
+            }
+          }
+
+          return parsed;
+        } catch (e) {
+          lastErr = e;
+          const status = Number(e?.status || 0);
+          const msg = String(e?.message || e);
+          console.warn(
+            `[recs] failed model=${model} external_web_access=${external_web_access} format=${fmt} status=${status || "?"}: ${msg.slice(0, 260)}`
+          );
+        }
+      }
+    }
+  }
+
+  throw lastErr || new Error("OpenAI recommendations failed");
+}
+
+async function callOpenAIForSephoraCategoryRepairRobust({
+  categoryKey,
+  categoryTitle,
+  undertone,
+  season,
+  toneDepth,
+  toneNumber,
+  preferredName,
+  preferredUrl,
+}) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY on server");
+
+  const recItem = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      product_name: { type: "string" },
+      product_url: { type: "string" },
+      color_name: { type: "string" },
+    },
+    required: ["product_name", "product_url", "color_name"],
+  };
+
+  const pools = {
+    foundation: FOUNDATION_POOL,
+    cheeks: CHEEKS_POOL,
+    eyes: EYES_POOL,
+    lips: LIPS_POOL,
+  };
+
+  const pool = Array.isArray(pools?.[categoryKey]) ? pools[categoryKey] : [];
+  const title = String(categoryTitle || categoryKey || "").trim() || "Category";
+
+  const undertoneTxt = String(undertone || "neutral");
+  const seasonTxt = String(season || "summer");
+  const depthTxt = String(toneDepth || "").trim();
+  const numberTxt =
+    typeof toneNumber === "number" && Number.isFinite(toneNumber) ? String(toneNumber) : String(toneNumber || "").trim();
+
+  const systemPrompt =
+    "You are a professional makeup artist assistant." +
+    " Use ONLY Sephora (sephora.com)." +
+    ` You are fixing missing color_name for category ${title}.` +
+    " Choose ONE supported product and return an exact, verifiable Sephora color name." +
+    " Never guess. Output JSON only.";
+
+  const formatSupportedList = (names) => {
+    const arr = Array.isArray(names) ? names : [];
+    const lines = [];
+    for (const raw of arr) {
+      const name = String(raw || "").trim();
+      if (!name) continue;
+      const url = String(PRODUCT_URLS?.[name] || "").trim();
+      if (url) lines.push(`- ${name} — ${url}`);
+      else lines.push(`- ${name}`);
+    }
+    return lines.join("\n");
+  };
+
+  const preferred = preferredName && preferredUrl ? `\nPreferred product: ${preferredName} — ${preferredUrl}\n` : "";
+
+  const userPrompt =
+    `Person attributes:\n` +
+    `- undertone: ${undertoneTxt}\n` +
+    `- season: ${seasonTxt}\n` +
+    (depthTxt ? `- depth: ${depthTxt}\n` : "") +
+    (numberTxt ? `- tone_number: ${numberTxt}\n` : "") +
+    preferred +
+    `\nTask: Choose ONE supported Sephora product for ${title} and find its exact Color/Shade label.\n` +
+    `Supported Sephora products for ${title}:\n` +
+    formatSupportedList(pool);
+
+  const modelsToTry = uniqueList([OPENAI_RECS_MODEL || "gpt-5-mini", "gpt-5", "o4-mini"]);
+  const externalModes = [true, false];
+  const formats = ["json_schema", "json_object"];
+
+  let lastErr = null;
+
+  for (const model of modelsToTry) {
+    for (const external_web_access of externalModes) {
+      for (const fmt of formats) {
+        const payload = {
+          model,
+          tools: [makeSephoraWebSearchTool({ external_web_access })],
+          tool_choice: "auto",
+          max_tool_calls: OPENAI_RECS_REPAIR_MAX_TOOL_CALLS,
+          max_output_tokens: OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS,
+          parallel_tool_calls: false,
+          instructions: systemPrompt,
+          input: userPrompt,
+          text:
+            fmt === "json_schema"
+              ? { format: { type: "json_schema", name: "undertone_sephora_category_repair", strict: true, schema: recItem } }
+              : { format: { type: "json_object" } },
+        };
+
+        if (isReasoningModelId(model)) payload.reasoning = { effort: "low" };
+
+        try {
+          const { data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `repair:${model}` });
+          const { text: outText, refusal } = extractOutputText(data);
+          if (refusal) throw new Error(refusal);
+          if (!outText) throw new Error("OpenAI returned no text output");
+
+          const parsed = JSON.parse(outText);
+          if (fmt === "json_object") {
+            if (!parsed?.product_name || !parsed?.product_url || parsed?.color_name === undefined) {
+              throw new Error("OpenAI returned invalid repair JSON");
+            }
+          }
+
+          return parsed;
+        } catch (e) {
+          lastErr = e;
+          const status = Number(e?.status || 0);
+          const msg = String(e?.message || e);
+          console.warn(
+            `[recs:repair] failed model=${model} external_web_access=${external_web_access} format=${fmt} status=${status || "?"}: ${msg.slice(0, 260)}`
+          );
+        }
+      }
+    }
+  }
+
+  throw lastErr || new Error("OpenAI category repair failed");
+}
+
+async function callOpenAIExtractSephoraDisplayedColorRobust({ productUrl }) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY on server");
+
+  const url = String(productUrl || "").trim();
+  if (!url) return "";
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: { color_name: { type: "string" } },
+    required: ["color_name"],
+  };
+
+  const systemPrompt =
+    "You are a strict data extractor." +
+    " Use ONLY Sephora (sephora.com) via web search." +
+    " Open the provided Sephora product URL." +
+    " Find the exact currently selected variant label on the page. Sephora usually shows it as 'Color: <value>' or 'Shade: <value>'." +
+    " Return ONLY the <value> part, EXACTLY as shown (include codes/numbers and descriptors if present)." +
+    " If you cannot find any Color/Shade line, return '(unavailable)'." +
+    " Output JSON only.";
+
+  const userPrompt = `Sephora product URL: ${url}`;
+
+  const modelsToTry = uniqueList([OPENAI_RECS_MODEL || "gpt-5-mini", "gpt-5", "o4-mini"]);
+  const externalModes = [true, false];
+
+  let lastErr = null;
+
+  for (const model of modelsToTry) {
+    for (const external_web_access of externalModes) {
+      const payload = {
+        model,
+        tools: [makeSephoraWebSearchTool({ external_web_access })],
+        tool_choice: "auto",
+        max_tool_calls: Math.max(4, Math.min(12, OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8)),
+        max_output_tokens: 120,
+        parallel_tool_calls: false,
+        instructions: systemPrompt,
+        input: userPrompt,
+        text: { format: { type: "json_schema", name: "sephora_color_extractor", strict: true, schema } },
+      };
+
+      if (isReasoningModelId(model)) payload.reasoning = { effort: "low" };
+
+      try {
+        const { data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `extract:${model}` });
+        const { text: outText, refusal } = extractOutputText(data);
+        if (refusal) throw new Error(refusal);
+        if (!outText) return "";
+
+        const parsed = JSON.parse(outText);
+        return String(parsed?.color_name || "").trim();
+      } catch (e) {
+        lastErr = e;
+        const status = Number(e?.status || 0);
+        const msg = String(e?.message || e);
+        console.warn(
+          `[recs:extract] failed model=${model} external_web_access=${external_web_access} status=${status || "?"}: ${msg.slice(0, 260)}`
+        );
+      }
+    }
+  }
+
+  // Don't throw here; just return empty so callers can fall back to '(unavailable)'
+  console.warn(`[recs:extract] giving up for url=${url.slice(0, 120)}`);
+  return "";
+}
 function isUnavailableColorName(value) {
   const s = String(value || "").trim();
   if (!s) return true;
@@ -2505,7 +2938,7 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
     // (2) If still unavailable, do a targeted web_search repair call (may also swap product/url).
     if (isUnavailable(item?.color_name) && OPENAI_RECS_REPAIR_ENABLED) {
       try {
-        const fixed = await callOpenAIForSephoraCategoryRepair({
+        const fixed = await callOpenAIForSephoraCategoryRepairRobust({
           categoryKey: sec.key,
           categoryTitle: sec.title,
           undertone,
@@ -2542,7 +2975,7 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
     // This avoids returning '(unavailable)' on categories where the full swatch list is not exposed.
     if (isUnavailable(item?.color_name) && normUrl && OPENAI_RECS_REPAIR_ENABLED) {
       try {
-        const extracted = await callOpenAIExtractSephoraDisplayedColor({ productUrl: normUrl });
+        const extracted = await callOpenAIExtractSephoraDisplayedColorRobust({ productUrl: normUrl });
         const ex = String(extracted || "").trim();
         if (ex && !/^\(unavailable\)$/i.test(ex)) {
           item.color_name = ex;
@@ -2566,7 +2999,7 @@ app.post("/recommend-products", authRequired, async (req, res) => {
     // Primary path: reasoning model + web_search (Sephora only)
     if (OPENAI_RECS_USE_WEB_SEARCH) {
       try {
-        const recs = await callOpenAIForSephoraRecs({
+        const recs = await callOpenAIForSephoraRecsRobust({
           undertone,
           season,
           toneDepth,
