@@ -68,7 +68,7 @@ const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH
 // Recs repair: if any category returns '(unavailable)', we do a small targeted follow-up
 // web search to fill the exact Sephora color/variant name. This runs only when needed.
 const OPENAI_RECS_REPAIR_ENABLED = String(process.env.OPENAI_RECS_REPAIR_ENABLED || "true").toLowerCase() !== "false";
-const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8);
+const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 12);
 const OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250);
 const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCase() === "true";
 
@@ -2253,8 +2253,7 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
           type: "web_search",
           filters: { allowed_domains: ["sephora.com"] },
           // Cache-only web search is typically more reliable for Sephora product pages.
-          external_web_access: false,
-          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
         },
       ],
       tool_choice: "auto",
@@ -2276,7 +2275,7 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
     try {
       let data;
       try {
-        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:${model}` }));
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 5, label: `recs:${model}` }));
       } catch (e) {
         // If cache-only mode fails due to transient tool issues, retry once with live access.
         const status = Number(e?.status || 0);
@@ -2287,8 +2286,7 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
           /processing your request/i.test(msg);
 
         if (isTransient) {
-          payload.tools[0].external_web_access = true;
-          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:${model}:live` }));
+({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:${model}:live` }));
         } else {
           throw e;
         }
@@ -2406,8 +2404,7 @@ async function callOpenAIForSephoraCategoryRepair({
         {
           type: "web_search",
           filters: { allowed_domains: ["sephora.com"] },
-          external_web_access: false,
-          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
         },
       ],
       tool_choice: "auto",
@@ -2433,7 +2430,7 @@ async function callOpenAIForSephoraCategoryRepair({
     try {
       let data;
       try {
-        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:repair:${model}` }));
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 4, label: `recs:repair:${model}` }));
       } catch (e) {
         const status = Number(e?.status || 0);
         const msg = String(e?.message || e);
@@ -2443,8 +2440,7 @@ async function callOpenAIForSephoraCategoryRepair({
           /processing your request/i.test(msg);
 
         if (isTransient) {
-          payload.tools[0].external_web_access = true;
-          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:repair:${model}:live` }));
+({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:repair:${model}:live` }));
         } else {
           throw e;
         }
@@ -2506,8 +2502,7 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
         {
           type: "web_search",
           filters: { allowed_domains: ["sephora.com"] },
-          external_web_access: false,
-          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
         },
       ],
       tool_choice: "auto",
@@ -2529,7 +2524,7 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
     try {
       let data;
       try {
-        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:extract:${model}` }));
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 4, label: `recs:extract:${model}` }));
       } catch (e) {
         const status = Number(e?.status || 0);
         const msg = String(e?.message || e);
@@ -2539,8 +2534,7 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
           /processing your request/i.test(msg);
 
         if (isTransient) {
-          payload.tools[0].external_web_access = true;
-          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:extract:${model}:live` }));
+({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:extract:${model}:live` }));
         } else {
           throw e;
         }
@@ -2684,6 +2678,101 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
   }
 }
 
+
+
+async function fillMissingCategoriesWithCategoryRepair(recs, { undertone, season, toneDepth, toneNumber }) {
+  const obj = recs && typeof recs === "object" ? recs : null;
+  if (!obj) return;
+
+  const sections = [
+    { key: "foundation", title: "Foundation", pool: FOUNDATION_POOL },
+    { key: "cheeks", title: "Cheeks", pool: CHEEKS_POOL },
+    { key: "eyes", title: "Eyes", pool: EYES_POOL },
+    { key: "lips", title: "Lips", pool: LIPS_POOL },
+  ];
+
+  for (const sec of sections) {
+    const item = obj?.[sec.key];
+    const name0 = String(item?.product_name || "").trim();
+    const url0 = String(item?.product_url || "").trim();
+    const color0 = String(item?.color_name || "").trim();
+
+    const urlOk = url0 && isAllowedRetailerUrl(url0);
+    const needsRepair = !name0 || !urlOk || isUnavailableColorName(color0);
+    if (!needsRepair) continue;
+
+    try {
+      const fixed = await callOpenAIForSephoraCategoryRepair({
+        categoryKey: sec.key,
+        categoryTitle: sec.title,
+        undertone,
+        season,
+        toneDepth,
+        toneNumber,
+        preferredName: name0,
+        preferredUrl: urlOk ? normalizeRetailerUrl(url0) : "",
+      });
+
+      const f = fixed && typeof fixed === "object" ? fixed : null;
+      if (f) {
+        const newName = String(f.product_name || "").trim();
+        let newUrl = String(f.product_url || "").trim();
+        const newColor = String(f.color_name || "").trim();
+
+        if (newName) f.product_name = newName;
+
+        if (newUrl && isAllowedRetailerUrl(newUrl)) {
+          f.product_url = normalizeRetailerUrl(newUrl);
+        } else if (newName) {
+          let u = String(PRODUCT_URLS?.[newName] || "").trim();
+          if (!u) {
+            try {
+              u = await resolveSephoraProductUrlByName(newName);
+            } catch {
+              u = "";
+            }
+          }
+          f.product_url = u ? normalizeRetailerUrl(u) : "";
+        }
+
+        if (!newColor || isUnavailableColorName(newColor)) {
+          f.color_name = newColor || "(unavailable)";
+        }
+
+        obj[sec.key] = f;
+      }
+    } catch (e) {
+      console.warn(`[recs] category repair failed for ${sec.title}:`, String(e?.message || e).slice(0, 240));
+
+      // Last resort: pick a stable supported product so we don't show "(unavailable)" as the product name.
+      try {
+        const seed = `${sec.key}|${undertone}|${season}|${String(toneNumber ?? "")} |${String(toneDepth ?? "")}`;
+        const pick = (pickStable(sec.pool, 1, seed) || [])[0];
+        if (pick) {
+          let u = String(PRODUCT_URLS?.[pick] || "").trim();
+          if (!u) {
+            try {
+              u = await resolveSephoraProductUrlByName(pick);
+            } catch {
+              u = "";
+            }
+          }
+          obj[sec.key] = {
+            product_name: pick,
+            product_url: u ? normalizeRetailerUrl(u) : "",
+            color_name: "(unavailable)",
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+
+
+
 app.post("/recommend-products", authRequired, async (req, res) => {
   try {
     const undertone = normalizeUndertoneKeyServer(req?.body?.undertone);
@@ -2701,6 +2790,7 @@ app.post("/recommend-products", authRequired, async (req, res) => {
           toneNumber,
         });
 
+        await fillMissingCategoriesWithCategoryRepair(recs, { undertone, season, toneDepth, toneNumber });
         await repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber });
 
         if (recs && typeof recs === "object") {
@@ -2724,9 +2814,7 @@ app.post("/recommend-products", authRequired, async (req, res) => {
             lines.push("");
             lines.push(`${sec.title}:`);
             if (name) {
-              // Include URL so the variant name is auditable.
-              const urlPart = url ? ` (Sephora: ${url})` : "";
-              lines.push(`- ${name} — Color: ${color}${urlPart}`);
+              lines.push(`- ${name} — Color: ${color}`);
             } else {
               lines.push(`- (unavailable) — Color: ${color}`);
             }
@@ -2768,6 +2856,8 @@ app.post("/recommend-products", authRequired, async (req, res) => {
             }
           }
 
+          await fillMissingCategoriesWithCategoryRepair(recs2, { undertone, season, toneDepth, toneNumber });
+
           await repairMissingSephoraColorNames(recs2, { undertone, season, toneDepth, toneNumber });
 
           const lines2 = [];
@@ -2782,8 +2872,7 @@ app.post("/recommend-products", authRequired, async (req, res) => {
             lines2.push("");
             lines2.push(`${sec.title}:`);
             if (name) {
-              const urlPart = url ? ` (Sephora: ${url})` : "";
-              lines2.push(`- ${name} — Color: ${color}${urlPart}`);
+              lines2.push(`- ${name} — Color: ${color}`);
             } else {
               lines2.push(`- (unavailable) — Color: ${color}`);
             }
