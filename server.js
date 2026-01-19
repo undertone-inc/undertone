@@ -72,6 +72,31 @@ const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_
 const OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250);
 const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCase() === "true";
 
+// Recommendation model fallback order (used only if the primary recs call fails).
+// Keeps the system resilient to transient model/tool errors.
+const OPENAI_RECS_MODEL_FALLBACK_ORDER = [
+  "o4-mini",
+  "gpt-5.2",
+];
+
+function uniqStringsLower(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(arr) ? arr : []) {
+    const v = String(item || "").trim();
+    if (!v) continue;
+    const k = v.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(v);
+  }
+  return out;
+}
+
+function recsModelCandidates() {
+  return uniqStringsLower([OPENAI_RECS_MODEL, ...OPENAI_RECS_MODEL_FALLBACK_ORDER]);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2163,7 +2188,10 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
   const undertoneTxt = String(undertone || "neutral");
   const seasonTxt = String(season || "summer");
   const depthTxt = String(toneDepth || "").trim();
-  const numberTxt = typeof toneNumber === "number" && Number.isFinite(toneNumber) ? String(toneNumber) : String(toneNumber || "").trim();
+  const numberTxt =
+    typeof toneNumber === "number" && Number.isFinite(toneNumber)
+      ? String(toneNumber)
+      : String(toneNumber || "").trim();
 
   const systemPrompt =
     "You are a professional makeup artist assistant." +
@@ -2210,63 +2238,77 @@ async function callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumb
     "\nTask:\n" +
     "1) Using Sephora only, choose ONE good product per category (foundation, cheeks, eyes, lips).\n" +
     "2) For each chosen product, look up its Sephora color/variant list and choose the best matching variant name for the person above.\n" +
-    "3) Return JSON only." + supportedProductsText;
+    "3) Return JSON only." +
+    supportedProductsText;
 
-  const payload = {
-    model: OPENAI_RECS_MODEL || "gpt-5-mini",
-    reasoning: { effort: "low" },
-    tools: [
-      {
-        type: "web_search",
-        filters: { allowed_domains: ["sephora.com"] },
-        // Cache-only web search is typically more reliable for Sephora product pages.
-        // See: Web search docs → Live internet access.
-        external_web_access: false,
-        user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
-      },
-    ],
-    tool_choice: "auto",
-    max_tool_calls: OPENAI_RECS_MAX_TOOL_CALLS,
-    max_output_tokens: OPENAI_RECS_MAX_OUTPUT_TOKENS,
-    parallel_tool_calls: false,
-    instructions: systemPrompt,
-    input: userPrompt,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "undertone_sephora_recommendations",
-        strict: true,
-        schema,
-      },
-    },
-  };
+  const models = recsModelCandidates();
+  let lastErr = null;
 
-  let data;
-  try {
-    ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: "recs" }));
-  } catch (e) {
-    // If cache-only mode fails due to transient tool issues, retry once with live access.
-    const status = Number(e?.status || 0);
-    const msg = String(e?.message || e);
-    const isTransient = status === 429 || (status >= 500 && status <= 599) || /processing your request/i.test(msg);
-    if (isTransient) {
-      payload.tools[0].external_web_access = true;
-      ({ data } = await openaiResponsesCreateRaw(payload, { retries: 1, label: "recs:live" }));
-    } else {
-      throw e;
+  for (const model of models) {
+    const payload = {
+      model,
+      reasoning: { effort: "low" },
+      tools: [
+        {
+          type: "web_search",
+          filters: { allowed_domains: ["sephora.com"] },
+          // Cache-only web search is typically more reliable for Sephora product pages.
+          external_web_access: false,
+          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+        },
+      ],
+      tool_choice: "auto",
+      max_tool_calls: OPENAI_RECS_MAX_TOOL_CALLS,
+      max_output_tokens: OPENAI_RECS_MAX_OUTPUT_TOKENS,
+      parallel_tool_calls: false,
+      instructions: systemPrompt,
+      input: userPrompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "undertone_sephora_recommendations",
+          strict: true,
+          schema,
+        },
+      },
+    };
+
+    try {
+      let data;
+      try {
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:${model}` }));
+      } catch (e) {
+        // If cache-only mode fails due to transient tool issues, retry once with live access.
+        const status = Number(e?.status || 0);
+        const msg = String(e?.message || e);
+        const isTransient =
+          status === 429 ||
+          (status >= 500 && status <= 599) ||
+          /processing your request/i.test(msg);
+
+        if (isTransient) {
+          payload.tools[0].external_web_access = true;
+          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:${model}:live` }));
+        } else {
+          throw e;
+        }
+      }
+
+      const { text: outText, refusal } = extractOutputText(data);
+      if (refusal) throw new Error(refusal);
+      if (!outText) throw new Error("OpenAI returned no text output");
+
+      return JSON.parse(outText);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[recs] failed model=${model}:`, String(e?.message || e).slice(0, 240));
+      continue;
     }
   }
 
-  const { text: outText, refusal } = extractOutputText(data);
-  if (refusal) throw new Error(refusal);
-  if (!outText) throw new Error("OpenAI returned no text output");
-
-  try {
-    return JSON.parse(outText);
-  } catch {
-    throw new Error("OpenAI returned non-JSON output");
-  }
+  throw lastErr || new Error("OpenAI recs failed across all models");
 }
+
 
 async function callOpenAIForSephoraCategoryRepair({
   categoryKey,
@@ -2353,65 +2395,75 @@ async function callOpenAIForSephoraCategoryRepair({
     `Supported Sephora products for ${title} (choose ONLY from these; use the listed URL as product_url):\n` +
     formatSupportedList(pool);
 
-  const payload = {
-    model: OPENAI_RECS_MODEL || "gpt-5-mini",
-    reasoning: { effort: "low" },
-    tools: [
-      {
-        type: "web_search",
-        filters: { allowed_domains: ["sephora.com"] },
-        // Cache-only web search is typically more reliable for Sephora product pages.
-        external_web_access: false,
-        user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
-      },
-    ],
-    tool_choice: "auto",
-    max_tool_calls: OPENAI_RECS_REPAIR_MAX_TOOL_CALLS,
-    max_output_tokens: OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS,
-    parallel_tool_calls: false,
-    instructions: systemPrompt,
-    input: userPrompt,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "undertone_sephora_category_repair",
-        strict: true,
-        schema: recItem,
-      },
-    },
-  };
+  const models = recsModelCandidates();
+  let lastErr = null;
 
-  if (OPENAI_RECS_DEBUG) {
-    payload.include = ["web_search_call.action.sources"];
-  }
+  for (const model of models) {
+    const payload = {
+      model,
+      reasoning: { effort: "low" },
+      tools: [
+        {
+          type: "web_search",
+          filters: { allowed_domains: ["sephora.com"] },
+          external_web_access: false,
+          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+        },
+      ],
+      tool_choice: "auto",
+      max_tool_calls: OPENAI_RECS_REPAIR_MAX_TOOL_CALLS,
+      max_output_tokens: OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS,
+      parallel_tool_calls: false,
+      instructions: systemPrompt,
+      input: userPrompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "undertone_sephora_category_repair",
+          strict: true,
+          schema: recItem,
+        },
+      },
+    };
 
-  let data;
-  try {
-    ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: "recs:repair" }));
-  } catch (e) {
-    // If cache-only mode fails due to transient tool issues, retry once with live access.
-    const status = Number(e?.status || 0);
-    const msg = String(e?.message || e);
-    const isTransient = status === 429 || (status >= 500 && status <= 599) || /processing your request/i.test(msg);
-    if (isTransient) {
-      payload.tools[0].external_web_access = true;
-      ({ data } = await openaiResponsesCreateRaw(payload, { retries: 1, label: "recs:repair:live" }));
-    } else {
-      throw e;
+    if (OPENAI_RECS_DEBUG) {
+      payload.include = ["web_search_call.action.sources"];
+    }
+
+    try {
+      let data;
+      try {
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:repair:${model}` }));
+      } catch (e) {
+        const status = Number(e?.status || 0);
+        const msg = String(e?.message || e);
+        const isTransient =
+          status === 429 ||
+          (status >= 500 && status <= 599) ||
+          /processing your request/i.test(msg);
+
+        if (isTransient) {
+          payload.tools[0].external_web_access = true;
+          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:repair:${model}:live` }));
+        } else {
+          throw e;
+        }
+      }
+
+      const { text: outText, refusal } = extractOutputText(data);
+      if (refusal) throw new Error(refusal);
+      if (!outText) throw new Error("OpenAI returned no text output");
+
+      return JSON.parse(outText);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[recs:repair] failed model=${model} category=${title}:`, String(e?.message || e).slice(0, 240));
+      continue;
     }
   }
 
-  const { text: outText, refusal } = extractOutputText(data);
-  if (refusal) throw new Error(refusal);
-  if (!outText) throw new Error("OpenAI returned no text output");
-
-  try {
-    return JSON.parse(outText);
-  } catch {
-    throw new Error("OpenAI returned non-JSON output");
-  }
+  throw lastErr || new Error("OpenAI repair failed across all models");
 }
-
 
 
 async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
@@ -2443,61 +2495,73 @@ async function callOpenAIExtractSephoraDisplayedColor({ productUrl }) {
 
   const userPrompt = `Sephora product URL: ${url}`;
 
-  const payload = {
-    model: OPENAI_RECS_MODEL || "gpt-5-mini",
-    reasoning: { effort: "low" },
-    tools: [
-      {
-        type: "web_search",
-        filters: { allowed_domains: ["sephora.com"] },
-        // Cache-only web search is typically more reliable for Sephora product pages.
-        external_web_access: false,
-        user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
-      },
-    ],
-    tool_choice: "auto",
-    max_tool_calls: Math.max(4, Math.min(12, OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8)),
-    max_output_tokens: 120,
-    parallel_tool_calls: false,
-    instructions: systemPrompt,
-    input: userPrompt,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "sephora_color_extractor",
-        strict: true,
-        schema,
-      },
-    },
-  };
+  const models = recsModelCandidates();
+  let lastErr = null;
 
-  let data;
-  try {
-    ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: "recs:extract" }));
-  } catch (e) {
-    // If cache-only mode fails due to transient tool issues, retry once with live access.
-    const status = Number(e?.status || 0);
-    const msg = String(e?.message || e);
-    const isTransient = status === 429 || (status >= 500 && status <= 599) || /processing your request/i.test(msg);
-    if (isTransient) {
-      payload.tools[0].external_web_access = true;
-      ({ data } = await openaiResponsesCreateRaw(payload, { retries: 1, label: "recs:extract:live" }));
-    } else {
-      throw e;
+  for (const model of models) {
+    const payload = {
+      model,
+      reasoning: { effort: "low" },
+      tools: [
+        {
+          type: "web_search",
+          filters: { allowed_domains: ["sephora.com"] },
+          external_web_access: false,
+          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+        },
+      ],
+      tool_choice: "auto",
+      max_tool_calls: Math.max(4, Math.min(12, OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8)),
+      max_output_tokens: 120,
+      parallel_tool_calls: false,
+      instructions: systemPrompt,
+      input: userPrompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "sephora_color_extractor",
+          strict: true,
+          schema,
+        },
+      },
+    };
+
+    try {
+      let data;
+      try {
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:extract:${model}` }));
+      } catch (e) {
+        const status = Number(e?.status || 0);
+        const msg = String(e?.message || e);
+        const isTransient =
+          status === 429 ||
+          (status >= 500 && status <= 599) ||
+          /processing your request/i.test(msg);
+
+        if (isTransient) {
+          payload.tools[0].external_web_access = true;
+          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: `recs:extract:${model}:live` }));
+        } else {
+          throw e;
+        }
+      }
+
+      const { text: outText, refusal } = extractOutputText(data);
+      if (refusal) throw new Error(refusal);
+      if (!outText) return "";
+
+      const parsed = JSON.parse(outText);
+      const c = String(parsed?.color_name || "").trim();
+      return c;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[recs:extract] failed model=${model}:`, String(e?.message || e).slice(0, 240));
+      continue;
     }
   }
 
-  const { text: outText, refusal } = extractOutputText(data);
-  if (refusal) throw new Error(refusal);
-  if (!outText) return "";
-
-  try {
-    const parsed = JSON.parse(outText);
-    const c = String(parsed?.color_name || "").trim();
-    return c;
-  } catch {
-    return "";
-  }
+  // If everything fails, treat as unavailable.
+  return "(unavailable)";
 }
 
 
@@ -2672,6 +2736,64 @@ app.post("/recommend-products", authRequired, async (req, res) => {
         }
       } catch (e) {
         console.error("recommend-products (web_search) failed:", e);
+        // Secondary path: if the combined multi-category call fails, fall back to 4 smaller
+        // category calls (much more reliable and usually avoids transient processing errors).
+        try {
+          const sections = [
+            { title: "Foundation", key: "foundation" },
+            { title: "Cheeks", key: "cheeks" },
+            { title: "Eyes", key: "eyes" },
+            { title: "Lips", key: "lips" },
+          ];
+
+          const recs2 = {};
+          for (const sec of sections) {
+            try {
+              recs2[sec.key] = await callOpenAIForSephoraCategoryRepair({
+                categoryKey: sec.key,
+                categoryTitle: sec.title,
+                undertone,
+                season,
+                toneDepth,
+                toneNumber,
+                preferredName: "",
+                preferredUrl: "",
+              });
+            } catch (e2) {
+              console.warn(
+                `recommend-products (web_search:category_fallback) failed for ${sec.title}:`,
+                String(e2?.message || e2).slice(0, 240)
+              );
+              recs2[sec.key] = { product_name: "", product_url: "", color_name: "(unavailable)" };
+            }
+          }
+
+          await repairMissingSephoraColorNames(recs2, { undertone, season, toneDepth, toneNumber });
+
+          const lines2 = [];
+          lines2.push("Recommended products:");
+          for (const sec of sections) {
+            const item = recs2?.[sec.key] || null;
+            const name = String(item?.product_name || "").trim();
+            const url = String(item?.product_url || "").trim();
+            const colorRaw = String(item?.color_name || "").trim();
+            const color = isUnavailableColorName(colorRaw) ? "(unavailable)" : colorRaw;
+
+            lines2.push("");
+            lines2.push(`${sec.title}:`);
+            if (name) {
+              const urlPart = url ? ` (Sephora: ${url})` : "";
+              lines2.push(`- ${name} — Color: ${color}${urlPart}`);
+            } else {
+              lines2.push(`- (unavailable) — Color: ${color}`);
+            }
+          }
+
+          return res.json({ ok: true, text: lines2.join("\n"), source: "sephora_web_search_category_fallback" });
+        } catch (e3) {
+          console.error("recommend-products (web_search:category_fallback) failed:", e3);
+        }
+
         // Fall through to legacy fallback.
       }
     }
