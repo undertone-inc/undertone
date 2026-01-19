@@ -778,9 +778,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [chatLoading, setChatLoading] = useState(false);
 
-  const [buyRecsLoading, setBuyRecsLoading] = useState(false);
-  const [buyRecsProgress, setBuyRecsProgress] = useState(0);
-  const buyRecsTimerRef = useRef<any>(null);
 
   const [photoPicking, setPhotoPicking] = useState(false);
 
@@ -808,20 +805,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [(route as any)?.params?.capturedPhoto]);
-
-  // Cleanup timers
-  useEffect(() => {
-    return () => {
-      try {
-        if (buyRecsTimerRef.current) {
-          clearInterval(buyRecsTimerRef.current);
-          buyRecsTimerRef.current = null;
-        }
-      } catch {
-        // ignore
-      }
-    };
-  }, []);
 
   // Keyboard tracking so the input bar stays above it.
   useEffect(() => {
@@ -1383,65 +1366,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     }
     if (chatLoading) return;
 
-    // UI progress (best-effort). Real streaming progress is hard on mobile reliably,
-    // so we animate up to ~95% until the server responds.
-    const startProgress = () => {
-      try {
-        if (buyRecsTimerRef.current) {
-          clearInterval(buyRecsTimerRef.current);
-          buyRecsTimerRef.current = null;
-        }
-      } catch {
-        // ignore
-      }
-
-      setBuyRecsProgress(0);
-      setBuyRecsLoading(true);
-      const startedAt = Date.now();
-
-      buyRecsTimerRef.current = setInterval(() => {
-        const elapsed = Date.now() - startedAt;
-
-        let target = 0;
-        if (elapsed < 15000) {
-          target = Math.floor((elapsed / 15000) * 70);
-        } else if (elapsed < 60000) {
-          target = 70 + Math.floor(((elapsed - 15000) / 45000) * 25);
-        } else {
-          target = 95;
-        }
-
-        const bump = Math.random() < 0.18 ? 1 : 0;
-        const next = Math.min(95, target + bump);
-
-        setBuyRecsProgress((prev) => (prev < next ? next : prev));
-      }, 450);
-    };
-
-    const stopProgress = (completed: boolean) => {
-      try {
-        if (buyRecsTimerRef.current) {
-          clearInterval(buyRecsTimerRef.current);
-          buyRecsTimerRef.current = null;
-        }
-      } catch {
-        // ignore
-      }
-
-      if (completed) {
-        setBuyRecsProgress(100);
-        setTimeout(() => {
-          setBuyRecsLoading(false);
-        }, 350);
-      } else {
-        setBuyRecsLoading(false);
-      }
-    };
-
     setChatLoading(true);
-    startProgress();
-
-    let didAddMessage = false;
 
     try {
       // Prefer server-side recommendations so we can attach real retailer color names.
@@ -1490,11 +1415,9 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
       const current = getChatFor(analysisId);
       await upsertChatFor(analysisId, [...current, assistantMsg]);
-      didAddMessage = true;
     } catch (e: any) {
       Alert.alert('Recommend products failed', String(e?.message || e));
     } finally {
-      stopProgress(didAddMessage);
       setChatLoading(false);
     }
   };
@@ -1765,13 +1688,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                 </View>
               ) : null}
 
-              {buyRecsLoading ? (
-                <View style={[styles.chatBubble, styles.chatBubbleAssistant, styles.loadingBubble]}>
-                  <ActivityIndicator />
-                  <Text style={[styles.chatBubbleText, { marginLeft: 10 }]}>Searching… {buyRecsProgress}%</Text>
-                </View>
-              ) : null}
-
               {analysisLoading ? (
                 <View style={[styles.chatBubble, styles.chatBubbleAssistant, styles.loadingBubble]}>
                   <ActivityIndicator />
@@ -1998,26 +1914,26 @@ const styles = StyleSheet.create({
     color: '#ffffff',
   },
   recommendRow: {
-    maxWidth: '92%',
+    width: '92%',
     alignSelf: 'flex-start',
-    flexDirection: 'row',
+    flexDirection: 'column',
     gap: 10,
     marginTop: 2,
   },
   recommendBtn: {
-    flex: 1,
+    width: '100%',
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#e5e7eb',
     backgroundColor: '#ffffff',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingVertical: 11,
+    paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
   },
   recommendBtnText: {
     color: '#111827',
-    fontWeight: '500',
+    fontWeight: '400',
     fontSize: 13,
   },
   kitSaveRow: {

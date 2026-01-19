@@ -63,7 +63,15 @@ const OPENAI_RECS_MODEL = String(process.env.OPENAI_RECS_MODEL || "gpt-5-mini").
 const OPENAI_RECS_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_MAX_OUTPUT_TOKENS || 500);
 // Keep tool calls bounded so costs are predictable (search/open/find all count).
 const OPENAI_RECS_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_MAX_TOOL_CALLS || 20);
-const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "false").toLowerCase() === "true";
+const OPENAI_RECS_USE_WEB_SEARCH = String(process.env.OPENAI_RECS_USE_WEB_SEARCH || "true").toLowerCase() !== "false";
+
+// Shade nuance refinement (no web search): when the heuristic is uncertain,
+// we do a tiny second-pass choice among the top candidate shades.
+// This keeps the endpoint fast while improving shade nuance (especially foundation).
+const OPENAI_RECS_SHADE_REFINE_ENABLED = String(process.env.OPENAI_RECS_SHADE_REFINE_ENABLED || "true").toLowerCase() !== "false";
+const OPENAI_RECS_SHADE_REFINE_SCOPE = String(process.env.OPENAI_RECS_SHADE_REFINE_SCOPE || "foundation").trim().toLowerCase(); // foundation | all | none
+const OPENAI_RECS_SHADE_REFINE_MODEL = String(process.env.OPENAI_RECS_SHADE_REFINE_MODEL || OPENAI_RECS_MODEL || "gpt-5-mini").trim();
+const OPENAI_RECS_SHADE_REFINE_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_SHADE_REFINE_MAX_OUTPUT_TOKENS || 140);
 
 // Recs repair: if any category returns '(unavailable)', we do a small targeted follow-up
 // web search to fill the exact Sephora color/variant name. This runs only when needed.
@@ -71,18 +79,6 @@ const OPENAI_RECS_REPAIR_ENABLED = String(process.env.OPENAI_RECS_REPAIR_ENABLED
 const OPENAI_RECS_REPAIR_MAX_TOOL_CALLS = Number(process.env.OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 12);
 const OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250);
 const OPENAI_RECS_DEBUG = String(process.env.OPENAI_RECS_DEBUG || "").toLowerCase() === "true";
-
-// Timeouts (ms) to keep recommendations responsive.
-// If OpenAI web_search is enabled and takes too long, we fall back to the fast local recommender.
-const OPENAI_RECS_TIMEOUT_MS = Math.max(8000, Math.min(90000, Number(process.env.OPENAI_RECS_TIMEOUT_MS || 25000)));
-// Shade extraction (Sephora HTML/Apify) timeout; when exceeded we fall back to curated/static shades.
-const SEPHORA_SHADE_TIMEOUT_MS = Math.max(3000, Math.min(45000, Number(process.env.SEPHORA_SHADE_TIMEOUT_MS || 12000)));
-// Apify actor run timeout (only relevant if APIFY_TOKEN is set).
-const APIFY_TIMEOUT_MS = Math.max(6000, Math.min(60000, Number(process.env.APIFY_TIMEOUT_MS || 12000)));
-
-// In-memory cache for full recommendation responses (helps when users tap twice or revisit the same scan).
-const RECS_CACHE_TTL_MS = Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Number(process.env.RECS_CACHE_TTL_MS || 6 * 60 * 60 * 1000)));
-const recsTextCache = new Map(); // key -> { fetchedAt:number, payload:{ ok:true, text:string, source:string } }
 
 // Recommendation model fallback order (used only if the primary recs call fails).
 // Keeps the system resilient to transient model/tool errors.
@@ -111,51 +107,6 @@ function recsModelCandidates() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function withTimeout(promise, ms, label = 'operation') {
-  const timeoutMs = Number(ms);
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.resolve(promise);
-
-  let t = null;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => {
-      const err = new Error(`${label} timed out after ${timeoutMs}ms`);
-      err.code = 'ETIMEDOUT';
-      reject(err);
-    }, timeoutMs);
-  });
-
-  return Promise.race([
-    Promise.resolve(promise).finally(() => {
-      if (t) clearTimeout(t);
-    }),
-    timeout,
-  ]);
-}
-
-async function mapLimit(items, limit, fn) {
-  const arr = Array.isArray(items) ? items : [];
-  const n = Number(limit);
-  const concurrency = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
-
-  const results = new Array(arr.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const i = nextIndex++;
-      if (i >= arr.length) break;
-      results[i] = await fn(arr[i], i);
-    }
-  }
-
-  const workers = [];
-  for (let i = 0; i < Math.min(concurrency, arr.length); i++) {
-    workers.push(worker());
-  }
-  await Promise.all(workers);
-  return results;
 }
 
 async function openaiResponsesCreateRaw(payload, { retries = 2, label = "openai" } = {}) {
@@ -1688,9 +1639,30 @@ function scoreByKeywords(text, want = [], avoid = []) {
   return score;
 }
 
-function pickBestShadeForCategory({ shades, category, undertone, season, toneNumber, toneDepth }) {
+function parseUndertoneFromShadeLabel(label) {
+  const t = String(label || "").toLowerCase();
+  if (!t) return null;
+
+  // Prefer explicit text descriptors when present.
+  if (t.includes("neutral")) return "neutral";
+  if (/(^|\b)(cool|rosy|pink)(\b|$)/.test(t)) return "cool";
+  if (/(^|\b)(warm|golden|yellow|peach|olive)(\b|$)/.test(t)) return "warm";
+
+  // Many foundation systems encode undertone via a letter (e.g., 1C, 2W, 0.5N, 2W0, 1N2, 0CR, 4WP).
+  const m = /\b(\d+(?:\.\d+)?)([NCWOP])(?:[A-Z]{0,3}|\d{1,2})\b/i.exec(String(label || ""));
+  if (!m) return null;
+  const code = String(m[2] || "").toUpperCase();
+  if (code == "N") return "neutral";
+  if (code == "C") return "cool";
+  if (code == "W") return "warm";
+  if (code == "P") return "warm"; // peach
+  if (code == "O") return "neutral"; // olive-ish
+  return null;
+}
+
+function rankShadesForCategory({ shades, category, undertone, season, toneNumber, toneDepth }) {
   const list = Array.isArray(shades) ? shades : [];
-  if (!list.length) return null;
+  if (!list.length) return [];
 
   const dir = undertoneDirectionServer(undertone);
   const seasonKey = normalizeSeasonKeyServer(season);
@@ -1753,7 +1725,7 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
   const tNum = Number(toneNumber);
   const targetP = Number.isFinite(tNum) ? Math.min(1, Math.max(0, (tNum - 1) / 9)) : 0.4;
 
-  // Pre-sort for foundation by first number we can extract (helps pick a similar depth index).
+  // Pre-sort by first number we can extract (helps pick a similar depth index, especially foundation).
   const withNum = list
     .map((sh, idx) => {
       const label = shadeLabel(sh);
@@ -1774,8 +1746,14 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
 
   const targetIdx = Math.round(targetP * Math.max(0, withNum.length - 1));
 
-  let best = null;
-  let bestScore = -1e9;
+  // Depth intent for non-foundation (a gentle nudge so deep tones don't get washed-out shades and
+  // very fair tones don't get very deep/intense picks).
+  const deepWant = ["deep", "rich", "intense", "dark", "plum", "berry", "wine", "brick", "chocolate", "espresso", "mahogany", "oxblood"];
+  const deepAvoid = ["pale", "light", "pastel", "baby", "petal"];
+  const fairWant = ["soft", "light", "sheer", "pale", "pastel", "baby", "petal", "champagne", "nude", "rose"];
+  const fairAvoid = ["deep", "dark", "intense", "rich", "espresso", "mahogany", "oxblood"];
+
+  const ranked = [];
 
   for (let i = 0; i < withNum.length; i++) {
     const item = withNum[i];
@@ -1783,7 +1761,7 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
     if (!label) continue;
 
     let score = 0;
-    const text = `${label}`;
+    const text = String(label || "");
 
     // Undertone + season cues
     score += 2 * scoreByKeywords(text, wantDir, avoidDir);
@@ -1797,18 +1775,43 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
         // Depth fallback: closeness to target index (using numeric ordering if available)
         score += 4 - Math.min(4, Math.abs(i - targetIdx));
       }
+
+      // Extra nuance: explicit undertone code/descriptor match for foundation.
+      const shadeU = parseUndertoneFromShadeLabel(label);
+      if (shadeU) {
+        if (dir === "neutral") {
+          score += shadeU === "neutral" ? 2 : 0.5;
+        } else {
+          if (shadeU === dir) score += 3;
+          else if (shadeU === "neutral") score += 1;
+          else score -= 3;
+        }
+      }
+    } else {
+      if (desiredDepthRank >= 5) {
+        score += 0.8 * scoreByKeywords(text, deepWant, deepAvoid);
+      } else if (desiredDepthRank <= 1) {
+        score += 0.8 * scoreByKeywords(text, fairWant, fairAvoid);
+      }
     }
 
     // Mild preference for shades that look like a real “color name”
     if (/\bcolor\b/i.test(text)) score -= 1;
 
-    if (score > bestScore) {
-      bestScore = score;
-      best = item.sh;
-    }
+    ranked.push({ sh: item.sh, score, label, idx: item.idx });
   }
 
-  return best;
+  ranked.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.idx - b.idx;
+  });
+
+  return ranked;
+}
+
+function pickBestShadeForCategory({ shades, category, undertone, season, toneNumber, toneDepth }) {
+  const ranked = rankShadesForCategory({ shades, category, undertone, season, toneNumber, toneDepth });
+  return ranked.length ? ranked[0].sh : null;
 }
 
 
@@ -1905,9 +1908,43 @@ async function getSephoraShadesForUrl(url) {
     return Array.isArray(cached.shades) ? cached.shades : [];
   }
 
-  const fallback = STATIC_SEPHORA_SHADE_FALLBACK?.[u];
+  let shades = [];
 
-  const mergeUnique = (base, addList) => {
+  // (1) Fast path: fetch product HTML directly and extract variants
+  try {
+    const html = await fetchHtml(u);
+    shades = extractSephoraColorVariantsFromHtml(html);
+  } catch {
+    shades = [];
+  }
+
+  // (2) Reliability fallback: Apify actor (optional)
+  // This is the only approach that tends to work consistently across Sephora's anti-bot changes.
+  if ((!Array.isArray(shades) || shades.length < APIFY_MIN_SHADES_THRESHOLD) && APIFY_TOKEN && isAllowedRetailerUrl(u)) {
+    try {
+      const apifyShades = await getSephoraShadesViaApify(u);
+      const merged = [];
+      const seen = new Set();
+      const add = (sh) => {
+        const v = String(sh?.value || "").trim();
+        const d = String(sh?.desc || "").trim();
+        if (!v) return;
+        const key = `${v.toLowerCase()}::${d.toLowerCase()}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push({ value: v, desc: d || undefined });
+      };
+      (Array.isArray(shades) ? shades : []).forEach(add);
+      (Array.isArray(apifyShades) ? apifyShades : []).forEach(add);
+      shades = merged;
+    } catch (e) {
+      if (APIFY_DEBUG) console.warn("Apify shades fetch failed:", String(e?.message || e).slice(0, 500));
+    }
+  }
+
+  // (3) Curated static fallbacks (kept small; only used if live extraction fails)
+  const fallback = STATIC_SEPHORA_SHADE_FALLBACK?.[u];
+  if (Array.isArray(fallback) && fallback.length) {
     const merged = [];
     const seen = new Set();
     const add = (sh) => {
@@ -1919,41 +1956,9 @@ async function getSephoraShadesForUrl(url) {
       seen.add(key);
       merged.push({ value: v, desc: d || undefined });
     };
-    (Array.isArray(base) ? base : []).forEach(add);
-    (Array.isArray(addList) ? addList : []).forEach(add);
-    return merged;
-  };
-
-  let shades = [];
-
-  // (1) Fast path: fetch product HTML directly and extract variants (bounded by timeout)
-  try {
-    const htmlTimeout = Array.isArray(fallback) && fallback.length ? Math.min(SEPHORA_SHADE_TIMEOUT_MS, 4000) : SEPHORA_SHADE_TIMEOUT_MS;
-    const html = await withTimeout(fetchHtml(u), htmlTimeout, "Sephora HTML fetch");
-    shades = extractSephoraColorVariantsFromHtml(html);
-  } catch {
-    shades = [];
-  }
-
-  // (2) Merge curated static fallbacks early (prevents unnecessary Apify calls)
-  if (Array.isArray(fallback) && fallback.length) {
-    shades = mergeUnique(shades, fallback);
-  }
-
-  // (3) Reliability fallback: Apify actor (optional + bounded by timeout)
-  // Only try Apify if we still couldn't extract enough shades.
-  if ((!Array.isArray(shades) || shades.length < APIFY_MIN_SHADES_THRESHOLD) && APIFY_TOKEN && isAllowedRetailerUrl(u)) {
-    try {
-      const apifyShades = await withTimeout(getSephoraShadesViaApify(u), APIFY_TIMEOUT_MS, "Apify Sephora shades");
-      shades = mergeUnique(shades, apifyShades);
-    } catch (e) {
-      if (APIFY_DEBUG) console.warn("Apify shades fetch failed:", String(e?.message || e).slice(0, 500));
-    }
-  }
-
-  // (4) Ensure fallback shades are present even if Apify returns nothing
-  if (Array.isArray(fallback) && fallback.length) {
-    shades = mergeUnique(shades, fallback);
+    (Array.isArray(shades) ? shades : []).forEach(add);
+    fallback.forEach(add);
+    shades = merged;
   }
 
   shadeCache.set(u, { fetchedAt: now, shades });
@@ -2199,6 +2204,89 @@ async function resolveSephoraProductUrlByName(name) {
 }
 
 
+async function callOpenAIShadeRefine({ category, productName, undertone, season, toneNumber, toneDepth, candidates }) {
+  if (!OPENAI_API_KEY) return null;
+  if (!OPENAI_RECS_SHADE_REFINE_ENABLED) return null;
+  const scope = String(OPENAI_RECS_SHADE_REFINE_SCOPE || "foundation").toLowerCase();
+  const catKey = String(category || "").trim().toLowerCase();
+  if (scope === "none") return null;
+  if (scope === "foundation" && catKey !== "foundation") return null;
+
+  const list = Array.isArray(candidates) ? candidates : [];
+  if (list.length < 2) return null;
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      index: { type: "integer", minimum: 0, maximum: Math.max(0, list.length - 1) },
+    },
+    required: ["index"],
+  };
+
+  const undertoneTxt = String(undertone || "neutral");
+  const seasonTxt = String(season || "summer");
+  const depthTxt = String(toneDepth || "").trim();
+  const numberTxt =
+    typeof toneNumber === "number" && Number.isFinite(toneNumber)
+      ? String(toneNumber)
+      : String(toneNumber || "").trim();
+
+  const sys =
+    "You are a professional makeup artist assistant. " +
+    "Choose the SINGLE best shade from the provided candidate list. " +
+    "Do NOT browse the web. Do NOT invent shades. Only choose from the list. " +
+    "For foundation: match both undertone and depth (tone number/depth). " +
+    "For cheeks/eyes/lips: pick the most flattering option for the user's undertone + season, and avoid extremes that would clash.";
+
+  const lines = [];
+  lines.push(`Category: ${String(category || "").trim()}`);
+  if (productName) lines.push(`Product: ${String(productName).trim()}`);
+  lines.push(`Undertone: ${undertoneTxt}`);
+  lines.push(`Season: ${seasonTxt}`);
+  if (depthTxt) lines.push(`Depth: ${depthTxt}`);
+  if (numberTxt) lines.push(`Tone number: ${numberTxt}`);
+  lines.push("\nCandidate shades (choose ONE by index):");
+  list.forEach((c, i) => {
+    const label = compactSpaces(String(c || ""));
+    lines.push(`${i}: ${label}`);
+  });
+
+  const payload = {
+    model: OPENAI_RECS_SHADE_REFINE_MODEL,
+    temperature: 0,
+    input: [
+      { role: "system", content: sys },
+      { role: "user", content: [{ type: "input_text", text: lines.join("\n") }] },
+    ],
+    max_output_tokens: OPENAI_RECS_SHADE_REFINE_MAX_OUTPUT_TOKENS,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "undertone_shade_refine",
+        strict: true,
+        schema,
+      },
+    },
+  };
+
+  const { data } = await openaiResponsesCreateRaw(payload, { retries: 1, label: "shade_refine" });
+  const { text, refusal } = extractOutputText(data);
+  if (refusal) return null;
+  if (!text) return null;
+  try {
+    const obj = JSON.parse(text);
+    const idx = Number(obj?.index);
+    if (!Number.isFinite(idx)) return null;
+    const i = Math.max(0, Math.min(list.length - 1, Math.floor(idx)));
+    const selected = compactSpaces(String(list[i] || ""));
+    return selected || null;
+  } catch {
+    return null;
+  }
+}
+
+
 async function buildProductLines({ products, category, undertone, season, toneNumber, toneDepth }) {
   const out = [];
   const list = Array.isArray(products) ? products : [];
@@ -2244,9 +2332,8 @@ async function buildProductLines({ products, category, undertone, season, toneNu
 
     let label = "";
     try {
-      if (url && isAllowedRetailerUrl(url)) {
-        const shades = await getSephoraShadesForUrl(url);
-        const best = pickBestShadeForCategory({
+      if (url && isAllowedRetailerUrl(url)) {      const shades = await getSephoraShadesForUrl(url);
+        const ranked = rankShadesForCategory({
           shades,
           category,
           undertone,
@@ -2254,7 +2341,45 @@ async function buildProductLines({ products, category, undertone, season, toneNu
           toneNumber,
           toneDepth,
         });
-        label = best ? shadeLabel(best) : (Array.isArray(shades) && shades[0] ? shadeLabel(shades[0]) : "");
+
+        // Primary pick (fast, deterministic)
+        label = ranked[0]?.label ? String(ranked[0].label) : (Array.isArray(shades) && shades[0] ? shadeLabel(shades[0]) : "");
+
+        // If the heuristic is uncertain, do a tiny second-pass choice among the top candidates.
+        // This keeps speed while improving nuance (especially foundation).
+        const catKey2 = String(category || "").trim().toLowerCase();
+        const canRefine =
+          OPENAI_RECS_SHADE_REFINE_ENABLED &&
+          !!OPENAI_API_KEY &&
+          (OPENAI_RECS_SHADE_REFINE_SCOPE === "all" || (OPENAI_RECS_SHADE_REFINE_SCOPE !== "none" && catKey2 === "foundation"));
+
+        if (canRefine && ranked.length >= 3) {
+          const bestScore = Number(ranked[0]?.score);
+          const secondScore = Number(ranked[1]?.score);
+          const delta = Number.isFinite(bestScore) && Number.isFinite(secondScore) ? bestScore - secondScore : 0;
+
+          // Low confidence when candidates are very close, or the best score is weak.
+          const lowConfidence =
+            (!Number.isFinite(bestScore) || bestScore < 2) ||
+            (catKey2 === "foundation" ? delta < 1.6 : delta < 1.0);
+
+          if (lowConfidence) {
+            const top = ranked.slice(0, Math.min(10, ranked.length)).map((r) => r.label).filter(Boolean);
+            const refined = await callOpenAIShadeRefine({
+              category,
+              productName: n,
+              undertone,
+              season,
+              toneNumber,
+              toneDepth,
+              candidates: top,
+            });
+
+            if (refined) {
+              label = refined;
+            }
+          }
+        }
 
         // Foundation shade sanity check: if the only available shades are wildly off from the
         // person’s depth, keep searching rather than returning an obviously wrong shade.
@@ -3018,17 +3143,134 @@ app.post("/recommend-products", authRequired, async (req, res) => {
     const toneNumber = req?.body?.tone_number;
     const toneDepth = req?.body?.tone_depth;
 
-    // Response cache (per undertone/season/depth bucket) so repeat taps return instantly.
-    const tn = Number(toneNumber);
-    const tnBucket = Number.isFinite(tn) ? Math.round(tn * 2) / 2 : "";
-    const depthKey = normalizeToneDepthServer(toneDepth) || (Number.isFinite(tn) ? toneDepthFromNumberServer(tn) : "");
-    const cacheKey = `${undertone}|${season}|${depthKey}|${tnBucket}`;
+    // Primary path: reasoning model + web_search (Sephora only)
+    if (OPENAI_RECS_USE_WEB_SEARCH) {
+      try {
+        const recs = await callOpenAIForSephoraRecs({
+          undertone,
+          season,
+          toneDepth,
+          toneNumber,
+        });
 
-    const cached = recsTextCache.get(cacheKey);
-    const now = Date.now();
-    if (cached && now - (cached.fetchedAt || 0) < RECS_CACHE_TTL_MS) {
-      return res.json(cached.payload);
+        await fillMissingCategoriesWithCategoryRepair(recs, { undertone, season, toneDepth, toneNumber });
+        await repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber });
+
+        if (recs && typeof recs === "object") {
+          const lines = [];
+          lines.push("Recommended products:");
+
+          const sections = [
+            { title: "Foundation", key: "foundation" },
+            { title: "Cheeks", key: "cheeks" },
+            { title: "Eyes", key: "eyes" },
+            { title: "Lips", key: "lips" },
+          ];
+
+          for (const sec of sections) {
+            const item = recs?.[sec.key] || null;
+            const name = String(item?.product_name || "").trim();
+            const url = String(item?.product_url || "").trim();
+            const colorRaw = String(item?.color_name || "").trim();
+            const color = isUnavailableColorName(colorRaw)
+              ? buildFallbackColorLabelServer({
+                  category: sec.title,
+                  undertone,
+                  season,
+                  toneNumber,
+                  toneDepth,
+                })
+              : colorRaw;
+
+            lines.push("");
+            lines.push(`${sec.title}:`);
+            if (name) {
+              lines.push(`- ${name} — Color: ${color}`);
+            } else {
+              lines.push(`- (unavailable) — Color: ${color}`);
+            }
+          }
+
+          return res.json({ ok: true, text: lines.join("\n"), source: "sephora_web_search" });
+        }
+      } catch (e) {
+        console.error("recommend-products (web_search) failed:", e);
+        // Secondary path: if the combined multi-category call fails, fall back to 4 smaller
+        // category calls (much more reliable and usually avoids transient processing errors).
+        try {
+          const sections = [
+            { title: "Foundation", key: "foundation" },
+            { title: "Cheeks", key: "cheeks" },
+            { title: "Eyes", key: "eyes" },
+            { title: "Lips", key: "lips" },
+          ];
+
+          const recs2 = {};
+          for (const sec of sections) {
+            try {
+              recs2[sec.key] = await callOpenAIForSephoraCategoryRepair({
+                categoryKey: sec.key,
+                categoryTitle: sec.title,
+                undertone,
+                season,
+                toneDepth,
+                toneNumber,
+                preferredName: "",
+                preferredUrl: "",
+              });
+            } catch (e2) {
+              console.warn(
+                `recommend-products (web_search:category_fallback) failed for ${sec.title}:`,
+                String(e2?.message || e2).slice(0, 240)
+              );
+              recs2[sec.key] = { product_name: "", product_url: "", color_name: "(unavailable)" };
+            }
+          }
+
+          await fillMissingCategoriesWithCategoryRepair(recs2, { undertone, season, toneDepth, toneNumber });
+
+          await repairMissingSephoraColorNames(recs2, { undertone, season, toneDepth, toneNumber });
+
+          const lines2 = [];
+          lines2.push("Recommended products:");
+          for (const sec of sections) {
+            const item = recs2?.[sec.key] || null;
+            const name = String(item?.product_name || "").trim();
+            const url = String(item?.product_url || "").trim();
+            const colorRaw = String(item?.color_name || "").trim();
+            const color = isUnavailableColorName(colorRaw)
+              ? buildFallbackColorLabelServer({
+                  category: sec.title,
+                  undertone,
+                  season,
+                  toneNumber,
+                  toneDepth,
+                })
+              : colorRaw;
+
+            lines2.push("");
+            lines2.push(`${sec.title}:`);
+            if (name) {
+              lines2.push(`- ${name} — Color: ${color}`);
+            } else {
+              lines2.push(`- (unavailable) — Color: ${color}`);
+            }
+          }
+
+          return res.json({ ok: true, text: lines2.join("\n"), source: "sephora_web_search_category_fallback" });
+        } catch (e3) {
+          console.error("recommend-products (web_search:category_fallback) failed:", e3);
+        }
+
+        // Fall through to legacy fallback.
+      }
     }
+
+    // Fallback path: curated product pools + best-effort shade extraction.
+    const list = BUY_RECS_SERVER[undertone] || BUY_RECS_SERVER.neutral;
+
+    const lines = [];
+    lines.push("Recommended products:");
 
     const sections = [
       { title: "Foundation", key: "foundation" },
@@ -3037,108 +3279,24 @@ app.post("/recommend-products", authRequired, async (req, res) => {
       { title: "Lips", key: "lips" },
     ];
 
-    const toTextPayloadFromRecs = (recsObj, source) => {
-      const recs = recsObj && typeof recsObj === "object" ? recsObj : {};
-      const lines = [];
-      lines.push("Recommended products:");
+    for (const sec of sections) {
+      const products = list?.[sec.key] || [];
+      const block = await buildProductLines({
+        products,
+        category: sec.title,
+        undertone,
+        season,
+        toneNumber,
+        toneDepth,
+      });
 
-      for (const sec of sections) {
-        const item = recs?.[sec.key] || null;
-        const name = String(item?.product_name || "").trim();
-        const colorRaw = String(item?.color_name || "").trim();
-        const color = isUnavailableColorName(colorRaw)
-          ? buildFallbackColorLabelServer({
-              category: sec.title,
-              undertone,
-              season,
-              toneNumber,
-              toneDepth,
-            })
-          : colorRaw;
-
-        lines.push("");
-        lines.push(`${sec.title}:`);
-        if (name) lines.push(`- ${name} — Color: ${color}`);
-        else lines.push(`- (unavailable) — Color: ${color}`);
-      }
-
-      return { ok: true, text: lines.join("\n"), source: String(source || "fallback") };
-    };
-
-    // Optional: OpenAI + Sephora web_search (slow, but can be enabled for higher-quality product selection).
-    // We bound this path with a timeout so the UI doesn't hang for 1–2 minutes.
-    if (OPENAI_RECS_USE_WEB_SEARCH) {
-      try {
-        const recs = await withTimeout(
-          callOpenAIForSephoraRecs({ undertone, season, toneDepth, toneNumber }),
-          OPENAI_RECS_TIMEOUT_MS,
-          "OpenAI Sephora recommender"
-        );
-
-        // Try repairs, but don't allow them to block the response for too long.
-        try {
-          await withTimeout(
-            fillMissingCategoriesWithCategoryRepair(recs, { undertone, season, toneDepth, toneNumber }),
-            Math.max(8000, Math.min(OPENAI_RECS_TIMEOUT_MS, 20000)),
-            "Recs category repair"
-          );
-        } catch {
-          // ignore
-        }
-
-        try {
-          await withTimeout(
-            repairMissingSephoraColorNames(recs, { undertone, season, toneDepth, toneNumber }),
-            Math.max(8000, Math.min(OPENAI_RECS_TIMEOUT_MS, 25000)),
-            "Recs color repair"
-          );
-        } catch {
-          // ignore
-        }
-
-        const payload = toTextPayloadFromRecs(recs, "sephora_web_search");
-        recsTextCache.set(cacheKey, { fetchedAt: Date.now(), payload });
-        return res.json(payload);
-      } catch (e) {
-        console.error("recommend-products (web_search) failed or timed out:", String(e?.message || e));
-        // Fall through to fast local recommender.
-      }
-    }
-
-    // Fast path: curated product pools + verifiable shade picking.
-    // This avoids OpenAI web_search latency and returns in seconds in most cases.
-    const list = BUY_RECS_SERVER[undertone] || BUY_RECS_SERVER.neutral;
-
-    const blocks = await mapLimit(
-      sections,
-      2,
-      async (sec) => {
-        const products = list?.[sec.key] || [];
-        const block = await buildProductLines({
-          products,
-          category: sec.title,
-          undertone,
-          season,
-          toneNumber,
-          toneDepth,
-        });
-        return { sec, block };
-      }
-    );
-
-    const lines = [];
-    lines.push("Recommended products:");
-
-    for (const { sec, block } of blocks) {
-      if (!block || !Array.isArray(block) || !block.length) continue;
+      if (!block.length) continue;
       lines.push("");
       lines.push(`${sec.title}:`);
       block.forEach((l) => lines.push(l));
     }
 
-    const payload = { ok: true, text: lines.join("\n"), source: "fallback_fast" };
-    recsTextCache.set(cacheKey, { fetchedAt: Date.now(), payload });
-    return res.json(payload);
+    return res.json({ ok: true, text: lines.join("\n"), source: "fallback" });
   } catch (e) {
     console.error("recommend-products error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
