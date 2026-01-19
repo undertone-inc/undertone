@@ -1637,6 +1637,7 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
 
   const dir = undertoneDirectionServer(undertone);
   const seasonKey = normalizeSeasonKeyServer(season);
+  const categoryKey = String(category || "").trim().toLowerCase();
   const desiredDepth = normalizeToneDepthServer(toneDepth) || toneDepthFromNumberServer(Number(toneNumber));
   const desiredDepthRank = depthRank(desiredDepth);
 
@@ -1654,7 +1655,7 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
         ? ["warm", "gold", "golden", "yellow", "peach", "orange"]
         : [];
 
-  const wantSeason =
+  let wantSeason =
     seasonKey === "spring"
       ? ["coral", "peach", "apricot", "fresh", "bright", "golden", "warm rose"]
       : seasonKey === "summer"
@@ -1663,7 +1664,7 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
           ? ["terracotta", "brick", "copper", "bronze", "spice", "warm brown", "apricot"]
           : ["bold", "deep", "berry", "cranberry", "true red", "plum", "wine"];
 
-  const avoidSeason =
+  let avoidSeason =
     seasonKey === "spring"
       ? ["deep", "dark", "plum", "wine"]
       : seasonKey === "summer"
@@ -1672,7 +1673,26 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
           ? ["icy", "cool pink", "fuchsia"]
           : ["beige", "nude beige"];
 
-  const isFoundation = String(category || "").toLowerCase() === "foundation";
+  // Eyes need different keywords than cheeks/lips. This improves shade picking when
+  // Sephora scraping is blocked and we fall back to curated shade lists.
+  if (categoryKey === "eyes") {
+    if (seasonKey === "spring") {
+      wantSeason = ["champagne", "gold", "bronze", "copper", "brown", "warm brown", "soft brown"];
+      avoidSeason = ["blackest", "charcoal", "deep navy", "wine"];
+    } else if (seasonKey === "summer") {
+      wantSeason = ["taupe", "soft", "cool brown", "mauve", "plum", "gray", "charcoal"];
+      avoidSeason = ["orange", "bright", "neon", "brick"];
+    } else if (seasonKey === "autumn") {
+      wantSeason = ["bronze", "copper", "olive", "green", "brown", "chocolate", "espresso"];
+      avoidSeason = ["icy", "silver", "fuchsia"];
+    } else {
+      // winter
+      wantSeason = ["black", "charcoal", "navy", "plum", "purple", "smoke", "berry"];
+      avoidSeason = ["peach", "coral", "apricot", "nude beige"];
+    }
+  }
+
+  const isFoundation = categoryKey === "foundation";
   const tNum = Number(toneNumber);
   const targetP = Number.isFinite(tNum) ? Math.min(1, Math.max(0, (tNum - 1) / 9)) : 0.4;
 
@@ -1770,6 +1790,7 @@ const STATIC_SEPHORA_SHADE_FALLBACK = {
   [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/backstage-face-body-foundation-P432500')]: [
     { value: '0W', desc: 'WARM - Very fair skin with golden undertones' },
     { value: '0.5N', desc: 'NEUTRAL - Very fair skin with neutral undertones' },
+    { value: '0CR', desc: 'COOL ROSY - Very fair skin with pink undertones' },
     { value: '1C', desc: 'COOL - Fair skin with cool undertones' },
     { value: '1N', desc: 'NEUTRAL - Fair skin with neutral undertones' },
     { value: '1W', desc: 'WARM - Fair skin with golden undertones' },
@@ -1778,6 +1799,9 @@ const STATIC_SEPHORA_SHADE_FALLBACK = {
     { value: '3N', desc: 'NEUTRAL - Light to medium skin with neutral undertones' },
     { value: '3W', desc: 'WARM - Light to medium skin with golden undertones' },
     { value: '4WP', desc: 'WARM PEACH - Medium skin with peach undertones' },
+    { value: '7N', desc: 'NEUTRAL - Deep skin with neutral beige undertones' },
+    { value: '7W', desc: 'WARM - Deep skin with golden undertones' },
+    { value: '8N', desc: 'NEUTRAL - Deep skin with neutral beige undertones' },
   ],
   [normalizeRetailerUrl('https://www.sephora.com/product/luminous-silk-natural-glow-blurring-liquid-foundation-with-24-hour-wear-P519887')]: [
     { value: '4.5', desc: 'light, neutral peach' },
@@ -1788,6 +1812,26 @@ const STATIC_SEPHORA_SHADE_FALLBACK = {
     { value: '6.5', desc: 'medium, neutral' },
     { value: '7', desc: 'medium to tan with a peach undertone' },
     { value: '7.5', desc: 'tan with a peach undertone' },
+  ],
+
+  // Eyes (curated subset; ensures we can always pick a verifiable shade even if live scraping is blocked)
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/24-7-glide-on-eye-pencil-P133707')]: [
+    { value: 'Perversion', desc: 'matte blackest black' },
+    { value: 'Whiskey', desc: 'rich brown matte' },
+    { value: 'Bourbon', desc: 'glimmering dark brown' },
+    { value: 'Rockstar', desc: 'dark purple' },
+    { value: 'Mildew', desc: 'deep forest green' },
+    { value: 'Sabbath', desc: 'deep navy matte' },
+  ],
+
+  // Lips (curated subset; ensures we can always pick a verifiable shade even if live scraping is blocked)
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/gloss-bomb-universal-lip-luminizer-P67988453')]: [
+    { value: 'Fenty Glow', desc: 'shimmering rose nude' },
+    { value: 'FU$$Y', desc: 'shimmering pink' },
+    { value: 'Hot Chocolit', desc: 'shimmering rich brown' },
+    { value: 'Glass Slipper', desc: 'clear' },
+    { value: '$weetmouth', desc: 'shimmering soft pink' },
+    { value: 'Riri', desc: 'shimmering rose mauve nude' },
   ],
 };
 
@@ -1904,6 +1948,15 @@ const LIPS_POOL = [
   "Fenty Beauty Gloss Bomb Universal Lip Luminizer",
   "Rare Beauty by Selena Gomez Kind Words Matte Lipstick",
 ];
+
+// When Sephora blocks live scraping, we still want to return a usable *real* shade.
+// These are stable fallbacks with curated shade lists in STATIC_SEPHORA_SHADE_FALLBACK.
+const CATEGORY_SAFE_FALLBACK_PRODUCT = {
+  foundation: "Dior Backstage Face & Body Foundation",
+  cheeks: "Rare Beauty Soft Pinch Liquid Blush",
+  eyes: "Urban Decay 24/7 Glide-On Waterproof Eyeliner Pencil",
+  lips: "Fenty Beauty Gloss Bomb Universal Lip Luminizer",
+};
 
 const BUY_RECS_SERVER = {
   cool: { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
@@ -2098,19 +2151,34 @@ async function buildProductLines({ products, category, undertone, season, toneNu
   const desiredCount = 1;
   const seed = `${String(category || "").toLowerCase()}|${undertone}|${season}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
 
-  // Try more candidates so we can avoid returning "(unavailable)" whenever possible.
-  const candidates = pickStable(list, Math.min(list.length, desiredCount * 6), seed);
+  // Try more candidates so we can avoid returning generic colors whenever possible.
+  // Always include a category-safe fallback product that has curated shades.
+  const catKey = String(category || "").trim().toLowerCase();
+  const safeFallback = CATEGORY_SAFE_FALLBACK_PRODUCT?.[catKey];
+  const stable = pickStable(list, Math.min(list.length, desiredCount * 8), seed);
+  const candidates = [];
+  const seen = new Set();
+  const push = (v) => {
+    const n = String(v || "").trim();
+    if (!n) return;
+    const k = n.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    candidates.push(n);
+  };
 
-  const tried = new Set();
-  const chosen = [];
-  const fallbacks = [];
+  // Prefer the safe fallback early so we can always return a real shade name.
+  if (safeFallback) push(safeFallback);
+  stable.forEach(push);
+
+  let firstPick = "";
 
   for (const name of candidates) {
     const n = String(name || "").trim();
-    if (!n || tried.has(n)) continue;
-    tried.add(n);
+    if (!n) continue;
+    if (!firstPick) firstPick = n;
 
-    let url = PRODUCT_URLS[n] || "";
+    let url = String(PRODUCT_URLS?.[n] || "").trim();
     if (!url) {
       try {
         url = await resolveSephoraProductUrlByName(n);
@@ -2120,7 +2188,6 @@ async function buildProductLines({ products, category, undertone, season, toneNu
     }
 
     let label = "";
-
     try {
       if (url && isAllowedRetailerUrl(url)) {
         const shades = await getSephoraShadesForUrl(url);
@@ -2132,27 +2199,36 @@ async function buildProductLines({ products, category, undertone, season, toneNu
           toneNumber,
           toneDepth,
         });
-        label = best ? shadeLabel(best) : "";
+        label = best ? shadeLabel(best) : (Array.isArray(shades) && shades[0] ? shadeLabel(shades[0]) : "");
+
+        // Foundation shade sanity check: if the only available shades are wildly off from the
+        // person’s depth, keep searching rather than returning an obviously wrong shade.
+        if (label && String(category || "").toLowerCase() === "foundation") {
+          const desiredDepth = normalizeToneDepthServer(toneDepth) || toneDepthFromNumberServer(Number(toneNumber));
+          const desiredRank = depthRank(desiredDepth);
+          const foundDepth = parseDepthFromText(label);
+          if (foundDepth && Math.abs(depthRank(foundDepth) - desiredRank) > 2) {
+            label = "";
+          }
+        }
       }
     } catch {
       label = "";
     }
 
     if (label) {
-      chosen.push(`- ${n} — Color: ${label}`);
-    } else {
-      fallbacks.push(`- ${n} — Color: (unavailable)`);
+      return [`- ${n} — Color: ${label}`];
     }
-
-    if (chosen.length >= desiredCount) break;
   }
 
-  // If we couldn't find enough with colors, fill remaining with unavailable ones.
-  while (chosen.length < desiredCount && fallbacks.length) {
-    chosen.push(fallbacks.shift());
+  // Last resort: never return "(unavailable)".
+  // Provide a best-effort descriptive color based on undertone/season/depth.
+  if (firstPick) {
+    const approx = buildFallbackColorLabelServer({ category, undertone, season, toneNumber, toneDepth });
+    return [`- ${firstPick} — Color: ${approx}`];
   }
 
-  return chosen;
+  return out;
 }
 
 
@@ -2558,115 +2634,6 @@ user_location: { type: "approximate", country: "CA", timezone: "America/Vancouve
   return "(unavailable)";
 }
 
-async function callOpenAIExtractSephoraVariantList({ productUrl }) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("Missing OPENAI_API_KEY on server");
-  }
-
-  const url = String(productUrl || "").trim();
-  if (!url) return [];
-
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      variants: {
-        type: "array",
-        maxItems: 40,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            value: { type: "string" },
-            desc: { type: "string" },
-          },
-          required: ["value"],
-        },
-      },
-    },
-    required: ["variants"],
-  };
-
-  const systemPrompt =
-    "You are a strict data extractor." +
-    " Use ONLY Sephora (sephora.com) via web search." +
-    " Open the provided Sephora product URL." +
-    " Extract real color/shade variant options for this product." +
-    " Look for the shade selector list, swatches, or embedded product JSON that contains variationValue / variationDesc." +
-    " Return up to 40 variant options exactly as shown on Sephora." +
-    " Do NOT guess and do NOT invent." +
-    " If you cannot find any variants, return an empty list." +
-    " Output JSON only.";
-
-  const userPrompt = `Sephora product URL: ${url}`;
-
-  const models = recsModelCandidates();
-  let lastErr = null;
-
-  for (const model of models) {
-    const payload = {
-      model,
-      reasoning: { effort: "medium" },
-      tools: [
-        {
-          type: "web_search",
-          filters: { allowed_domains: ["sephora.com"] },
-          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
-        },
-      ],
-      tool_choice: "auto",
-      // Variant lists for foundations can be long; allow a bit more tool budget than the simple color extractor.
-      max_tool_calls: Math.max(10, Math.min(24, (OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 12) + 10)),
-      max_output_tokens: Math.max(250, OPENAI_RECS_REPAIR_MAX_OUTPUT_TOKENS || 250),
-      parallel_tool_calls: false,
-      instructions: systemPrompt,
-      input: userPrompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "sephora_variant_list",
-          strict: true,
-          schema,
-        },
-      },
-    };
-
-    try {
-      let data;
-      ({ data } = await openaiResponsesCreateRaw(payload, { retries: 4, label: `recs:variants:${model}` }));
-
-      const { text: outText, refusal } = extractOutputText(data);
-      if (refusal) throw new Error(refusal);
-      if (!outText) return [];
-
-      const parsed = JSON.parse(outText);
-      const variants = Array.isArray(parsed?.variants) ? parsed.variants : [];
-      const cleaned = [];
-      const seen = new Set();
-      for (const v of variants) {
-        const value = cleanVariantValue(v?.value);
-        const desc = compactSpaces(safeDecodeJsonString(v?.desc));
-        if (!value) continue;
-        const key = `${value.toLowerCase()}::${String(desc || "").toLowerCase()}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        cleaned.push({ value, desc: desc || undefined });
-        if (cleaned.length >= 40) break;
-      }
-      return cleaned;
-    } catch (e) {
-      lastErr = e;
-      console.warn(`[recs:variants] failed model=${model}:`, String(e?.message || e).slice(0, 240));
-      continue;
-    }
-  }
-
-  if (OPENAI_RECS_DEBUG && lastErr) {
-    console.warn("[recs:variants] last error:", String(lastErr?.message || lastErr).slice(0, 500));
-  }
-  return [];
-}
-
 
 function isUnavailableColorName(value) {
   const s = String(value || "").trim();
@@ -2689,6 +2656,61 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
   ];
 
   const isUnavailable = isUnavailableColorName;
+
+  const pools = {
+    foundation: FOUNDATION_POOL,
+    cheeks: CHEEKS_POOL,
+    eyes: EYES_POOL,
+    lips: LIPS_POOL,
+  };
+
+  const tryPickShadeForProductName = async ({ productName, categoryTitle }) => {
+    const n = String(productName || "").trim();
+    if (!n) return null;
+
+    let url = String(PRODUCT_URLS?.[n] || "").trim();
+    if (!url) {
+      try {
+        url = await resolveSephoraProductUrlByName(n);
+      } catch {
+        url = "";
+      }
+    }
+    if (!url || !isAllowedRetailerUrl(url)) return null;
+
+    const normUrl = normalizeRetailerUrl(url);
+    let shades = [];
+    try {
+      shades = await getSephoraShadesForUrl(normUrl);
+    } catch {
+      shades = [];
+    }
+    if (!Array.isArray(shades) || !shades.length) return null;
+
+    const best = pickBestShadeForCategory({
+      shades,
+      category: categoryTitle,
+      undertone,
+      season,
+      toneNumber,
+      toneDepth,
+    });
+    const label = best ? shadeLabel(best) : shadeLabel(shades[0]);
+    if (!label) return null;
+
+    // Foundation shade sanity check: if the only available shades are wildly off from the
+    // person’s depth, avoid returning an obviously incorrect shade code.
+    if (String(categoryTitle || "").toLowerCase() === "foundation") {
+      const desiredDepth = normalizeToneDepthServer(toneDepth) || toneDepthFromNumberServer(Number(toneNumber));
+      const desiredRank = depthRank(desiredDepth);
+      const foundDepth = parseDepthFromText(label);
+      if (foundDepth && Math.abs(depthRank(foundDepth) - desiredRank) > 2) {
+        return null;
+      }
+    }
+
+    return { product_name: n, product_url: normUrl, color_name: label };
+  };
 
 
 
@@ -2785,36 +2807,56 @@ async function repairMissingSephoraColorNames(recs, { undertone, season, toneDep
       }
     }
 
-    // (4) If we still don't have a color, extract a list of real variants via web search,
-    // cache it, and pick the best match using our deterministic scorer.
-    // This helps for products where Sephora doesn't render a "Color:" line until a shade is selected.
-    if (isUnavailable(item?.color_name) && normUrl && OPENAI_RECS_REPAIR_ENABLED) {
-      try {
-        const variants = await callOpenAIExtractSephoraVariantList({ productUrl: normUrl });
-        if (Array.isArray(variants) && variants.length) {
-          // Cache these variants so subsequent scans don't need to re-extract.
-          try {
-            shadeCache.set(normUrl, { fetchedAt: Date.now(), shades: variants });
-          } catch {
-            // ignore cache errors
-          }
+    // (4) Guaranteed fallback: swap to a category-safe product with curated shades, then pick the best shade.
+    // This ensures the UI never shows "Color: (unavailable)".
+    if (isUnavailable(item?.color_name)) {
+      const safeName = String(CATEGORY_SAFE_FALLBACK_PRODUCT?.[sec.key] || "").trim();
+      const pool = Array.isArray(pools?.[sec.key]) ? pools[sec.key] : [];
 
-          const best = pickBestShadeForCategory({
-            shades: variants,
-            category: sec.title,
-            undertone,
-            season,
-            toneNumber,
-            toneDepth,
-          });
-          const label = best ? shadeLabel(best) : "";
-          if (label) item.color_name = label;
-        }
-      } catch (e) {
-        if (OPENAI_RECS_DEBUG) {
-          console.warn(`Sephora variant list extract failed for ${sec.title}:`, String(e?.message || e).slice(0, 500));
+      const candidates = [];
+      const seen = new Set();
+      const push = (v) => {
+        const s = String(v || "").trim();
+        if (!s) return;
+        const k = s.toLowerCase();
+        if (seen.has(k)) return;
+        seen.add(k);
+        candidates.push(s);
+      };
+
+      if (safeName) push(safeName);
+      // Prefer products that have a curated static fallback first.
+      for (const p of pool) {
+        const n = String(p || "").trim();
+        const u = String(PRODUCT_URLS?.[n] || "").trim();
+        const nu = u && isAllowedRetailerUrl(u) ? normalizeRetailerUrl(u) : "";
+        if (nu && Array.isArray(STATIC_SEPHORA_SHADE_FALLBACK?.[nu]) && STATIC_SEPHORA_SHADE_FALLBACK[nu].length) {
+          push(n);
         }
       }
+      pool.forEach(push);
+
+      for (const cand of candidates) {
+        const picked = await tryPickShadeForProductName({ productName: cand, categoryTitle: sec.title });
+        if (picked) {
+          item.product_name = picked.product_name;
+          item.product_url = picked.product_url;
+          item.color_name = picked.color_name;
+          break;
+        }
+      }
+    }
+
+    // (5) Absolute last resort: a descriptive best-effort color label.
+    // This is used only if we couldn't find any verifiable shade name.
+    if (isUnavailable(item?.color_name)) {
+      item.color_name = buildFallbackColorLabelServer({
+        category: sec.title,
+        undertone,
+        season,
+        toneNumber,
+        toneDepth,
+      });
     }
   }
 }
@@ -2950,7 +2992,15 @@ app.post("/recommend-products", authRequired, async (req, res) => {
             const name = String(item?.product_name || "").trim();
             const url = String(item?.product_url || "").trim();
             const colorRaw = String(item?.color_name || "").trim();
-            const color = isUnavailableColorName(colorRaw) ? "(unavailable)" : colorRaw;
+            const color = isUnavailableColorName(colorRaw)
+              ? buildFallbackColorLabelServer({
+                  category: sec.title,
+                  undertone,
+                  season,
+                  toneNumber,
+                  toneDepth,
+                })
+              : colorRaw;
 
             lines.push("");
             lines.push(`${sec.title}:`);
@@ -3008,7 +3058,15 @@ app.post("/recommend-products", authRequired, async (req, res) => {
             const name = String(item?.product_name || "").trim();
             const url = String(item?.product_url || "").trim();
             const colorRaw = String(item?.color_name || "").trim();
-            const color = isUnavailableColorName(colorRaw) ? "(unavailable)" : colorRaw;
+            const color = isUnavailableColorName(colorRaw)
+              ? buildFallbackColorLabelServer({
+                  category: sec.title,
+                  undertone,
+                  season,
+                  toneNumber,
+                  toneDepth,
+                })
+              : colorRaw;
 
             lines2.push("");
             lines2.push(`${sec.title}:`);
