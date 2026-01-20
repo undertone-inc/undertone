@@ -855,7 +855,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                     </View>
                     <View style={styles.smallChip}>
                       <Text style={styles.smallChipText}>{planLabel}</Text>
-                    </ScrollView>
+                    </View>
                   </View>
                 </TouchableOpacity>
               );

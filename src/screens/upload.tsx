@@ -934,7 +934,18 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const upsertChatFor = async (id: string, messages: ChatMessage[]) => {
     const limited = messages.slice(-60);
-    const next: ChatStore = { ...(chatStore || {}) };
+
+    // Important: avoid wiping other scans if this function runs with stale state.
+    // Always merge into the latest stored chat map.
+    let base: ChatStore = {};
+    try {
+      const stored = await getJson<ChatStore>(chatKey);
+      if (stored && typeof stored === 'object') base = stored as any;
+    } catch {
+      base = (chatStore || {}) as any;
+    }
+
+    const next: ChatStore = { ...(base || {}) };
     next[id] = limited;
     await saveChatStore(next);
   };
@@ -1220,9 +1231,20 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       setNewScanMode(false);
 
       // Save analysis history (local)
+      // IMPORTANT: always merge with the latest stored history to avoid wiping older scans
+      // if this async flow runs with stale component state.
+      let baseHistory: HistoryItem[] = [];
+      try {
+        const stored = await getJson<HistoryItem[]>(historyKey);
+        baseHistory = Array.isArray(stored) ? stored : [];
+      } catch {
+        baseHistory = Array.isArray(history) ? history : [];
+      }
+
+      const createdAt = new Date().toISOString();
       const nextHistory: HistoryItem[] = [
-        { id, createdAt: new Date().toISOString(), analysis: nextAnalysis },
-        ...history,
+        { id, createdAt, analysis: nextAnalysis },
+        ...baseHistory.filter((h) => String(h?.id || '') !== String(id)),
       ].slice(0, 20);
       await saveHistory(nextHistory);
 
@@ -1305,10 +1327,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     setAnalysisId(null);
     setAnalysis(null);
     setNewScanMode(true);
-
-    setTimeout(() => {
-      void choosePhoto('camera');
-    }, 0);
   };
 
   const selectChat = (item: HistoryItem) => {
@@ -1681,7 +1699,9 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend items from kit</Text>
+                      <Text style={styles.recommendBtnText} numberOfLines={1}>
+                        Recommend items from kit
+                      </Text>
                     </TouchableOpacity>
                   ) : null}
 
@@ -1695,7 +1715,9 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend products</Text>
+                      <Text style={styles.recommendBtnText} numberOfLines={1}>
+                        Recommend products
+                      </Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
@@ -1927,14 +1949,14 @@ const styles = StyleSheet.create({
     color: '#ffffff',
   },
   recommendRow: {
-    maxWidth: '92%',
+    width: '92%',
     alignSelf: 'flex-start',
-    flexDirection: 'row',
+    flexDirection: 'column',
     gap: 10,
     marginTop: 2,
   },
   recommendBtn: {
-    flex: 1,
+    width: '100%',
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#e5e7eb',
@@ -1946,7 +1968,7 @@ const styles = StyleSheet.create({
   },
   recommendBtnText: {
     color: '#111827',
-    fontWeight: '500',
+    fontWeight: '400',
     fontSize: 13,
   },
   kitSaveRow: {
