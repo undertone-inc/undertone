@@ -1213,14 +1213,14 @@ const YourKit: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => 
                     <FormRow
                       label="Brand"
                       value={activeItem?.brand ?? ''}
-                      placeholder="NARS"
+                      placeholder="Dior"
                       onChangeText={(v) => updateItemField('brand', v)}
                     />
                     <View style={styles.rowDivider} />
                     <FormRow
-                      label="Shade"
+                      label="Color"
                       value={activeItem?.shade ?? ''}
-                      placeholder="Custard"
+                      placeholder="0N - Neutral"
                       onChangeText={(v) => updateItemField('shade', v)}
                     />
                     <View style={styles.rowDivider} />

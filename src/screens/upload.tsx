@@ -629,7 +629,7 @@ function buildBuyRecommendationsText(opts: {
   lines.push('Recommended products:');
 
   const addBlock = (label: string, arr: string[], colorLabel: string) => {
-    const list = Array.isArray(arr) ? arr.slice(0, 1) : [];
+    const list = Array.isArray(arr) ? arr.slice(0, 1) : []; // keep it concise
     if (!list.length) return;
     lines.push('');
     lines.push(`${label}:`);
@@ -770,6 +770,9 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [analysisId, setAnalysisId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<any | null>(null);
 
+  // When true, we intentionally keep the chat blank (don’t auto-restore last scan).
+  const [newScanMode, setNewScanMode] = useState(false);
+
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [chatStore, setChatStore] = useState<ChatStore>({});
 
@@ -878,7 +881,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       }
 
       // If we don't have an active analysis yet, restore the most recent.
-      if (alive && !analysisId && loadedHistory.length) {
+      if (alive && !analysisId && !newScanMode && loadedHistory.length) {
         const mostRecent = loadedHistory[0];
         if (mostRecent?.id) {
           setAnalysisId(String(mostRecent.id));
@@ -895,7 +898,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       if (typeof unsubscribe === 'function') unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [navigation, kitlogKey, catalogKey, historyKey, chatKey]);
+  }, [navigation, kitlogKey, catalogKey, historyKey, chatKey, analysisId, newScanMode]);
 
   useEffect(() => {
     // Auto-scroll when chat updates.
@@ -950,7 +953,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   }, [activeChat]);
 
   const activeChatTitle = useMemo(() => {
-    if (!analysisId) return 'Your scans';
+    if (!analysisId) return 'New scan';
     const hit = history.find((h) => String(h?.id || '') === String(analysisId));
     return hit ? formatChatTitle(hit) : 'Your scans';
   }, [analysisId, history]);
@@ -1214,6 +1217,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       setAnalysisId(id);
       setAnalysis(nextAnalysis);
 
+      setNewScanMode(false);
+
       // Save analysis history (local)
       const nextHistory: HistoryItem[] = [
         { id, createdAt: new Date().toISOString(), analysis: nextAnalysis },
@@ -1294,7 +1299,16 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     setChatListOpen(false);
     setChatListQuery('');
     Keyboard.dismiss();
-    setTimeout(() => { void choosePhoto('camera'); }, 0);
+
+    // Immediately switch UI to a fresh, blank chat.
+    setComposer('');
+    setAnalysisId(null);
+    setAnalysis(null);
+    setNewScanMode(true);
+
+    setTimeout(() => {
+      void choosePhoto('camera');
+    }, 0);
   };
 
   const selectChat = (item: HistoryItem) => {
@@ -1302,6 +1316,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     if (!id) return;
     setAnalysisId(id);
     setAnalysis(item?.analysis ?? null);
+    setNewScanMode(false);
     setChatListOpen(false);
   };
 
@@ -1437,16 +1452,18 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
     const existingClients = Array.isArray(catalog?.clients) ? catalog.clients : [];
 
-    // Next "Scan N" label
+    // Default to "Untitled scan" (with numbering if needed)
+    const baseName = 'Untitled scan';
     let max = 0;
     existingClients.forEach((c: any) => {
       const name = String(c?.displayName || '').trim();
-      const m = /^scan\s+(\d+)$/i.exec(name);
+      const m = /^untitled\s+scan(?:\s+(\d+))?$/i.exec(name);
       if (!m) return;
-      const n = Number(m[1]);
+      const n = m[1] ? Number(m[1]) : 1;
       if (Number.isFinite(n) && n > max) max = n;
     });
-    const scanLabel = `Scan ${max + 1}`;
+    const nextN = max + 1;
+    const scanLabel = nextN === 1 ? baseName : `${baseName} ${nextN}`;
 
     const now = Date.now();
     const uid = (prefix: string) => `${prefix}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1664,7 +1681,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText} numberOfLines={1}>Recommend items from kit</Text>
+                      <Text style={styles.recommendBtnText}>Recommend items from kit</Text>
                     </TouchableOpacity>
                   ) : null}
 
@@ -1678,7 +1695,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText} numberOfLines={1}>Recommend products</Text>
+                      <Text style={styles.recommendBtnText}>Recommend products</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
@@ -1912,24 +1929,24 @@ const styles = StyleSheet.create({
   recommendRow: {
     maxWidth: '92%',
     alignSelf: 'flex-start',
-    flexDirection: 'column',
+    flexDirection: 'row',
     gap: 10,
     marginTop: 2,
   },
   recommendBtn: {
-    width: '100%',
+    flex: 1,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#e5e7eb',
     backgroundColor: '#ffffff',
     paddingVertical: 10,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
   recommendBtnText: {
     color: '#111827',
-    fontWeight: '400',
+    fontWeight: '500',
     fontSize: 13,
   },
   kitSaveRow: {
@@ -1954,7 +1971,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   loadingBubble: {
-    flexDirection: 'column',
+    flexDirection: 'row',
     alignItems: 'center',
   },
 
@@ -2019,7 +2036,7 @@ const styles = StyleSheet.create({
   },
   chatListTitle: {
     fontSize: 16,
-    fontWeight: '400',
+    fontWeight: '500',
     color: '#111827',
   },
   chatListClose: {
@@ -2065,7 +2082,7 @@ const styles = StyleSheet.create({
   },
   chatListItemTitle: {
     color: '#111827',
-    fontWeight: '400',
+    fontWeight: '500',
     marginBottom: 2,
   },
   chatListItemSub: {
@@ -2091,7 +2108,7 @@ const styles = StyleSheet.create({
   },
   chatListEmptyText: {
     color: '#111827',
-    fontWeight: '400',
+    fontWeight: '500',
     marginBottom: 6,
   },
   chatListEmptySub: {

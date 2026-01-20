@@ -65,11 +65,10 @@ type Undertone = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm' |
 
 const EVENT_TYPE_OPTIONS = [
   'Wedding',
-  'Special occasion',
   'Photoshoot',
   'Fashion & editorial',
   'TV',
-  'Corporate',
+  'Other',
 ] as const;
 
 type EventType = (typeof EVENT_TYPE_OPTIONS)[number];
@@ -317,8 +316,14 @@ function normalizeData(input: any): ClientsData {
         const rawEventType = typeof (c as any)?.eventType === 'string' ? String((c as any).eventType).trim() : '';
         let eventType: EventType | '' = '';
         if (rawEventType) {
-          const match = EVENT_TYPE_OPTIONS.find((opt) => opt.toLowerCase() === rawEventType.toLowerCase());
-          eventType = (match as any) || '';
+          const key = rawEventType.toLowerCase();
+          // Migrate legacy event types to new options.
+          if (key === 'corporate' || key === 'special occasion' || key === 'special_occasion' || key === 'special-occasion') {
+            eventType = 'Other';
+          } else {
+            const match = EVENT_TYPE_OPTIONS.find((opt) => opt.toLowerCase() === key);
+            eventType = (match as any) || '';
+          }
         }
 
         const createdAt = typeof c.createdAt === 'number' ? c.createdAt : Date.now();
@@ -386,7 +391,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
   const [kitlogCategories, setKitlogCategories] = useState<string[]>(DEFAULT_KITLOG_CATEGORIES);
   const [newProductCategory, setNewProductCategory] = useState<PlanCategory>(FALLBACK_CATEGORY_NAME);
   const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
-  const [eventTypePickerOpen, setEventTypePickerOpen] = useState(false);
+  const [eventTypeMenuOpen, setEventTypeMenuOpen] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const tabBarHeight = useBottomTabBarHeight();
 
@@ -637,7 +642,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
   }
 
   function closeClient() {
-    setEventTypePickerOpen(false);
+    setEventTypeMenuOpen(false);
     setCategoryPickerOpen(false);
     if (!draft) return;
     const cleaned: ClientRecord = {
@@ -740,6 +745,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
 
   async function openCategoryPicker() {
     Keyboard.dismiss();
+    setEventTypeMenuOpen(false);
     await refreshKitlogCategories();
     setCategoryPickerOpen(true);
   }
@@ -849,7 +855,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                     </View>
                     <View style={styles.smallChip}>
                       <Text style={styles.smallChipText}>{planLabel}</Text>
-                    </View>
+                    </ScrollView>
                   </View>
                 </TouchableOpacity>
               );
@@ -964,7 +970,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                       activeOpacity={0.9}
                       onPress={() => {
                         Keyboard.dismiss();
-                        setEventTypePickerOpen(true);
+                        setEventTypeMenuOpen((v) => !v);
                       }}
                       accessibilityRole="button"
                     >
@@ -982,6 +988,36 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                         <Ionicons name="chevron-down" size={14} color="#6b7280" style={{ marginLeft: 6 }} />
                       </View>
                     </TouchableOpacity>
+
+                    {eventTypeMenuOpen ? (
+                      <View style={styles.eventMenu}>
+                        {[('None' as const), ...EVENT_TYPE_OPTIONS].map((name, idx) => {
+                          const value = name === 'None' ? '' : name;
+                          const on = (draft?.eventType || '') === value;
+                          const isLast = idx === EVENT_TYPE_OPTIONS.length;
+                          return (
+                            <View key={String(name)}>
+                              <TouchableOpacity
+                                style={styles.eventMenuRow}
+                                activeOpacity={0.9}
+                                onPress={() => {
+                                  setDraft((prev) =>
+                                    prev ? { ...prev, eventType: value as any, updatedAt: Date.now() } : prev
+                                  );
+                                  setEventTypeMenuOpen(false);
+                                }}
+                                accessibilityRole="button"
+                              >
+                                <Text style={styles.eventMenuText}>{name}</Text>
+                                {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : <View style={{ width: 18 }} />}
+                              </TouchableOpacity>
+                              {!isLast ? <View style={styles.eventMenuDivider} /> : null}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    ) : null}
+
                     <TextInput
                       value={draft?.notes ?? ''}
                       onChangeText={(v) => setDraft((prev) => (prev ? { ...prev, notes: v, updatedAt: Date.now() } : prev))}
@@ -996,7 +1032,12 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                     <Text style={styles.sectionTitle}>Match</Text>
 
                     <Text style={styles.fieldLabel}>Undertone</Text>
-                    <View style={styles.pillRow}>
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      contentContainerStyle={styles.pillRow}
+                      keyboardShouldPersistTaps="handled"
+                    >
                       {(['cool', 'neutral-cool', 'neutral', 'neutral-warm', 'warm'] as Undertone[]).map((u) => {
                         const on = (draft?.undertone ?? 'unknown') === u;
                         return (
@@ -1010,10 +1051,15 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                           </TouchableOpacity>
                         );
                       })}
-                    </View>
+                    </ScrollView>
 
                     <Text style={[styles.fieldLabel, { marginTop: 10 }]}>Season</Text>
-                    <View style={styles.pillRow}>
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      contentContainerStyle={styles.pillRow}
+                      keyboardShouldPersistTaps="handled"
+                    >
                       {(['spring', 'summer', 'autumn', 'winter'] as Season4[]).map((s) => {
                         const on = (draft?.season ?? null) === s;
                         return (
@@ -1027,7 +1073,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                           </TouchableOpacity>
                         );
                       })}
-                    </View>
+                    </ScrollView>
                   </View>
 
                   <View style={styles.editorCard}>
@@ -1147,65 +1193,6 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                             style={styles.sheetCancel}
                             activeOpacity={0.9}
                             onPress={() => setCategoryPickerOpen(false)}
-                            accessibilityRole="button"
-                          >
-                            <Text style={styles.sheetCancelText}>Cancel</Text>
-                          </TouchableOpacity>
-                        </View>
-                      </TouchableWithoutFeedback>
-                    </View>
-                  </TouchableWithoutFeedback>
-                </Modal>
-
-                {/* Event type picker */}
-                <Modal
-                  visible={eventTypePickerOpen}
-                  transparent
-                  animationType="fade"
-                  onRequestClose={() => setEventTypePickerOpen(false)}
-                >
-                  <TouchableWithoutFeedback onPress={() => setEventTypePickerOpen(false)}>
-                    <View style={styles.sheetBackdrop}>
-                      <TouchableWithoutFeedback onPress={() => {}}>
-                        <View style={styles.sheetContainer}>
-                          <Text style={styles.sheetTitle}>Event type</Text>
-
-                          <View style={styles.sheetList}>
-                            <ScrollView
-                              style={styles.sheetScroll}
-                              showsVerticalScrollIndicator
-                              bounces={false}
-                              keyboardShouldPersistTaps="handled"
-                            >
-                              {[('None' as const), ...EVENT_TYPE_OPTIONS].map((name, idx) => {
-                                const value = name === 'None' ? '' : name;
-                                const on = (draft?.eventType || '') === value;
-                                const isLast = idx === EVENT_TYPE_OPTIONS.length;
-                                return (
-                                  <View key={String(name)}>
-                                    <TouchableOpacity
-                                      style={styles.sheetRow}
-                                      activeOpacity={0.9}
-                                      onPress={() => {
-                                        setDraft((prev) => (prev ? { ...prev, eventType: value as any, updatedAt: Date.now() } : prev));
-                                        setEventTypePickerOpen(false);
-                                      }}
-                                      accessibilityRole="button"
-                                    >
-                                      <Text style={styles.sheetRowText}>{name}</Text>
-                                      {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : null}
-                                    </TouchableOpacity>
-                                    {!isLast ? <View style={styles.sheetDivider} /> : null}
-                                  </View>
-                                );
-                              })}
-                            </ScrollView>
-                          </View>
-
-                          <TouchableOpacity
-                            style={styles.sheetCancel}
-                            activeOpacity={0.9}
-                            onPress={() => setEventTypePickerOpen(false)}
                             accessibilityRole="button"
                           >
                             <Text style={styles.sheetCancelText}>Cancel</Text>
@@ -1505,6 +1492,33 @@ const styles = StyleSheet.create({
     color: '#9ca3af',
     fontWeight: '400',
   },
+
+  // Inline event type menu
+  eventMenu: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 12,
+    overflow: 'hidden',
+    backgroundColor: '#ffffff',
+  },
+  eventMenuRow: {
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  eventMenuText: {
+    fontSize: 13,
+    color: '#111111',
+    fontWeight: '500',
+    flexShrink: 1,
+  },
+  eventMenuDivider: {
+    height: 1,
+    backgroundColor: '#f3f4f6',
+  },
   notesInput: {
     marginTop: 10,
     fontSize: 13,
@@ -1521,23 +1535,23 @@ const styles = StyleSheet.create({
   },
   pillRow: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
+    flexWrap: 'nowrap',
+    paddingBottom: 2,
   },
   pillBtn: {
     borderWidth: 1,
     borderColor: '#e5e7eb',
     borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
     marginRight: 8,
-    marginBottom: 8,
     backgroundColor: '#ffffff',
   },
   pillBtnOn: {
     borderColor: '#111111',
   },
   pillBtnText: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '500',
     color: '#111111',
   },
