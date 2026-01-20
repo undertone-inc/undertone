@@ -626,10 +626,10 @@ function buildBuyRecommendationsText(opts: {
   const buy = BUY_RECS[u] || BUY_RECS.neutral;
 
   const lines: string[] = [];
-  lines.push('Recommended products:');
+  lines.push('Recommended products (suggested colors):');
 
   const addBlock = (label: string, arr: string[], colorLabel: string) => {
-    const list = Array.isArray(arr) ? arr.slice(0, 1) : []; // keep it concise
+    const list = Array.isArray(arr) ? arr.slice(0, 2) : [];
     if (!list.length) return;
     lines.push('');
     lines.push(`${label}:`);
@@ -639,11 +639,11 @@ function buildBuyRecommendationsText(opts: {
   addBlock(
     'Foundation',
     buy.base,
-    `Color: ${foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })}`
+    `Suggested color: ${foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })}`
   );
-  addBlock('Cheeks', buy.cheeks, `Color: ${colorHint('cheeks', u, season)}`);
-  addBlock('Eyes', buy.eyes, `Color: ${colorHint('eyes', u, season)}`);
-  addBlock('Lips', buy.lips, `Color: ${colorHint('lips', u, season)}`);
+  addBlock('Cheeks', buy.cheeks, `Suggested color: ${colorHint('cheeks', u, season)}`);
+  addBlock('Eyes', buy.eyes, `Suggested color: ${colorHint('eyes', u, season)}`);
+  addBlock('Lips', buy.lips, `Suggested color: ${colorHint('lips', u, season)}`);
 
   return lines.join('\n');
 }
@@ -770,8 +770,12 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [analysisId, setAnalysisId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<any | null>(null);
 
-  // When true, we intentionally keep the chat blank (don’t auto-restore last scan).
-  const [newScanMode, setNewScanMode] = useState(false);
+  // Keep the latest analysisId in a ref so focus refresh doesn't accidentally
+  // restore the previous scan while the user is starting a new one.
+  const analysisIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    analysisIdRef.current = analysisId;
+  }, [analysisId]);
 
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [chatStore, setChatStore] = useState<ChatStore>({});
@@ -881,7 +885,9 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       }
 
       // If we don't have an active analysis yet, restore the most recent.
-      if (alive && !analysisId && !newScanMode && loadedHistory.length) {
+      // Use the ref (not the closure) so we don't overwrite a user-initiated "new scan" draft.
+      const currentId = analysisIdRef.current;
+      if (alive && !currentId && loadedHistory.length) {
         const mostRecent = loadedHistory[0];
         if (mostRecent?.id) {
           setAnalysisId(String(mostRecent.id));
@@ -898,7 +904,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       if (typeof unsubscribe === 'function') unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [navigation, kitlogKey, catalogKey, historyKey, chatKey, analysisId, newScanMode]);
+  }, [navigation, kitlogKey, catalogKey, historyKey, chatKey]);
 
   useEffect(() => {
     // Auto-scroll when chat updates.
@@ -934,18 +940,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const upsertChatFor = async (id: string, messages: ChatMessage[]) => {
     const limited = messages.slice(-60);
-
-    // Important: avoid wiping other scans if this function runs with stale state.
-    // Always merge into the latest stored chat map.
-    let base: ChatStore = {};
-    try {
-      const stored = await getJson<ChatStore>(chatKey);
-      if (stored && typeof stored === 'object') base = stored as any;
-    } catch {
-      base = (chatStore || {}) as any;
-    }
-
-    const next: ChatStore = { ...(base || {}) };
+    const next: ChatStore = { ...(chatStore || {}) };
     next[id] = limited;
     await saveChatStore(next);
   };
@@ -964,7 +959,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   }, [activeChat]);
 
   const activeChatTitle = useMemo(() => {
-    if (!analysisId) return 'New scan';
+    if (!analysisId) return 'Your scans';
     const hit = history.find((h) => String(h?.id || '') === String(analysisId));
     return hit ? formatChatTitle(hit) : 'Your scans';
   }, [analysisId, history]);
@@ -1228,23 +1223,10 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       setAnalysisId(id);
       setAnalysis(nextAnalysis);
 
-      setNewScanMode(false);
-
       // Save analysis history (local)
-      // IMPORTANT: always merge with the latest stored history to avoid wiping older scans
-      // if this async flow runs with stale component state.
-      let baseHistory: HistoryItem[] = [];
-      try {
-        const stored = await getJson<HistoryItem[]>(historyKey);
-        baseHistory = Array.isArray(stored) ? stored : [];
-      } catch {
-        baseHistory = Array.isArray(history) ? history : [];
-      }
-
-      const createdAt = new Date().toISOString();
       const nextHistory: HistoryItem[] = [
-        { id, createdAt, analysis: nextAnalysis },
-        ...baseHistory.filter((h) => String(h?.id || '') !== String(id)),
+        { id, createdAt: new Date().toISOString(), analysis: nextAnalysis },
+        ...history,
       ].slice(0, 20);
       await saveHistory(nextHistory);
 
@@ -1322,11 +1304,15 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     setChatListQuery('');
     Keyboard.dismiss();
 
-    // Immediately switch UI to a fresh, blank chat.
-    setComposer('');
-    setAnalysisId(null);
+    // Show a blank chat immediately.
+    // We use a draft id so the focus refresh logic doesn't restore the last scan
+    // while the camera screen is returning (which would put the "Analyzing..." bubble
+    // under the previous chat).
+    const draftId = `draft_${makeId()}`;
+    analysisIdRef.current = draftId;
+    setAnalysisId(draftId);
     setAnalysis(null);
-    setNewScanMode(true);
+    setComposer('');
   };
 
   const selectChat = (item: HistoryItem) => {
@@ -1334,7 +1320,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     if (!id) return;
     setAnalysisId(id);
     setAnalysis(item?.analysis ?? null);
-    setNewScanMode(false);
     setChatListOpen(false);
   };
 
@@ -1397,8 +1382,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       return;
     }
     if (chatLoading) return;
-
     setChatLoading(true);
+
     try {
       // Prefer server-side recommendations so we can attach real retailer color names.
       let serverText = '';
@@ -1446,6 +1431,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
       const current = getChatFor(analysisId);
       await upsertChatFor(analysisId, [...current, assistantMsg]);
+    } catch (e: any) {
+      Alert.alert('Recommend products failed', String(e?.message || e));
     } finally {
       setChatLoading(false);
     }
@@ -1470,18 +1457,19 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
     const existingClients = Array.isArray(catalog?.clients) ? catalog.clients : [];
 
-    // Default to "Untitled scan" (with numbering if needed)
-    const baseName = 'Untitled scan';
-    let max = 0;
-    existingClients.forEach((c: any) => {
-      const name = String(c?.displayName || '').trim();
-      const m = /^untitled\s+scan(?:\s+(\d+))?$/i.exec(name);
-      if (!m) return;
-      const n = m[1] ? Number(m[1]) : 1;
-      if (Number.isFinite(n) && n > max) max = n;
-    });
-    const nextN = max + 1;
-    const scanLabel = nextN === 1 ? baseName : `${baseName} ${nextN}`;
+    // Default name: "Untitled scan" (auto-number if needed).
+    const existingNames = new Set(
+      existingClients
+        .map((c: any) => String(c?.displayName || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+
+    let scanLabel = 'Untitled scan';
+    if (existingNames.has(scanLabel.toLowerCase())) {
+      let i = 2;
+      while (existingNames.has(`untitled scan ${i}`)) i += 1;
+      scanLabel = `Untitled scan ${i}`;
+    }
 
     const now = Date.now();
     const uid = (prefix: string) => `${prefix}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
