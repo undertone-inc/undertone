@@ -626,10 +626,10 @@ function buildBuyRecommendationsText(opts: {
   const buy = BUY_RECS[u] || BUY_RECS.neutral;
 
   const lines: string[] = [];
-  lines.push('Recommended products (suggested colors):');
+  lines.push('Recommended products:');
 
   const addBlock = (label: string, arr: string[], colorLabel: string) => {
-    const list = Array.isArray(arr) ? arr.slice(0, 2) : [];
+    const list = Array.isArray(arr) ? arr.slice(0, 1) : [];
     if (!list.length) return;
     lines.push('');
     lines.push(`${label}:`);
@@ -639,11 +639,11 @@ function buildBuyRecommendationsText(opts: {
   addBlock(
     'Foundation',
     buy.base,
-    `Suggested color: ${foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })}`
+    `Color: ${foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })}`
   );
-  addBlock('Cheeks', buy.cheeks, `Suggested color: ${colorHint('cheeks', u, season)}`);
-  addBlock('Eyes', buy.eyes, `Suggested color: ${colorHint('eyes', u, season)}`);
-  addBlock('Lips', buy.lips, `Suggested color: ${colorHint('lips', u, season)}`);
+  addBlock('Cheeks', buy.cheeks, `Color: ${colorHint('cheeks', u, season)}`);
+  addBlock('Eyes', buy.eyes, `Color: ${colorHint('eyes', u, season)}`);
+  addBlock('Lips', buy.lips, `Color: ${colorHint('lips', u, season)}`);
 
   return lines.join('\n');
 }
@@ -777,7 +777,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [chatListQuery, setChatListQuery] = useState('');
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [chatLoading, setChatLoading] = useState(false);
-
 
   const [photoPicking, setPhotoPicking] = useState(false);
 
@@ -1367,7 +1366,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     if (chatLoading) return;
 
     setChatLoading(true);
-
     try {
       // Prefer server-side recommendations so we can attach real retailer color names.
       let serverText = '';
@@ -1415,8 +1413,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
       const current = getChatFor(analysisId);
       await upsertChatFor(analysisId, [...current, assistantMsg]);
-    } catch (e: any) {
-      Alert.alert('Recommend products failed', String(e?.message || e));
     } finally {
       setChatLoading(false);
     }
@@ -1668,7 +1664,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend items from kit</Text>
+                      <Text style={styles.recommendBtnText} numberOfLines={1}>Recommend items from kit</Text>
                     </TouchableOpacity>
                   ) : null}
 
@@ -1682,7 +1678,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend products</Text>
+                      <Text style={styles.recommendBtnText} numberOfLines={1}>Recommend products</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
@@ -1914,7 +1910,7 @@ const styles = StyleSheet.create({
     color: '#ffffff',
   },
   recommendRow: {
-    width: '92%',
+    maxWidth: '92%',
     alignSelf: 'flex-start',
     flexDirection: 'column',
     gap: 10,
@@ -1926,8 +1922,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e5e7eb',
     backgroundColor: '#ffffff',
-    paddingVertical: 11,
-    paddingHorizontal: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1958,7 +1954,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   loadingBubble: {
-    flexDirection: 'row',
+    flexDirection: 'column',
     alignItems: 'center',
   },
 
@@ -2023,7 +2019,7 @@ const styles = StyleSheet.create({
   },
   chatListTitle: {
     fontSize: 16,
-    fontWeight: '500',
+    fontWeight: '400',
     color: '#111827',
   },
   chatListClose: {
@@ -2069,7 +2065,7 @@ const styles = StyleSheet.create({
   },
   chatListItemTitle: {
     color: '#111827',
-    fontWeight: '500',
+    fontWeight: '400',
     marginBottom: 2,
   },
   chatListItemSub: {
@@ -2095,7 +2091,7 @@ const styles = StyleSheet.create({
   },
   chatListEmptyText: {
     color: '#111827',
-    fontWeight: '500',
+    fontWeight: '400',
     marginBottom: 6,
   },
   chatListEmptySub: {
