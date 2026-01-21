@@ -928,7 +928,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                 <View style={styles.modalHeader}>
                   <TouchableOpacity style={styles.modalBack} onPress={closeClient} accessibilityRole="button">
                     <Ionicons name="chevron-back" size={20} color="#111111" />
-                    <Text style={styles.modalBackText}>Clients</Text>
+                    <Text style={styles.modalBackText}>List</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity style={styles.modalDelete} onPress={deleteClient} accessibilityRole="button">
