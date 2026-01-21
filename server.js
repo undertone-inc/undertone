@@ -50,6 +50,13 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
 const RESET_TTL_MINUTES = Number(process.env.RESET_TTL_MINUTES || 30);
 
+const RESET_DEBUG_RETURN_TOKEN = String(process.env.RESET_DEBUG_RETURN_TOKEN || "").toLowerCase() === "true";
+
+// Password reset email (Resend). Standard flow: email the reset code; do not return it in production.
+const APP_NAME = String(process.env.APP_NAME || "Undertone").trim();
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || "").trim();
+const EMAIL_FROM = String(process.env.EMAIL_FROM || "").trim();
+
 // OpenAI (server-side only)
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4o").trim();
@@ -277,6 +284,62 @@ function publicUserRow(row) {
 function hashToken(token) {
   return crypto.createHash("sha256").update(String(token || "")).digest("hex");
 }
+
+async function sendEmailResend({ to, subject, html, text }) {
+  if (!RESEND_API_KEY) throw new Error("RESEND_API_KEY is not set");
+  if (!EMAIL_FROM) throw new Error("EMAIL_FROM is not set");
+
+  const payload = {
+    from: EMAIL_FROM,
+    to: Array.isArray(to) ? to : [String(to)],
+    subject: String(subject || ""),
+    ...(html ? { html: String(html) } : {}),
+    ...(text ? { text: String(text) } : {}),
+  };
+
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Resend send failed (${resp.status}): ${body.slice(0, 500)}`);
+  }
+
+  return resp.json().catch(() => ({}));
+}
+
+async function sendPasswordResetEmail(toEmail, resetToken, ttlMinutes) {
+  const code = String(resetToken || "").trim();
+  const minutes = Number.isFinite(Number(ttlMinutes)) ? Number(ttlMinutes) : 30;
+
+  const subject = `${APP_NAME} password reset code`;
+  const text =
+    `Your ${APP_NAME} password reset code is:\n\n` +
+    `${code}\n\n` +
+    `This code expires in ${minutes} minutes.\n\n` +
+    `If you didn't request this, you can ignore this email.`;
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; line-height: 1.4;">
+      <h2 style="margin: 0 0 12px;">${APP_NAME} password reset</h2>
+      <p style="margin: 0 0 12px;">Use this code to reset your password:</p>
+      <div style="font-size: 18px; font-weight: 700; letter-spacing: 0.5px; padding: 12px 14px; border: 1px solid #ddd; border-radius: 10px; display: inline-block;">
+        ${code}
+      </div>
+      <p style="margin: 12px 0 0;">This code expires in ${minutes} minutes.</p>
+      <p style="margin: 12px 0 0; color: #555;">If you didn't request this, you can ignore this email.</p>
+    </div>
+  `;
+
+  return sendEmailResend({ to: toEmail, subject, html, text });
+}
+
 
 function getBearerToken(req) {
   const h = String(req.headers?.authorization || "");
@@ -683,17 +746,34 @@ app.post("/request-password-reset", async (req, res) => {
     const ttlMinutes = Number.isFinite(RESET_TTL_MINUTES) && RESET_TTL_MINUTES > 0 ? RESET_TTL_MINUTES : 30;
     const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
 
-    await pool.query(
-      "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-      [user.id, tokenHash, expiresAt]
-    );
+    // Optional: invalidate any previous unused tokens for this user to reduce confusion.
+// (Keeps behavior "standard": only the most recent code works.)
+await pool.query("DELETE FROM password_resets WHERE user_id = $1 AND used_at IS NULL", [user.id]);
 
-    // In production, deliver resetToken out-of-band (email/SMS). We do NOT return it.
-    if (NODE_ENV !== "production") {
-      return res.json({ ok: true, resetToken });
-    }
+await pool.query(
+  "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+  [user.id, tokenHash, expiresAt]
+);
 
-    return res.json({ ok: true });
+// Standard behavior: deliver resetToken out-of-band (email). Do NOT return it in production.
+if (RESEND_API_KEY && EMAIL_FROM) {
+  try {
+    await sendPasswordResetEmail(user.email, resetToken, ttlMinutes);
+  } catch (err) {
+    console.error("password reset email send failed:", err);
+  }
+} else if (NODE_ENV === "production") {
+  console.warn(
+    "Password reset requested but RESEND_API_KEY/EMAIL_FROM not configured; no email was sent."
+  );
+}
+
+// Dev-only: allow returning the token for local testing (never enable in production).
+if (NODE_ENV !== "production" && RESET_DEBUG_RETURN_TOKEN) {
+  return res.json({ ok: true, resetToken });
+}
+
+return res.json({ ok: true });
   } catch (e) {
     console.error("request-password-reset error:", e);
     // Still no enumeration.
