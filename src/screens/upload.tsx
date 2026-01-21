@@ -633,7 +633,10 @@ function buildBuyRecommendationsText(opts: {
     if (!list.length) return;
     lines.push('');
     lines.push(`${label}:`);
-    list.forEach((x) => lines.push(`- ${x} — ${colorLabel}`));
+    list.forEach((x) => {
+      lines.push(`- ${x}`);
+      if (colorLabel) lines.push(`- ${colorLabel}`);
+    });
   };
 
   addBlock(
@@ -646,6 +649,50 @@ function buildBuyRecommendationsText(opts: {
   addBlock('Lips', buy.lips, `Suggested color: ${colorHint('lips', u, season)}`);
 
   return lines.join('\n');
+}
+
+function formatBuyRecTextForChat(text: string): string {
+  const src = String(text || '').replace(/\r\n/g, '\n');
+  if (!src.trim()) return '';
+
+  const lines = src.split('\n');
+  const out: string[] = [];
+
+  for (const line of lines) {
+    const raw = String(line || '');
+    if (!raw.startsWith('- ')) {
+      out.push(raw);
+      continue;
+    }
+
+    const body = raw.slice(2);
+    const seps = [' — ', ' – ', ' - '];
+    let split = false;
+
+    for (const sep of seps) {
+      const idx = body.indexOf(sep);
+      if (idx <= 0) continue;
+
+      const left = body.slice(0, idx).trim();
+      const right0 = body.slice(idx + sep.length).trim();
+      if (!left || !right0) continue;
+
+      const rLower = right0.toLowerCase();
+      const right =
+        rLower.includes('color') || rLower.includes('shade') || rLower.includes('suggested')
+          ? right0
+          : `Color: ${right0}`;
+
+      out.push(`- ${left}`);
+      out.push(`- ${right}`);
+      split = true;
+      break;
+    }
+
+    if (!split) out.push(raw);
+  }
+
+  return out.join('\n');
 }
 
 function formatAnalysisToText(analysis: any): string {
@@ -770,11 +817,16 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [analysisId, setAnalysisId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<any | null>(null);
 
-  // Keep the latest analysisId in a ref so focus refresh doesn't accidentally
-  // restore the previous scan while the user is starting a new one.
-  const analysisIdRef = useRef<string | null>(null);
+  // A "draft" thread is created when the user taps the top “Scan” chip.
+  // It keeps the UI on a fresh, blank chat while the camera is opened and
+  // before the server returns an analysisId.
+  const draftThreadIdRef = useRef<string | null>(null);
+
+  // Keep a ref to the current active thread id so async flows (camera return)
+  // can reliably attach analysis to the correct thread.
+  const activeThreadIdRef = useRef<string | null>(null);
   useEffect(() => {
-    analysisIdRef.current = analysisId;
+    activeThreadIdRef.current = analysisId;
   }, [analysisId]);
 
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -807,7 +859,12 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     }
 
     if (!analysisLoading && !chatLoading) {
-      void analyzePhoto({ ...captured, uri } as PickedPhoto);
+      // Always prefer attaching the captured photo to the current *draft* thread
+      // (created by the top “Scan” chip). This prevents the “Analyzing…” bubble
+      // from ever jumping back into a previous, already-saved chat.
+      void analyzePhoto({ ...captured, uri } as PickedPhoto, {
+        targetThreadId: draftThreadIdRef.current,
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [(route as any)?.params?.capturedPhoto]);
@@ -884,13 +941,20 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         if (alive) setChatStore({});
       }
 
-      // If we don't have an active analysis yet, restore the most recent.
-      // Use the ref (not the closure) so we don't overwrite a user-initiated "new scan" draft.
-      const currentId = analysisIdRef.current;
-      if (alive && !currentId && loadedHistory.length) {
+      // If we don't have an active analysis thread yet (including a draft thread),
+      // restore the most recent from history.
+      //
+      // IMPORTANT: do NOT rely on `analysisId` here — this effect intentionally does
+      // not depend on it, so it can be stale. Use refs for the current thread instead.
+      const currentThread = String(activeThreadIdRef.current || '').trim();
+      const currentDraft = String(draftThreadIdRef.current || '').trim();
+      if (alive && !currentThread && !currentDraft && loadedHistory.length) {
         const mostRecent = loadedHistory[0];
         if (mostRecent?.id) {
-          setAnalysisId(String(mostRecent.id));
+          const id = String(mostRecent.id);
+          activeThreadIdRef.current = id;
+          draftThreadIdRef.current = null;
+          setAnalysisId(id);
           setAnalysis(mostRecent.analysis ?? null);
         }
       }
@@ -932,6 +996,50 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     }
   };
 
+  const readHistoryFromStorage = async (): Promise<HistoryItem[]> => {
+    try {
+      const stored = await getJson<HistoryItem[]>(historyKey);
+      return Array.isArray(stored) ? stored : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const readChatStoreFromStorage = async (): Promise<ChatStore> => {
+    try {
+      const stored = await getJson<ChatStore>(chatKey);
+      if (stored && typeof stored === 'object') return stored as any;
+      return {};
+    } catch {
+      return {};
+    }
+  };
+
+  const ensureHistoryEntry = async (id: string, nextAnalysis: any, createdAt?: string) => {
+    const idStr = String(id || '').trim();
+    if (!idStr) return;
+
+    const base = await readHistoryFromStorage();
+    const idx = base.findIndex((h) => String(h?.id || '') === idStr);
+    const ts = String(createdAt || '').trim() || new Date().toISOString();
+
+    let next: HistoryItem[] = [];
+    if (idx >= 0) {
+      const existing = base[idx];
+      const merged: HistoryItem = {
+        id: idStr,
+        createdAt: String(existing?.createdAt || ts),
+        analysis: nextAnalysis ?? existing?.analysis ?? null,
+      };
+
+      next = [merged, ...base.filter((_, i) => i !== idx)].slice(0, 20);
+    } else {
+      next = [{ id: idStr, createdAt: ts, analysis: nextAnalysis ?? null }, ...base].slice(0, 20);
+    }
+
+    await saveHistory(next);
+  };
+
   const getChatFor = (id: string | null): ChatMessage[] => {
     if (!id) return [];
     const arr = (chatStore as any)?.[id];
@@ -940,9 +1048,13 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const upsertChatFor = async (id: string, messages: ChatMessage[]) => {
     const limited = messages.slice(-60);
-    const next: ChatStore = { ...(chatStore || {}) };
-    next[id] = limited;
-    await saveChatStore(next);
+
+    // Merge with what’s on-disk so a slow initial load can’t overwrite prior chats.
+    const fromDisk = await readChatStoreFromStorage();
+    const merged: ChatStore = { ...(fromDisk || {}), ...(chatStore || {}) };
+    merged[id] = limited;
+
+    await saveChatStore(merged);
   };
 
   const activeChat = getChatFor(analysisId);
@@ -1082,7 +1194,12 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     };
   };
 
-  const analyzePhoto = async (picked: PickedPhoto) => {
+  const analyzePhoto = async (
+    picked: PickedPhoto,
+    opts?: {
+      targetThreadId?: string | null;
+    }
+  ) => {
     if (!tokenTrimmed) {
       Alert.alert('Not logged in', 'Please log in again.');
       return;
@@ -1090,6 +1207,52 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
     setComposer('');
     Keyboard.dismiss();
+
+    // Decide which chat thread should receive this photo's analysis.
+    //
+    // If the user already opened a fresh blank chat using the top “Scan” chip,
+    // we keep that draft thread active while we show “Analyzing…”. Otherwise,
+    // a new photo should NOT overwrite the currently-open scan thread — so we
+    // create a new draft thread automatically.
+    const requested = String(opts?.targetThreadId ?? '').trim();
+    const currentId = String(analysisId ?? '').trim();
+    const currentDraft = String(draftThreadIdRef.current ?? '').trim();
+    const requestedIsDraft = !!requested && requested === currentDraft;
+    const currentIsDraft = !!currentId && currentId === currentDraft;
+
+    let draftThreadId: string;
+
+    if (requestedIsDraft) {
+      draftThreadId = requested;
+    } else if (currentIsDraft) {
+      draftThreadId = currentId;
+    } else {
+      // Best-effort: make sure the current scan exists in history before switching away.
+      if (currentId && analysis) {
+        try {
+          await ensureHistoryEntry(currentId, analysis);
+        } catch {
+          // ignore
+        }
+      }
+
+      draftThreadId = makeId();
+      draftThreadIdRef.current = draftThreadId;
+      activeThreadIdRef.current = draftThreadId;
+      lastCapturedUriRef.current = null;
+
+      setAnalysisId(draftThreadId);
+    }
+
+    // Make sure downstream async flows always attach to this draft thread.
+    activeThreadIdRef.current = draftThreadId;
+    draftThreadIdRef.current = draftThreadId;
+
+    // Ensure the UI is on the draft thread while loading.
+    if (String(analysisId ?? '').trim() !== draftThreadId) {
+      setAnalysisId(draftThreadId);
+    }
+    setAnalysis(null);
 
     setAnalysisLoading(true);
 
@@ -1217,38 +1380,43 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         throw new Error(msg);
       }
 
-      const id = String(data?.analysisId || makeId());
+      const serverId = String(data?.analysisId || makeId());
       const nextAnalysis = data?.analysisStable ?? data?.analysis ?? null;
+      const createdAtIso = new Date().toISOString();
 
-      setAnalysisId(id);
+      // We now have a stable server analysisId, so leave draft-mode.
+      draftThreadIdRef.current = null;
+      activeThreadIdRef.current = serverId;
+
+      setAnalysisId(serverId);
       setAnalysis(nextAnalysis);
 
-      // Save analysis history (local)
+      // Save analysis history (local) using what's currently on-disk as base.
+      const baseHistory = await readHistoryFromStorage();
       const nextHistory: HistoryItem[] = [
-        { id, createdAt: new Date().toISOString(), analysis: nextAnalysis },
-        ...history,
+        { id: serverId, createdAt: createdAtIso, analysis: nextAnalysis },
+        ...baseHistory.filter((h) => String(h?.id || '') !== String(serverId)),
       ].slice(0, 20);
       await saveHistory(nextHistory);
 
-
       // Seed chat with: "photo uploaded" + analysis summary.
-	  const seedMsgs: ChatMessage[] = [
-	    {
-	      id: makeId(),
-	      role: 'user',
-	      text: 'Uploaded face photo.',
-	      createdAt: new Date().toISOString(),
-	    },
-	    {
-	      id: makeId(),
-	      role: 'assistant',
-	      kind: 'analysis',
-	      text: formatAnalysisToText(nextAnalysis),
-	      createdAt: new Date().toISOString(),
-	    },
-	  ];
+      const seedMsgs: ChatMessage[] = [
+        {
+          id: makeId(),
+          role: 'user',
+          text: 'Uploaded face photo.',
+          createdAt: createdAtIso,
+        },
+        {
+          id: makeId(),
+          role: 'assistant',
+          kind: 'analysis',
+          text: formatAnalysisToText(nextAnalysis),
+          createdAt: createdAtIso,
+        },
+      ];
 
-	  await upsertChatFor(id, seedMsgs);
+      await upsertChatFor(serverId, seedMsgs);
     } catch (e: any) {
       Alert.alert('Analysis failed', String(e?.message || e));
     } finally {
@@ -1299,18 +1467,30 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     setChatListOpen(true);
   };
 
-  const startNewChat = () => {
+  const startNewChat = async () => {
     setChatListOpen(false);
     setChatListQuery('');
     Keyboard.dismiss();
 
-    // Show a blank chat immediately.
-    // We use a draft id so the focus refresh logic doesn't restore the last scan
-    // while the camera screen is returning (which would put the "Analyzing..." bubble
-    // under the previous chat).
-    const draftId = `draft_${makeId()}`;
-    analysisIdRef.current = draftId;
-    setAnalysisId(draftId);
+    const currentId = String(analysisId || '').trim();
+    const isDraft = !!currentId && draftThreadIdRef.current === currentId;
+
+    // Ensure the currently-open chat is present in history so it shows in “Your scans”.
+    if (currentId && analysis && !isDraft) {
+      try {
+        await ensureHistoryEntry(currentId, analysis);
+      } catch {
+        // ignore
+      }
+    }
+
+    // Open a fresh blank thread (no camera here — camera is triggered from the bottom icon).
+    const nextDraftId = makeId();
+    draftThreadIdRef.current = nextDraftId;
+    activeThreadIdRef.current = nextDraftId;
+    lastCapturedUriRef.current = null;
+
+    setAnalysisId(nextDraftId);
     setAnalysis(null);
     setComposer('');
   };
@@ -1318,6 +1498,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const selectChat = (item: HistoryItem) => {
     const id = String(item?.id || '').trim();
     if (!id) return;
+    draftThreadIdRef.current = null;
+    activeThreadIdRef.current = id;
     setAnalysisId(id);
     setAnalysis(item?.analysis ?? null);
     setChatListOpen(false);
@@ -1330,12 +1512,14 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         text: 'Delete',
         style: 'destructive',
         onPress: async () => {
-          const nextHistory = history.filter((h) => String(h?.id) !== String(id));
+          const baseHistory = await readHistoryFromStorage();
+          const nextHistory = baseHistory.filter((h) => String(h?.id) !== String(id));
           await saveHistory(nextHistory);
 
-          const nextStore: ChatStore = { ...(chatStore || {}) };
-          delete (nextStore as any)[id];
-          await saveChatStore(nextStore);
+          const fromDisk = await readChatStoreFromStorage();
+          const merged: ChatStore = { ...(fromDisk || {}), ...(chatStore || {}) };
+          delete (merged as any)[id];
+          await saveChatStore(merged);
 
           if (String(analysisId) === String(id)) {
             const fallback = nextHistory[0] || null;
@@ -1382,6 +1566,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       return;
     }
     if (chatLoading) return;
+
     setChatLoading(true);
 
     try {
@@ -1418,8 +1603,10 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         toneDepthRaw: (analysis as any)?.tone_depth,
       });
 
-      const t = String(serverText || fallback || '').trim();
-      if (!t) return;
+      const tRaw = String(serverText || fallback || '').trim();
+      if (!tRaw) return;
+
+      const t = formatBuyRecTextForChat(tRaw);
 
       const assistantMsg: ChatMessage = {
         id: makeId(),
@@ -1457,19 +1644,16 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
     const existingClients = Array.isArray(catalog?.clients) ? catalog.clients : [];
 
-    // Default name: "Untitled scan" (auto-number if needed).
-    const existingNames = new Set(
-      existingClients
-        .map((c: any) => String(c?.displayName || '').trim().toLowerCase())
-        .filter(Boolean)
-    );
-
-    let scanLabel = 'Untitled scan';
-    if (existingNames.has(scanLabel.toLowerCase())) {
-      let i = 2;
-      while (existingNames.has(`untitled scan ${i}`)) i += 1;
-      scanLabel = `Untitled scan ${i}`;
-    }
+    // Next "Scan N" label
+    let max = 0;
+    existingClients.forEach((c: any) => {
+      const name = String(c?.displayName || '').trim();
+      const m = /^scan\s+(\d+)$/i.exec(name);
+      if (!m) return;
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > max) max = n;
+    });
+    const scanLabel = `Scan ${max + 1}`;
 
     const now = Date.now();
     const uid = (prefix: string) => `${prefix}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1525,8 +1709,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     const msg = String(text || '').trim();
     if (!msg) return;
 
-    if (!analysisId) {
-      Alert.alert('Scan a face photo first', 'Tap “Scan” to upload or take a face photo.');
+    if (!analysisId || !analysis) {
+      Alert.alert('Scan a face photo first', 'Take a face photo in this chat before messaging.');
       return;
     }
     if (!tokenTrimmed) {
@@ -1687,9 +1871,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText} numberOfLines={1}>
-                        Recommend items from kit
-                      </Text>
+                      <Text style={styles.recommendBtnText}>Recommend items from kit</Text>
                     </TouchableOpacity>
                   ) : null}
 
@@ -1703,9 +1885,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText} numberOfLines={1}>
-                        Recommend products
-                      </Text>
+                      <Text style={styles.recommendBtnText}>Recommend products</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
@@ -1900,7 +2080,7 @@ const styles = StyleSheet.create({
   uploadChipText: {
     color: '#111827',
     fontSize: 13,
-    fontWeight: '600',
+    fontWeight: '500',
   },
 
   // Chat

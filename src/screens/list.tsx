@@ -20,6 +20,7 @@ import Constants from 'expo-constants';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { DOC_KEYS, getJson, getString, makeScopedKey, setString } from '../localstore';
+import { PlanTier, PLAN_LIMITS } from '../api';
 import { SafeAreaView, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
 
 const STORAGE_KEY = DOC_KEYS.catalog;
@@ -112,6 +113,7 @@ type ClientsScreenProps = {
   route: any;
   email?: string | null;
   userId?: string | number | null;
+  planTier?: PlanTier;
 };
 
 function uid(prefix: string) {
@@ -372,7 +374,7 @@ function normalizeData(input: any): ClientsData {
   }
 }
 
-const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) => {
+const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTier = 'free' }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const catalogKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
@@ -583,7 +585,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
 
     return [
       ...upcomingVisible.map((c) => ({ kind: 'client' as const, key: `u_${c.id}`, client: c })),
-      { kind: 'sectionHeader' as const, key: 'hdr_clients', title: 'Clients', meta: clientsMeta },
+      { kind: 'sectionHeader' as const, key: 'hdr_clients', title: 'List', meta: clientsMeta },
       ...nonUpcomingVisible.map((c) => ({ kind: 'client' as const, key: `c_${c.id}`, client: c })),
     ];
   }, [hasUpcoming, upcomingVisible, nonUpcomingVisible, clientsMeta]);
@@ -597,6 +599,36 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
   function addClientFromBar() {
     const name = newClientText.trim();
     Keyboard.dismiss();
+
+    const limit = PLAN_LIMITS[planTier].clients;
+    const used = Array.isArray(data.clients) ? data.clients.length : 0;
+    if (limit !== Infinity && used >= limit) {
+      const isPro = planTier === 'pro';
+      const msg = isPro
+        ? `You’ve reached the Pro plan limit of ${limit.toLocaleString()} clients.`
+        : `Free plan allows up to ${limit.toLocaleString()} clients. Upgrade to Pro to add more.`;
+
+      Alert.alert(
+        'Client limit reached',
+        msg,
+        isPro
+          ? [{ text: 'OK' }]
+          : [
+              { text: 'Not now', style: 'cancel' },
+              {
+                text: 'Upgrade',
+                onPress: () => {
+                  try {
+                    navigation.navigate('Account', { openUpgrade: true });
+                  } catch {
+                    navigation.navigate('Account');
+                  }
+                },
+              },
+            ]
+      );
+      return;
+    }
 
     const now = Date.now();
     const c = blankClient();
@@ -750,7 +782,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
     setCategoryPickerOpen(true);
   }
 
-  const topTitle = hasUpcoming ? 'Upcoming' : 'Clients';
+  const topTitle = hasUpcoming ? 'Upcoming' : 'List';
   const topMeta = hasUpcoming ? upcomingMeta : clientsMeta;
 
   return (
@@ -765,7 +797,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                 style={styles.searchInput}
                 value={search}
                 onChangeText={setSearch}
-                placeholder="Search clients"
+                placeholder="Search list"
                 placeholderTextColor="#999999"
                 returnKeyType="search"
               />
@@ -781,7 +813,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
             </View>
 
             <TouchableOpacity style={styles.accountChip} onPress={() => navigation.navigate('Upload')}>
-              <Text style={styles.accountChipText}>Upload</Text>
+              <Text style={styles.accountChipText}>Scan</Text>
             </TouchableOpacity>
           </View>
 
@@ -869,7 +901,7 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                 style={styles.textInput}
                 value={newClientText}
                 onChangeText={setNewClientText}
-                placeholder="Add client…"
+                placeholder="Add to list…"
                 placeholderTextColor="#999999"
                 returnKeyType="done"
                 onSubmitEditing={addClientFromBar}
@@ -914,8 +946,6 @@ const Clients: React.FC<ClientsScreenProps> = ({ navigation, email, userId }) =>
                   showsVerticalScrollIndicator={false}
                 >
                   <View style={styles.editorCard}>
-                    <Text style={styles.sectionTitle}>Client</Text>
-
                     <TextInput
                       value={draft?.displayName ?? ''}
                       onChangeText={(v) => setDraft((prev) => (prev ? { ...prev, displayName: v, updatedAt: Date.now() } : prev))}
@@ -1716,4 +1746,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export default Clients;
+export default List;

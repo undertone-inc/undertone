@@ -20,43 +20,12 @@ import {
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
 import Constants from 'expo-constants';
+import { PlanTier, PLAN_CONFIG, PLAN_LIMITS, PLAN_RANK, normalizePlanTier } from '../api';
 
 import { SafeAreaView, initialWindowMetrics, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
 
-type PlanTier = 'free' | 'pro';
-
-const PLAN_CONFIG: Record<
-  PlanTier,
-  { label: string; priceLabel: string; features: string[] }
-> = {
-  free: {
-    label: 'Free',
-    priceLabel: '$0',
-    features: ['5 uploads / mo', '5 clients / mo', '5 categories', '10 items'],
-  },
-  pro: {
-    label: 'Pro',
-    priceLabel: '$100 / mo',
-    features: [
-      '100 uploads / mo',
-      '100 clients / mo',
-      'Unlimited categories',
-      'Unlimited items',
-    ],
-  },
-};
-
-const PLAN_LIMITS: Record<
-  PlanTier,
-  { uploads: number; clients: number; categories: number; items: number }
-> = {
-  free: { uploads: 5, clients: 5, categories: 5, items: 10 },
-  pro: { uploads: 100, clients: 100, categories: Infinity, items: Infinity },
-};
-
-const PLAN_RANK: Record<PlanTier, number> = { free: 0, pro: 1 };
 
 function formatPercent(used: number, limit: number): string {
   const safeUsed = Number.isFinite(used) && used > 0 ? used : 0;
@@ -71,15 +40,7 @@ function formatPercent(used: number, limit: number): string {
   return `${Math.max(0, pct)}%`;
 }
 
-function normalizePlanTier(value: any): PlanTier {
-  const v = String(value ?? '').trim().toLowerCase();
-  if (v === 'pro') return 'pro';
-  if (v === 'free') return 'free';
-  if (v.includes('pro')) return 'pro';
-  // "Plus" is no longer offered; treat it as "Pro" so legacy values don't break UI.
-  if (v === 'plus' || v.includes('plus')) return 'pro';
-  return 'free';
-}
+// normalizePlanTier is imported from ../api
 
 // Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
 const API_BASE =
@@ -111,7 +72,9 @@ type AccountScreenProps = {
   email?: string | null;
   userId?: string | number | null;
   token?: string | null;
+  initialPlanTier?: PlanTier;
   onEmailUpdated?: (nextEmail: string) => void;
+  onPlanTierChanged?: (nextTier: PlanTier) => void;
   onLogout?: () => void;
 };
 
@@ -163,7 +126,17 @@ async function getJson(path: string, token?: string): Promise<any> {
   return data;
 }
 
-const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, token, onEmailUpdated, onLogout }) => {
+const Account: React.FC<AccountScreenProps> = ({
+  navigation,
+  route,
+  email,
+  userId,
+  token,
+  initialPlanTier,
+  onEmailUpdated,
+  onPlanTierChanged,
+  onLogout,
+}) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const kitlogKey = makeScopedKey(KITLOG_STORAGE_KEY, scope);
@@ -192,8 +165,15 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
 
   const [accountName, setAccountName] = useState('');
 
-  const [planTier, setPlanTier] = useState<PlanTier>('free');
+  const [planTier, setPlanTier] = useState<PlanTier>(initialPlanTier ?? 'free');
   const [pendingPlanTier, setPendingPlanTier] = useState<PlanTier | null>(null);
+
+  // Keep local plan state in sync with app-level plan state.
+  useEffect(() => {
+    if (!initialPlanTier) return;
+    if (initialPlanTier !== planTier) setPlanTier(initialPlanTier);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPlanTier]);
 
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
   const [saving, setSaving] = useState(false);
@@ -244,6 +224,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
           data?.user?.subscription?.plan
       );
       setPlanTier(nextTier);
+      if (onPlanTierChanged) onPlanTierChanged(nextTier);
 
       // Optional usage fields from the server (fallbacks to local/defaults when absent).
       const usage = data?.usage ?? data?.limitsUsage ?? data?.counters ?? data?.stats ?? {};
@@ -461,6 +442,20 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
     setActiveModal('plan');
   };
 
+  // If another screen navigates here with { openUpgrade: true }, auto-open the upgrade modal.
+  useEffect(() => {
+    const open = Boolean(route?.params?.openUpgrade);
+    if (!open) return;
+
+    try {
+      navigation.setParams({ openUpgrade: undefined });
+    } catch {
+      // ignore
+    }
+
+    openPlanModal();
+  }, [route?.params?.openUpgrade]);
+
   const saveAccountName = async () => {
     const name = draftName.trim();
     if (!name) {
@@ -593,7 +588,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
             >
               <Pressable style={styles.modalCard} onPress={() => {}}>
                 <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Plans</Text>
+                  <Text style={styles.modalTitle}>Upgrade</Text>
                   <TouchableOpacity
                     onPress={closeModal}
                     activeOpacity={0.85}
@@ -607,7 +602,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
                 </View>
 
                 <Text style={styles.planIntro}>
-                  Pick the plan that matches your usage. Billed monthly. Cancel anytime.
+                  Upgrade to increase usage limit. Billed monthly. Cancel anytime.
                 </Text>
 
                 <ScrollView
@@ -1014,9 +1009,9 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
             }}
             activeOpacity={0.85}
             accessibilityRole="button"
-            accessibilityLabel="Upload"
+            accessibilityLabel="Scan"
           >
-            <Text style={styles.accountChipText}>Upload</Text>
+            <Text style={styles.accountChipText}>Scan</Text>
           </TouchableOpacity>
         </View>
 
@@ -1150,7 +1145,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
                     <View style={styles.group}>
                       {showUploadUsage && (
                         <View style={styles.row}>
-                          <Text style={styles.rowLabel}>Uploads</Text>
+                          <Text style={styles.rowLabel}>Scans</Text>
                           <Text style={styles.rowValue}>{usagePercentValue}</Text>
                         </View>
                       )}
@@ -1162,7 +1157,7 @@ const Account: React.FC<AccountScreenProps> = ({ navigation, email, userId, toke
                           onPress={() => navigation.navigate('Clients')}
                           accessibilityRole="button"
                         >
-                          <Text style={styles.rowLabel}>Clients</Text>
+                          <Text style={styles.rowLabel}>Your list</Text>
                           <Text style={styles.rowValue}>{catalogPercentValue}</Text>
                         </TouchableOpacity>
                       )}
@@ -1327,7 +1322,7 @@ const styles = StyleSheet.create({
   accountChipText: {
     color: '#111827',
     fontSize: 13,
-    fontWeight: '600',
+    fontWeight: '500',
   },
 
   // Middle account content

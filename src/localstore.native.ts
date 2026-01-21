@@ -131,12 +131,51 @@ async function migrateOneKeyFromSecureStore(baseKey: string, scope?: string | nu
   } catch {}
 }
 
+async function migrateOneKeyFromLegacySQLite(baseKey: string, scope?: string | number | null): Promise<void> {
+  const s = String(scope ?? '').trim();
+  if (!s) return;
+
+  const targetKey = makeScopedKey(baseKey, s);
+  if (targetKey === baseKey) return;
+
+  // If scoped already exists, don't touch legacy.
+  const existing = await getString(targetKey);
+  if (existing) return;
+
+  const legacy = await getString(baseKey);
+  if (!legacy) return;
+
+  await setString(targetKey, legacy);
+  // Best-effort cleanup.
+  try {
+    await deleteKey(baseKey);
+  } catch {
+    // ignore
+  }
+}
+
 // One-time migration: move legacy Catalog/KitLog blobs out of SecureStore
 // and into SQLite (scoped per user).
 export async function migrateLegacySecureStoreIfNeeded(scope?: string | number | null): Promise<void> {
+  const s = String(scope ?? '').trim();
+  if (!s) return;
+
+  const keys = [DOC_KEYS.catalog, DOC_KEYS.kitlog, DOC_KEYS.faceAnalysisHistory, DOC_KEYS.faceChatHistory];
+
+  // 1) Move legacy *SQLite* unscoped docs into the scoped namespace.
   try {
-    await migrateOneKeyFromSecureStore(DOC_KEYS.catalog, scope);
-    await migrateOneKeyFromSecureStore(DOC_KEYS.kitlog, scope);
+    for (const k of keys) {
+      await migrateOneKeyFromLegacySQLite(k, s);
+    }
+  } catch {
+    // ignore
+  }
+
+  // 2) Move legacy *SecureStore* docs into SQLite (and clean up SecureStore).
+  try {
+    for (const k of keys) {
+      await migrateOneKeyFromSecureStore(k, s);
+    }
   } catch {
     // ignore
   }

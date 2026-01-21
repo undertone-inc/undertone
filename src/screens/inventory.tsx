@@ -19,12 +19,14 @@ import { SafeAreaView, useSafeAreaInsets, initialWindowMetrics } from 'react-nat
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { DOC_KEYS, getString, makeScopedKey, setString } from '../localstore';
+import { PlanTier, PLAN_LIMITS } from '../api';
 
 type KitLogScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
   userId?: string | number | null;
+  planTier?: PlanTier;
 };
 
 type ItemStatus = 'inKit' | 'low' | 'empty';
@@ -253,7 +255,7 @@ function normalizeData(input: any): KitLogData {
   }
 }
 
-const YourKit: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => {
+const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, planTier = 'free' }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const storageKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
@@ -596,6 +598,31 @@ const YourKit: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => 
       return;
     }
 
+    const limit = PLAN_LIMITS[planTier].categories;
+    const used = Array.isArray(data.categories)
+      ? data.categories.filter((c) => !isCoreCategoryName(c.name)).length
+      : 0;
+    if (limit !== Infinity && used >= limit) {
+      Alert.alert(
+        'Category limit reached',
+        `Free plan allows up to ${limit.toLocaleString()} custom categories. Upgrade to Pro to add more.`,
+        [
+          { text: 'Not now', style: 'cancel' },
+          {
+            text: 'Upgrade',
+            onPress: () => {
+              try {
+                navigation.navigate('Account', { openUpgrade: true });
+              } catch {
+                navigation.navigate('Account');
+              }
+            },
+          },
+        ]
+      );
+      return;
+    }
+
     const now = Date.now();
     const cat: KitCategory = { id: uid('cat'), name, createdAt: now, items: [] };
 
@@ -651,6 +678,38 @@ const YourKit: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => 
   function quickAddItem() {
     if (!activeCategoryId) return;
     const text = quickAddText.trim();
+
+    const limit = PLAN_LIMITS[planTier].items;
+    const used = Array.isArray(data.categories)
+      ? data.categories.reduce((sum, c) => sum + (Array.isArray(c.items) ? c.items.length : 0), 0)
+      : 0;
+    if (limit !== Infinity && used >= limit) {
+      const isPro = planTier === 'pro';
+      const msg = isPro
+        ? `You’ve reached the Pro plan limit of ${limit.toLocaleString()} kit items.`
+        : `Free plan allows up to ${limit.toLocaleString()} kit items. Upgrade to Pro to add more.`;
+
+      Alert.alert(
+        'Kit item limit reached',
+        msg,
+        isPro
+          ? [{ text: 'OK' }]
+          : [
+              { text: 'Not now', style: 'cancel' },
+              {
+                text: 'Upgrade',
+                onPress: () => {
+                  try {
+                    navigation.navigate('Account', { openUpgrade: true });
+                  } catch {
+                    navigation.navigate('Account');
+                  }
+                },
+              },
+            ]
+      );
+      return;
+    }
 
     const now = Date.now();
     const newId = uid('item');
@@ -778,7 +837,7 @@ const YourKit: React.FC<KitLogScreenProps> = ({ navigation, email, userId }) => 
             </View>
 
             <TouchableOpacity style={styles.accountChip} onPress={() => navigation.navigate('Upload')}>
-              <Text style={styles.accountChipText}>Upload</Text>
+              <Text style={styles.accountChipText}>Scan</Text>
             </TouchableOpacity>
           </View>
 
@@ -2323,4 +2382,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export default YourKit;
+export default Inventory;

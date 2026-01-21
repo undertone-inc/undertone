@@ -188,3 +188,52 @@ export function applyClientChatTo(state: ChatState): ChatState {
   return { ...state, openChats: open, messages, inbox };
 }
 // ----------------------------------------------------------------------
+
+
+// -------------------------------
+// Plan config & limits
+// -------------------------------
+
+export type PlanTier = 'free' | 'pro';
+
+export const PLAN_CONFIG: Record<
+  PlanTier,
+  { label: string; priceLabel: string; features: string[] }
+> = {
+  free: {
+    label: 'Free',
+    priceLabel: '$0',
+    features: ['Up to 5 scans / mo', 'Up to 5 clients', 'Up to 5 custom categories', 'Up to 10 kit items'],
+  },
+  pro: {
+    label: 'Pro',
+    priceLabel: '$20 / mo',
+    features: [
+      'Up to 100 scans per month',
+      'Up to 1,000 total clients',
+      'Up to 1,000 total kit items',
+      'Increase in scan accuracy',
+    ],
+  },
+};
+
+export const PLAN_LIMITS: Record<
+  PlanTier,
+  { uploads: number; clients: number; categories: number; items: number }
+> = {
+  free: { uploads: 5, clients: 5, categories: 5, items: 10 },
+  // NOTE: items = total across all categories.
+  pro: { uploads: 100, clients: 1000, categories: Infinity, items: 1000 },
+};
+
+export const PLAN_RANK: Record<PlanTier, number> = { free: 0, pro: 1 };
+
+export function normalizePlanTier(value: any): PlanTier {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (v === 'pro') return 'pro';
+  if (v === 'free') return 'free';
+  if (v.includes('pro')) return 'pro';
+  // "Plus" is no longer offered; treat it as "Pro" so legacy values don't break UI.
+  if (v === 'plus' || v.includes('plus')) return 'pro';
+  return 'free';
+}

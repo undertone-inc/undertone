@@ -11,11 +11,12 @@ import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-c
 
 import { clearToken, getToken } from './src/auth';
 import { migrateLegacySecureStoreIfNeeded } from './src/localstore';
+import { PlanTier, normalizePlanTier } from './src/api';
 import Login from './src/screens/login';
 import Upload from './src/screens/upload';
 import Account from './src/screens/account';
-import Clients from './src/screens/clients';
-import YourKit from './src/screens/yourkit';
+import List from './src/screens/list';
+import Inventory from './src/screens/inventory';
 import CameraScreen from './src/screens/camera';
 
 export type AuthStackParamList = {
@@ -67,7 +68,7 @@ function IdCardOutlineIcon({
   const markerX2 = 7.6;
   const lineX1 = 11.4;
   const lineX2 = 18.2;
-  const lineY1 = 9.9;
+  const lineY1 = 9.8;
   const lineY2 = 14.2;
 
   return (
@@ -176,11 +177,21 @@ type AppTabsProps = {
   userEmail: string | null;
   userId: string | null;
   token: string;
+  planTier: PlanTier;
   onEmailUpdated: (nextEmail: string) => void;
+  onPlanTierChanged: (nextTier: PlanTier) => void;
   onLogout: () => void;
 };
 
-function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: AppTabsProps) {
+function AppTabsShell({
+  userEmail,
+  userId,
+  token,
+  planTier,
+  onEmailUpdated,
+  onPlanTierChanged,
+  onLogout,
+}: AppTabsProps) {
   return (
     <TabNavigator
       lazy={false}
@@ -229,13 +240,13 @@ function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: Ap
       <Tabs.Screen
         name="Clients"
         options={{
-          tabBarLabel: 'clients',
+          tabBarLabel: 'your list',
           tabBarIcon: ({ color, size }) => (
             <FolderCleanOutlineIcon size={size ?? 24} color={color} />
           ),
         }}
       >
-        {(props: any) => <Clients {...props} email={userEmail} userId={userId} />}
+        {(props: any) => <List {...props} email={userEmail} userId={userId} planTier={planTier} />}
       </Tabs.Screen>
 
       <Tabs.Screen
@@ -247,7 +258,7 @@ function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: Ap
           ),
         }}
       >
-        {(props: any) => <YourKit {...props} email={userEmail} userId={userId} />}
+        {(props: any) => <Inventory {...props} email={userEmail} userId={userId} planTier={planTier} />}
       </Tabs.Screen>
 
       <Tabs.Screen
@@ -265,7 +276,9 @@ function AppTabsShell({ userEmail, userId, token, onEmailUpdated, onLogout }: Ap
             email={userEmail}
             userId={userId}
             token={token}
+            initialPlanTier={planTier}
             onEmailUpdated={onEmailUpdated}
+            onPlanTierChanged={onPlanTierChanged}
             onLogout={onLogout}
           />
         )}
@@ -278,6 +291,7 @@ export default function App() {
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+  const [planTier, setPlanTier] = useState<PlanTier>('free');
 
   useEffect(() => {
     let alive = true;
@@ -292,9 +306,17 @@ export default function App() {
             const data = await fetchMe(token);
             const email = String(data?.user?.email || '').trim();
             const id = String(data?.user?.id || '').trim();
+            const tier = normalizePlanTier(
+              data?.user?.planTier ??
+                data?.user?.plan ??
+                data?.user?.tier ??
+                data?.user?.subscriptionPlan ??
+                data?.user?.subscription?.plan
+            );
 
             if (email) setUserEmail(email);
             if (id) setUserId(id);
+            setPlanTier(tier);
 
             // One-time migration: move large blobs out of SecureStore.
             // Scope by stable user id so email changes don't split local data.
@@ -314,6 +336,7 @@ export default function App() {
             setAuthToken(null);
             setUserEmail(null);
             setUserId(null);
+            setPlanTier('free');
           }
         }
       } finally {
@@ -332,13 +355,39 @@ export default function App() {
     setUserEmail(email);
     const idStr = String(id ?? '').trim();
     setUserId(idStr || null);
+    setPlanTier('free');
+
     if (idStr) migrateLegacySecureStoreIfNeeded(idStr).catch(() => {});
+
+    // Fetch canonical user + plan tier (login/signup may not include all fields).
+    (async () => {
+      try {
+        const data = await fetchMe(token);
+        const nextEmail = String(data?.user?.email || '').trim();
+        const nextId = String(data?.user?.id || '').trim();
+        const tier = normalizePlanTier(
+          data?.user?.planTier ??
+            data?.user?.plan ??
+            data?.user?.tier ??
+            data?.user?.subscriptionPlan ??
+            data?.user?.subscription?.plan
+        );
+
+        if (nextEmail) setUserEmail(nextEmail);
+        if (nextId) setUserId(nextId);
+        setPlanTier(tier);
+        if (nextId) migrateLegacySecureStoreIfNeeded(nextId).catch(() => {});
+      } catch {
+        // ignore
+      }
+    })();
   };
 
   const handleLogout = () => {
     setAuthToken(null);
     setUserEmail(null);
     setUserId(null);
+    setPlanTier('free');
     clearToken().catch(() => {
       // ignore
     });
@@ -368,7 +417,9 @@ export default function App() {
                         userEmail={userEmail}
                         userId={userId}
                         token={authToken as string}
+                        planTier={planTier}
                         onEmailUpdated={handleEmailUpdated}
+                        onPlanTierChanged={(nextTier) => setPlanTier(nextTier)}
                         onLogout={handleLogout}
                       />
                     )}

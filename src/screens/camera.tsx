@@ -340,7 +340,9 @@ function assessQualityFromBase64Jpeg(base64: string): QualityState {
   }
 }
 
-export default function CameraScreen({ navigation }: any) {
+export default function CameraScreen({ navigation, route }: any) {
+
+  const draftChatId = String((route as any)?.params?.draftChatId || '').trim();
   const cameraRef = useRef<CameraView | null>(null);
   const probeTimerRef = useRef<any>(null);
   const inFlightRef = useRef<Promise<any> | null>(null);
@@ -567,7 +569,7 @@ export default function CameraScreen({ navigation }: any) {
                 state: {
                   index: 0,
                   routes: [
-                    { name: 'Upload', params: { capturedPhoto: picked } },
+                    { name: 'Upload', params: draftChatId ? { capturedPhoto: picked, draftChatId } : { capturedPhoto: picked } },
                     { name: 'Clients' },
 						{ name: 'YourKit' },
                     { name: 'Account' },
@@ -580,7 +582,7 @@ export default function CameraScreen({ navigation }: any) {
       } catch {
         // Last-resort fallback
         try {
-          navigation.navigate('Tabs', { screen: 'Upload', params: { capturedPhoto: picked }, merge: true });
+          navigation.navigate('Tabs', { screen: 'Upload', params: draftChatId ? { capturedPhoto: picked, draftChatId } : { capturedPhoto: picked }, merge: true });
           navigation.goBack();
         } catch {
           // ignore

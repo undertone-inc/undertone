@@ -57,6 +57,16 @@ const OPENAI_MODEL_FALLBACK = String(process.env.OPENAI_MODEL_FALLBACK || "").tr
 const OPENAI_IMAGE_DETAIL = String(process.env.OPENAI_IMAGE_DETAIL || "high").trim();
 const OPENAI_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 120);
 
+
+// OpenAI (chat about analysis results)
+const OPENAI_CHAT_MODEL = String(process.env.OPENAI_CHAT_MODEL || OPENAI_MODEL || "gpt-4o").trim();
+const OPENAI_CHAT_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_CHAT_MAX_OUTPUT_TOKENS || 220);
+const OPENAI_CHAT_TEMPERATURE = (() => {
+  const v = Number(process.env.OPENAI_CHAT_TEMPERATURE);
+  if (!Number.isFinite(v)) return 0.4;
+  return Math.max(0, Math.min(1, v));
+})();
+
 // OpenAI (product recommendations via Sephora web search)
 // Default to a reasoning model that is cost-efficient and strong at agentic web search.
 const OPENAI_RECS_MODEL = String(process.env.OPENAI_RECS_MODEL || "gpt-5-mini").trim();
@@ -3342,6 +3352,137 @@ async function fillMissingCategoriesWithCategoryRepair(recs, { undertone, season
 
 
 
+
+
+
+// --- Chat about a face analysis ---
+// The client uses this for the in-scan Q&A chat. It is intentionally lightweight:
+// we only provide general guidance based on the saved analysis. For retailer picks
+// with exact shade/variant names, use /recommend-products.
+app.post("/analysis-chat", authRequired, async (req, res) => {
+  try {
+    if (!requireDb(res)) return;
+
+    const user = req?.auth?.user;
+    const userId = user?.id;
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "Server is missing OPENAI_API_KEY" });
+    }
+
+    const message = String(req?.body?.message || "").trim();
+    if (!message) return res.status(400).json({ ok: false, error: "Missing message" });
+    if (message.length > 2500) return res.status(413).json({ ok: false, error: "Message too long" });
+
+    const analysisIdRaw = String(req?.body?.analysisId || "").trim();
+    const analysisId = /^\d+$/.test(analysisIdRaw) ? analysisIdRaw : null;
+
+    // Load the saved analysis for this user. If the client sends a non-numeric id
+    // (shouldn't happen once a scan is saved), fall back to the latest analysis.
+    let row = null;
+
+    if (analysisId) {
+      try {
+        const r = await pool.query(
+          "SELECT id, analysis_json FROM face_analyses WHERE user_id = $1 AND id = $2 LIMIT 1",
+          [userId, analysisId]
+        );
+        row = r?.rows?.[0] || null;
+      } catch {
+        row = null;
+      }
+    }
+
+    if (!row) {
+      try {
+        const r = await pool.query(
+          "SELECT id, analysis_json FROM face_analyses WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+          [userId]
+        );
+        row = r?.rows?.[0] || null;
+      } catch {
+        row = null;
+      }
+    }
+
+    const analysis = row?.analysis_json || null;
+    if (!analysis) {
+      return res.status(404).json({ ok: false, error: "Analysis not found. Please scan a face photo first." });
+    }
+
+    const undertone = normalizeUndertoneKeyServer(analysis?.undertone);
+    const season = normalizeSeasonKeyServer(analysis?.season);
+    const confidence = clampInt(analysis?.confidence, 0, 100, 55);
+
+    const toneNumber =
+      typeof analysis?.tone_number === "number" && Number.isFinite(analysis.tone_number) ? analysis.tone_number : null;
+
+    const toneDepth =
+      typeof analysis?.tone_depth === "string" && String(analysis.tone_depth || "").trim()
+        ? String(analysis.tone_depth || "").trim()
+        : (toneNumber !== null ? toneDepthFromNumberServer(Number(toneNumber)) : "");
+
+    const analysisSummaryLines = [
+      `undertone: ${undertone}`,
+      `season: ${season}`,
+      `confidence: ${confidence}`,
+      toneNumber !== null ? `tone_number: ${toneNumber}` : "",
+      toneDepth ? `tone_depth: ${toneDepth}` : "",
+    ].filter(Boolean);
+
+    const systemPrompt =
+      "You are Undertone's in-app assistant for makeup and color guidance. " +
+      "You help the user interpret their undertone/season result and choose flattering color directions. " +
+      "Keep answers practical and concise. " +
+      "Be neutral and non-judgmental; do NOT comment on attractiveness, body shape, health, age, race/ethnicity, or weight. " +
+      "Do not provide medical advice. " +
+      "If the user asks for exact retailer product shade names, explain that the app can generate Sephora picks via the Recommend products button, " +
+      "and otherwise give general guidance (shade family, finish, and how to swatch on jaw/neck).";
+
+    const messages = [];
+
+    // Provide stable context (analysis) as a system message so it’s always in view.
+    messages.push({ role: "system", content: systemPrompt });
+    messages.push({ role: "system", content: `User face analysis:
+${analysisSummaryLines.join("\n")}` });
+
+    // Optional prior chat context (client sends up to ~13 items).
+    const history = Array.isArray(req?.body?.history) ? req.body.history : [];
+    const trimmedHistory = history.slice(-12);
+
+    for (const m of trimmedHistory) {
+      const roleRaw = String(m?.role || "").trim().toLowerCase();
+      const role = roleRaw === "assistant" ? "assistant" : "user";
+      const content = String(m?.content || "").trim();
+      if (!content) continue;
+
+      // Keep each historical message bounded.
+      messages.push({ role, content: content.slice(0, 800) });
+    }
+
+    // Final user message.
+    messages.push({ role: "user", content: message });
+
+    const payload = {
+      model: OPENAI_CHAT_MODEL,
+      temperature: OPENAI_CHAT_TEMPERATURE,
+      max_output_tokens: OPENAI_CHAT_MAX_OUTPUT_TOKENS,
+      input: messages,
+    };
+
+    const { data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: "analysis_chat" });
+
+    const { text: outText, refusal } = extractOutputText(data);
+    if (refusal) throw new Error(refusal);
+    const reply = String(outText || "").trim();
+    if (!reply) throw new Error("Empty reply");
+
+    return res.json({ ok: true, reply, analysisId: String(row?.id || analysisId || "") });
+  } catch (e) {
+    console.error("analysis-chat error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || "Server error") });
+  }
+});
 
 app.post("/recommend-products", authRequired, async (req, res) => {
   try {

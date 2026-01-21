@@ -75,7 +75,12 @@ export async function migrateLegacySecureStoreIfNeeded(scope?: string | number |
   const s = String(scope ?? '').trim();
   if (!s) return;
 
-  const keys = [DOC_KEYS.catalog, DOC_KEYS.kitlog];
+  const keys = [
+    DOC_KEYS.catalog,
+    DOC_KEYS.kitlog,
+    DOC_KEYS.faceAnalysisHistory,
+    DOC_KEYS.faceChatHistory,
+  ];
   for (const baseKey of keys) {
     const targetKey = makeScopedKey(baseKey, s);
     const existing = await getString(targetKey);
