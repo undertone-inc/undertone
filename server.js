@@ -1825,6 +1825,17 @@ function pickBestShadeForCategory({ shades, category, undertone, season, toneNum
     score += 2 * scoreByKeywords(text, wantDir, avoidDir);
     score += 1 * scoreByKeywords(text, wantSeason, avoidSeason);
 
+    // Stronger alignment when a shade explicitly describes itself as cool/warm.
+    // (This helps avoid “cool taupe” being picked for warm undertones, and vice versa.)
+    const tLow = String(text || "").toLowerCase();
+    if (dir === "warm") {
+      if (/\bcool\b/.test(tLow) || /\bicy\b/.test(tLow)) score -= 4;
+      if (/\bwarm\b/.test(tLow) || /\bgolden\b/.test(tLow)) score += 2;
+    } else if (dir === "cool") {
+      if (/\bwarm\b/.test(tLow) || /\bgolden\b/.test(tLow) || /\bpeach\b/.test(tLow)) score -= 4;
+      if (/\bcool\b/.test(tLow)) score += 2;
+    }
+
     if (isFoundation) {
       const depth = parseDepthFromText(label);
       if (depth) {
@@ -2152,51 +2163,13 @@ const STATIC_SEPHORA_SHADE_FALLBACK = {
   ],
 
   // Eyes (curated subset; ensures we can always pick a verifiable shade even if live scraping is blocked)
-  // NOTE: Eyes recommendations must be eyeshadow products (not eyeliner).
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/laura-mercier-caviar-shimmer-eyeshadow-stick-reform-P512549')]: [
-    { value: 'Rosegold', desc: 'shimmering rosegold' },
-    { value: 'Amethyst', desc: 'shimmering soft mauve with hidden pearl' },
-    { value: 'Moonlight', desc: 'shimmering metallic pewter' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/long-wear-waterproof-cream-eyeshadow-stick-P378145')]: [
-    { value: 'Bellini', desc: 'a shimmering champagne' },
-    { value: 'Golden Pink', desc: 'shimmering pink peach' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/product/long-wear-waterproof-cream-eyeshadow-stick-P378145')]: [
-    { value: 'Bellini', desc: 'a shimmering champagne' },
-    { value: 'Golden Pink', desc: 'shimmering pink peach' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/gogo-shimmer-stick-P517334')]: [
-    { value: 'Troubadour', desc: 'golden amber' },
-    { value: 'Avalon', desc: 'true pink' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/it-cosmetics-superhero-no-tug-eye-shadow-stick-P479964')]: [
-    { value: 'Silk Armor' },
-    { value: 'Tough Tan' },
-    { value: 'Bionic Bronze' },
-    { value: 'Bare & Brave' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/kvd-vegan-beauty-dazzle-stick-eyeshadow-P464781')]: [
-    { value: 'Heat Burst', desc: 'bold ruby' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/eye-tint-P393434')]: [
-    { value: '30M Cedar', desc: 'cool taupe matte' },
-    { value: '25M Sandalwood', desc: 'brick beige' },
-    { value: '45S Desert', desc: 'light gold shimmer' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/product/eye-tint-P393434')]: [
-    { value: '30M Cedar', desc: 'cool taupe matte' },
-    { value: '18M Beige', desc: 'cool beige matte' },
-    { value: '25M Sandalwood', desc: 'brick beige' },
-    { value: '45S Desert', desc: 'light gold shimmer' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/solo-shadow-cream-eyeshadow-P506671')]: [
-    { value: 'Iris', desc: 'soft plum' },
-    { value: 'Studio', desc: 'cool taupe' },
-  ],
-  [normalizeRetailerUrl('https://www.sephora.com/product/solo-shadow-cream-eyeshadow-P506671')]: [
-    { value: 'Iris', desc: 'soft plum' },
-    { value: 'Studio', desc: 'cool taupe' },
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/24-7-glide-on-eye-pencil-P133707')]: [
+    { value: 'Perversion', desc: 'matte blackest black' },
+    { value: 'Whiskey', desc: 'rich brown matte' },
+    { value: 'Bourbon', desc: 'glimmering dark brown' },
+    { value: 'Rockstar', desc: 'dark purple' },
+    { value: 'Mildew', desc: 'deep forest green' },
+    { value: 'Sabbath', desc: 'deep navy matte' },
   ],
 
   // Lips (curated subset; ensures we can always pick a verifiable shade even if live scraping is blocked)
@@ -2536,12 +2509,14 @@ async function resolveSephoraProductUrlByName(name) {
 }
 
 
-async function buildProductLines({ products, category, undertone, season, toneNumber, toneDepth }) {
+async function buildProductLines({ products, category, undertone, season, toneNumber, toneDepth, seedExtra = "" }) {
   const out = [];
   const list = Array.isArray(products) ? products : [];
 
   const desiredCount = 1;
-  const seed = `${String(category || "").toLowerCase()}|${undertone}|${season}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
+  // Deterministic (so repeated taps don't reshuffle), but seeded by the authenticated user
+  // (and optionally analysisId) so different users don't all see the exact same picks.
+  const seed = `${String(seedExtra || "")}|${String(category || "").toLowerCase()}|${undertone}|${season}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
 
   // Try more candidates so we can avoid returning generic colors whenever possible.
   // Always include a category-safe fallback product that has curated shades.
@@ -3543,10 +3518,18 @@ app.post("/recommend-products", authRequired, async (req, res) => {
     const toneNumber = req?.body?.tone_number;
     const toneDepth = req?.body?.tone_depth;
 
+    // Optional: allow the client to pass a stable analysis id so we can (a) avoid
+    // cross-user caching collisions, and (b) produce stable-but-varied results per scan.
+    // If not provided, we still include the authenticated user id so different users
+    // don't share the same cache bucket.
+    const analysisId = String(req?.body?.analysis_id || req?.body?.analysisId || "").trim();
+    const userId = req?.auth?.user?.id ? String(req.auth.user.id) : "";
+    const seedExtra = `${userId}|${analysisId}`;
+
     const mode = String(req?.body?.mode || "").trim().toLowerCase();
     const deepMode = mode === "deep" || mode === "web" || mode === "sephora_web_search";
 
-    const cacheKey = `recs|${deepMode ? "deep" : "fast"}|${undertone}|${season}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
+    const cacheKey = `recs|${deepMode ? "deep" : "fast"}|${userId}|${analysisId}|${undertone}|${season}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
     const now = Date.now();
 
     try {
@@ -3638,6 +3621,7 @@ app.post("/recommend-products", authRequired, async (req, res) => {
         season,
         toneNumber,
         toneDepth,
+        seedExtra,
       });
       return { sec, block };
     });
