@@ -2152,13 +2152,51 @@ const STATIC_SEPHORA_SHADE_FALLBACK = {
   ],
 
   // Eyes (curated subset; ensures we can always pick a verifiable shade even if live scraping is blocked)
-  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/24-7-glide-on-eye-pencil-P133707')]: [
-    { value: 'Perversion', desc: 'matte blackest black' },
-    { value: 'Whiskey', desc: 'rich brown matte' },
-    { value: 'Bourbon', desc: 'glimmering dark brown' },
-    { value: 'Rockstar', desc: 'dark purple' },
-    { value: 'Mildew', desc: 'deep forest green' },
-    { value: 'Sabbath', desc: 'deep navy matte' },
+  // NOTE: Eyes recommendations must be eyeshadow products (not eyeliner).
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/laura-mercier-caviar-shimmer-eyeshadow-stick-reform-P512549')]: [
+    { value: 'Rosegold', desc: 'shimmering rosegold' },
+    { value: 'Amethyst', desc: 'shimmering soft mauve with hidden pearl' },
+    { value: 'Moonlight', desc: 'shimmering metallic pewter' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/long-wear-waterproof-cream-eyeshadow-stick-P378145')]: [
+    { value: 'Bellini', desc: 'a shimmering champagne' },
+    { value: 'Golden Pink', desc: 'shimmering pink peach' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/product/long-wear-waterproof-cream-eyeshadow-stick-P378145')]: [
+    { value: 'Bellini', desc: 'a shimmering champagne' },
+    { value: 'Golden Pink', desc: 'shimmering pink peach' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/gogo-shimmer-stick-P517334')]: [
+    { value: 'Troubadour', desc: 'golden amber' },
+    { value: 'Avalon', desc: 'true pink' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/it-cosmetics-superhero-no-tug-eye-shadow-stick-P479964')]: [
+    { value: 'Silk Armor' },
+    { value: 'Tough Tan' },
+    { value: 'Bionic Bronze' },
+    { value: 'Bare & Brave' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/kvd-vegan-beauty-dazzle-stick-eyeshadow-P464781')]: [
+    { value: 'Heat Burst', desc: 'bold ruby' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/eye-tint-P393434')]: [
+    { value: '30M Cedar', desc: 'cool taupe matte' },
+    { value: '25M Sandalwood', desc: 'brick beige' },
+    { value: '45S Desert', desc: 'light gold shimmer' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/product/eye-tint-P393434')]: [
+    { value: '30M Cedar', desc: 'cool taupe matte' },
+    { value: '18M Beige', desc: 'cool beige matte' },
+    { value: '25M Sandalwood', desc: 'brick beige' },
+    { value: '45S Desert', desc: 'light gold shimmer' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/ca/en/product/solo-shadow-cream-eyeshadow-P506671')]: [
+    { value: 'Iris', desc: 'soft plum' },
+    { value: 'Studio', desc: 'cool taupe' },
+  ],
+  [normalizeRetailerUrl('https://www.sephora.com/product/solo-shadow-cream-eyeshadow-P506671')]: [
+    { value: 'Iris', desc: 'soft plum' },
+    { value: 'Studio', desc: 'cool taupe' },
   ],
 
   // Lips (curated subset; ensures we can always pick a verifiable shade even if live scraping is blocked)
