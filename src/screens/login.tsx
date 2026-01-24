@@ -25,6 +25,9 @@ const RAW_API_BASE =
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
+// Keep placeholders consistent across fields.
+const PLACEHOLDER_COLOR = '#999999';
+
 const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
   const [mode, setMode] = useState<Mode>('login');
 
@@ -261,6 +264,7 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
             value={email}
             onChangeText={setEmail}
             placeholder="you@example.com"
+            placeholderTextColor={PLACEHOLDER_COLOR}
             keyboardType="email-address"
             autoCapitalize="none"
             autoCorrect={false}
@@ -277,6 +281,7 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
                 value={password}
                 onChangeText={setPassword}
                 placeholder="Password"
+                placeholderTextColor={PLACEHOLDER_COLOR}
                 secureTextEntry
                 returnKeyType="done"
                 onSubmitEditing={handleLogin}
@@ -316,6 +321,7 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
                 value={password}
                 onChangeText={setPassword}
                 placeholder="Create a password"
+                placeholderTextColor={PLACEHOLDER_COLOR}
                 secureTextEntry
                 returnKeyType="done"
                 onSubmitEditing={handleSignup}
@@ -375,6 +381,7 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
                     value={resetCode}
                     onChangeText={setResetCode}
                     placeholder="Reset code"
+                    placeholderTextColor={PLACEHOLDER_COLOR}
                     autoCapitalize="none"
                     autoCorrect={false}
                     returnKeyType="next"
@@ -387,6 +394,7 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
                     value={newPassword}
                     onChangeText={setNewPassword}
                     placeholder="New password"
+                    placeholderTextColor={PLACEHOLDER_COLOR}
                     secureTextEntry
                     returnKeyType="done"
                     onSubmitEditing={handleResetPassword}

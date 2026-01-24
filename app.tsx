@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { StatusBar, View, Text, StyleSheet } from 'react-native';
+import { StatusBar, View, StyleSheet } from 'react-native';
 import Constants from 'expo-constants';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import Svg, { Line, Rect, Path } from 'react-native-svg';
@@ -12,6 +12,7 @@ import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-c
 import { clearToken, getToken } from './src/auth';
 import { migrateLegacySecureStoreIfNeeded } from './src/localstore';
 import { PlanTier, normalizePlanTier } from './src/api';
+import { RevenueCatProvider, useRevenueCat } from './src/revenuecat/revenuecatprovider';
 import Login from './src/screens/login';
 import Upload from './src/screens/upload';
 import Account from './src/screens/account';
@@ -43,6 +44,18 @@ const AppStack = createNativeStackNavigator<AppStackParamList>();
 const AuthStackNavigator = AuthStack.Navigator as React.ComponentType<any>;
 const TabNavigator = Tabs.Navigator as React.ComponentType<any>;
 const AppStackNavigator = AppStack.Navigator as React.ComponentType<any>;
+
+function RevenueCatPlanBridge({
+  serverPlanTier,
+  children,
+}: {
+  serverPlanTier: PlanTier;
+  children: (effectivePlanTier: PlanTier) => React.ReactNode;
+}) {
+  const { isPro } = useRevenueCat();
+  const effectivePlanTier: PlanTier = isPro || serverPlanTier === 'pro' ? 'pro' : 'free';
+  return <>{children(effectivePlanTier)}</>;
+}
 
 function TabBarBackground() {
   return (
@@ -159,17 +172,36 @@ const RAW_API_BASE =
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
 
-async function fetchMe(token: string) {
-  const res = await fetch(`${API_BASE}/me`, {
-    method: 'GET',
-    headers: { authorization: `Bearer ${token}` },
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data?.ok === false) {
-    const msg = data?.error || data?.message || `HTTP ${res.status}`;
-    throw new Error(msg);
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
   }
-  return data;
+}
+
+async function fetchMe(token: string, timeoutMs = 12000) {
+  // On mobile, fetch has no default timeout and can hang indefinitely if the API host
+  // is unreachable. Use an abort timeout so the app never gets stuck on startup.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
+
+  try {
+    const res = await fetch(`${API_BASE}/me`, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.ok === false) {
+      const msg = data?.error || data?.message || `HTTP ${res.status}`;
+      throw new HttpError(res.status, String(msg));
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 
@@ -229,9 +261,10 @@ function AppTabsShell({
         name="Upload"
         options={{
           tabBarLabel: 'scan',
-          tabBarIcon: ({ color, size }) => (
-            <Ionicons name="scan-outline" size={size ?? 24} color={color} />
-          ),
+          tabBarIcon: ({ color, size }) => {
+            const iconSize = Math.max(18, (size ?? 24) - 2);
+            return <Ionicons name="scan-outline" size={iconSize} color={color} />;
+          },
         }}
       >
         {(props: any) => <Upload {...props} email={userEmail} userId={userId} token={token} />}
@@ -241,9 +274,10 @@ function AppTabsShell({
         name="Clients"
         options={{
           tabBarLabel: 'your list',
-          tabBarIcon: ({ color, size }) => (
-            <FolderCleanOutlineIcon size={size ?? 24} color={color} />
-          ),
+          tabBarIcon: ({ color, size }) => {
+            const iconSize = Math.max(18, (size ?? 24) - 1);
+            return <FolderCleanOutlineIcon size={iconSize} color={color} />;
+          },
         }}
       >
         {(props: any) => <List {...props} email={userEmail} userId={userId} planTier={planTier} />}
@@ -253,9 +287,10 @@ function AppTabsShell({
         name="YourKit"
         options={{
           tabBarLabel: 'your kit',
-          tabBarIcon: ({ color, size }) => (
-            <Ionicons name="briefcase-outline" size={size ?? 24} color={color} />
-          ),
+          tabBarIcon: ({ color, size }) => {
+            const iconSize = Math.max(18, (size ?? 24) - 1);
+            return <Ionicons name="briefcase-outline" size={iconSize} color={color} />;
+          },
         }}
       >
         {(props: any) => <Inventory {...props} email={userEmail} userId={userId} planTier={planTier} />}
@@ -297,13 +332,28 @@ export default function App() {
     let alive = true;
 
     const boot = async () => {
+      // Never block the UI on network calls during boot.
+      // 1) Restore token (fast) -> show app/login immediately.
+      // 2) Fetch /me in the background with a hard timeout.
+      let token: string | null = null;
       try {
-        const token = await getToken();
-        if (!alive) return;
+        token = await getToken();
+      } catch {
+        token = null;
+      }
 
-        if (token) {
+      if (!alive) return;
+
+      if (token) {
+        // Optimistically render the authed app immediately.
+        setAuthToken(token);
+
+        // Fetch canonical user + plan tier (background; do not block startup).
+        (async () => {
           try {
-            const data = await fetchMe(token);
+            const data = await fetchMe(token as string, 12000);
+            if (!alive) return;
+
             const email = String(data?.user?.email || '').trim();
             const id = String(data?.user?.id || '').trim();
             const tier = normalizePlanTier(
@@ -319,29 +369,39 @@ export default function App() {
             setPlanTier(tier);
 
             // One-time migration: move large blobs out of SecureStore.
-            // Scope by stable user id so email changes don't split local data.
-            if (id) {
+            // Best-effort; do not block rendering.
+            if (id) migrateLegacySecureStoreIfNeeded(id).catch(() => {});
+          } catch (err: any) {
+            if (!alive) return;
+
+            // If the token is invalid/expired, log out.
+            const status = typeof err?.status === 'number' ? err.status : 0;
+            const msg = String(err?.message || '');
+            const looksUnauthorized = status === 401 || status === 403 || /unauthor/i.test(msg);
+
+            if (looksUnauthorized) {
               try {
-                await migrateLegacySecureStoreIfNeeded(id);
-              } catch {
-                // ignore
-              }
+                await clearToken();
+              } catch {}
+              setAuthToken(null);
+              setUserEmail(null);
+              setUserId(null);
+              setPlanTier('free');
+            } else {
+              // Network/API unreachable: keep the token so the app can still open.
+              // (Fetches elsewhere can show their own error states.)
+              console.warn('Boot: /me unavailable', err);
             }
-            setAuthToken(token);
-          } catch {
-            // Token invalid/expired.
-            try {
-              await clearToken();
-            } catch {}
-            setAuthToken(null);
-            setUserEmail(null);
-            setUserId(null);
-            setPlanTier('free');
           }
-        }
-      } finally {
-        if (alive) setBooting(false);
+        })();
+      } else {
+        setAuthToken(null);
+        setUserEmail(null);
+        setUserId(null);
+        setPlanTier('free');
       }
+
+      if (alive) setBooting(false);
     };
 
     boot();
@@ -398,43 +458,48 @@ export default function App() {
   };
 
   return (
-    <SafeAreaProvider initialMetrics={initialWindowMetrics} style={{ flex: 1 }}>
+    <RevenueCatProvider appUserID={authToken ? (userId ? String(userId) : null) : null}>
+      <SafeAreaProvider initialMetrics={initialWindowMetrics} style={{ flex: 1 }}>
       <StatusBar barStyle="dark-content" />
 
       <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
         {booting ? (
-          <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-            <Text style={{ color: '#111111' }}>Loading…</Text>
-          </View>
+          // Keep this blank so users never see a "Loading..." screen.
+          // Startup should feel instant (native splash handles the initial load).
+          <View style={{ flex: 1, backgroundColor: '#ffffff' }} />
         ) : (
           <NavigationContainer key={authToken ? 'app' : 'auth'}>
             <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
               {authToken ? (
-                <AppStackNavigator screenOptions={{ headerShown: false }}>
-                  <AppStack.Screen name="Tabs">
-                    {() => (
-                      <AppTabsShell
-                        userEmail={userEmail}
-                        userId={userId}
-                        token={authToken as string}
-                        planTier={planTier}
-                        onEmailUpdated={handleEmailUpdated}
-                        onPlanTierChanged={(nextTier) => setPlanTier(nextTier)}
-                        onLogout={handleLogout}
-                      />
-                    )}
-                  </AppStack.Screen>
+                <RevenueCatPlanBridge serverPlanTier={planTier}>
+                  {(effectivePlanTier) => (
+                    <AppStackNavigator screenOptions={{ headerShown: false }}>
+                      <AppStack.Screen name="Tabs">
+                        {() => (
+                          <AppTabsShell
+                            userEmail={userEmail}
+                            userId={userId}
+                            token={authToken as string}
+                            planTier={effectivePlanTier}
+                            onEmailUpdated={handleEmailUpdated}
+                            onPlanTierChanged={(nextTier) => setPlanTier(nextTier)}
+                            onLogout={handleLogout}
+                          />
+                        )}
+                      </AppStack.Screen>
 
-                  <AppStack.Screen
-                    name="Camera"
-                    component={CameraScreen}
-                    options={{
-                      headerShown: false,
-                      presentation: 'fullScreenModal',
-                      animation: 'slide_from_bottom',
-                    }}
-                  />
-                </AppStackNavigator>
+                      <AppStack.Screen
+                        name="Camera"
+                        component={CameraScreen}
+                        options={{
+                          headerShown: false,
+                          presentation: 'fullScreenModal',
+                          animation: 'slide_from_bottom',
+                        }}
+                      />
+                    </AppStackNavigator>
+                  )}
+                </RevenueCatPlanBridge>
               ) : (
                 <AuthStackNavigator
                   screenOptions={{
@@ -452,7 +517,8 @@ export default function App() {
           </NavigationContainer>
         )}
       </View>
-    </SafeAreaProvider>
+      </SafeAreaProvider>
+    </RevenueCatProvider>
   );
 }
 

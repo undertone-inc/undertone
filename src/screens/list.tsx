@@ -42,7 +42,7 @@ const DEFAULT_KITLOG_CATEGORIES = [
   'Lashes',
   'Tools',
   'Hygiene & Disposables',
-  'Body / FX / Extras',
+  'Other',
 ];
 
 const FALLBACK_CATEGORY_NAME = 'Foundation';
@@ -67,8 +67,6 @@ type Undertone = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm' |
 const EVENT_TYPE_OPTIONS = [
   'Wedding',
   'Photoshoot',
-  'Fashion & editorial',
-  'TV',
   'Other',
 ] as const;
 
@@ -271,8 +269,8 @@ const LEGACY_CATEGORY_CODES: Record<string, string> = {
   lip: 'Lips',
   tools: 'Tools',
   hygiene: 'Hygiene & Disposables',
-  bodyfx: 'Body / FX / Extras',
-  other: 'Body / FX / Extras',
+  bodyfx: 'Other',
+  other: 'Other',
 };
 
 function normalizeCategory(raw: any): PlanCategory {
@@ -321,6 +319,8 @@ function normalizeData(input: any): ClientsData {
           const key = rawEventType.toLowerCase();
           // Migrate legacy event types to new options.
           if (key === 'corporate' || key === 'special occasion' || key === 'special_occasion' || key === 'special-occasion') {
+            eventType = 'Other';
+          } else if (key === 'tv' || key === 'fashion & editorial' || key === 'fashion&editorial') {
             eventType = 'Other';
           } else {
             const match = EVENT_TYPE_OPTIONS.find((opt) => opt.toLowerCase() === key);

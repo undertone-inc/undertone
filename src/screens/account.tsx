@@ -15,12 +15,12 @@ import {
   KeyboardAvoidingView,
   ActivityIndicator,
   Alert,
-  Linking,
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
 import Constants from 'expo-constants';
 import { PlanTier, PLAN_CONFIG, PLAN_LIMITS, PLAN_RANK, normalizePlanTier } from '../api';
+import { useRevenueCat } from '../revenuecat/revenuecatprovider';
 
 import { SafeAreaView, initialWindowMetrics, useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -85,7 +85,18 @@ const CLOSED_BOTTOM_PADDING = 28;
 // Extra space ABOVE the keyboard when it is OPEN
 const KEYBOARD_GAP = 0;
 
-type ModalKind = null | 'name' | 'email' | 'password' | 'plan' | 'delete';
+type ModalKind =
+  | null
+  | 'name'
+  | 'email'
+  | 'password'
+  | 'plan'
+  | 'delete'
+  | 'updates'
+  | 'support'
+  | 'refer';
+
+type BillingCycle = 'monthly' | 'yearly';
 
 async function readJsonSafe(res: Response): Promise<any> {
   const text = await res.text();
@@ -168,6 +179,28 @@ const Account: React.FC<AccountScreenProps> = ({
   const [planTier, setPlanTier] = useState<PlanTier>(initialPlanTier ?? 'free');
   const [pendingPlanTier, setPendingPlanTier] = useState<PlanTier | null>(null);
 
+  const [billingCycle, setBillingCycle] = useState<BillingCycle>('monthly');
+
+  const {
+    ready: rcReady,
+    isPro: rcIsPro,
+    buyMonthly,
+    buyYearly,
+    restore,
+    showPaywall,
+    openCustomerCenter,
+  } = useRevenueCat();
+
+  const effectivePlanTier: PlanTier = rcIsPro || planTier === 'pro' ? 'pro' : 'free';
+
+  // If RevenueCat says the user is Pro, never let server refreshes downgrade the local UI.
+  useEffect(() => {
+    if (!rcIsPro) return;
+    if (planTier === 'pro') return;
+    setPlanTier('pro');
+    if (onPlanTierChanged) onPlanTierChanged('pro');
+  }, [rcIsPro, planTier]);
+
   // Keep local plan state in sync with app-level plan state.
   useEffect(() => {
     if (!initialPlanTier) return;
@@ -187,6 +220,9 @@ const Account: React.FC<AccountScreenProps> = ({
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
+
+  const [supportMessage, setSupportMessage] = useState('');
+  const [inviteEmail, setInviteEmail] = useState('');
 
   useEffect(() => {
     const showEvent = Platform.OS === 'android' ? 'keyboardDidShow' : 'keyboardWillShow';
@@ -223,8 +259,10 @@ const Account: React.FC<AccountScreenProps> = ({
           data?.user?.subscriptionPlan ??
           data?.user?.subscription?.plan
       );
-      setPlanTier(nextTier);
-      if (onPlanTierChanged) onPlanTierChanged(nextTier);
+
+      const resolvedTier: PlanTier = rcIsPro ? 'pro' : nextTier;
+      setPlanTier(resolvedTier);
+      if (onPlanTierChanged) onPlanTierChanged(resolvedTier);
 
       // Optional usage fields from the server (fallbacks to local/defaults when absent).
       const usage = data?.usage ?? data?.limitsUsage ?? data?.counters ?? data?.stats ?? {};
@@ -374,10 +412,21 @@ const Account: React.FC<AccountScreenProps> = ({
   const showPlan = matchesQuery('Plan', 'Free', 'Pro', 'Upgrade', 'Manage');
   const showBilling = matchesQuery('Billing', 'Update billing');
 
-  const showUploadUsage = matchesQuery('Usage', 'Upload usage', 'Upload', 'Uploads');
-
-  const showCatalog = matchesQuery('Clients', 'Catalog', 'clients', 'items', 'categories');
-  const showYourKit = matchesQuery('Your kit', 'kit', 'items');
+  const showUpdates = matchesQuery('Updates', 'Update', 'Location', 'Locations');
+  const showReferUser = matchesQuery(
+    'Refer user',
+    'Refer a friend',
+    'Refer friend',
+    'Referral',
+    'Invite',
+    'Invites',
+    'Refer',
+    'Affiliate center',
+    'Affiliate',
+    'Affiliates',
+    'Your list',
+    'List'
+  );
 
   const showEmailUpdates = matchesQuery('Email updates');
   const showUserAgreement = matchesQuery('User agreement');
@@ -388,8 +437,8 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const profileRowsVisible = showAccountName || showEmailRow || showPassword;
   const planRowsVisible = showPlan || showBilling;
-  const catalogRowsVisible = showUploadUsage || showCatalog || showYourKit;
-  const commRowsVisible = showEmailUpdates || showUserAgreement || showSupport;
+  const catalogRowsVisible = showUpdates || showReferUser || showSupport;
+  const commRowsVisible = showEmailUpdates || showUserAgreement;
   const actionRowsVisible = showDeleteAccount || showLogout;
 
   const anyRowsVisible =
@@ -404,12 +453,15 @@ const Account: React.FC<AccountScreenProps> = ({
   const closeModal = () => {
     setActiveModal(null);
     setPendingPlanTier(null);
+    setBillingCycle('monthly');
     setDraftName('');
     setDraftEmail('');
     setEmailPassword('');
     setCurrentPassword('');
     setNewPassword('');
     setConfirmNewPassword('');
+    setSupportMessage('');
+    setInviteEmail('');
   };
 
   const openNameModal = () => {
@@ -436,10 +488,77 @@ const Account: React.FC<AccountScreenProps> = ({
     setActiveModal('password');
   };
 
+  const openUpdatesModal = () => {
+    Keyboard.dismiss();
+    setActiveModal('updates');
+  };
+
+  const openReferModal = () => {
+    if (!requireAuthOrAlert()) return;
+    Keyboard.dismiss();
+    setInviteEmail('');
+    setActiveModal('refer');
+  };
+
+  const openReferInfo = () => {
+    Alert.alert(
+      'INFO',
+      'User counts as referred if account was created using an e-mail to which an invite link was sent and account is in use for over 30 days'
+    );
+  };
+
+
+  const openSupportModal = () => {
+    if (!requireAuthOrAlert()) return;
+    Keyboard.dismiss();
+    setSupportMessage('');
+    setActiveModal('support');
+  };
+
+
   const openPlanModal = () => {
     if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
     setActiveModal('plan');
+  };
+
+  const openCustomerCenterSafe = async () => {
+    if (!requireAuthOrAlert()) return;
+    if (!rcReady) {
+      Alert.alert('Subscriptions', 'Purchases are still initializing. Please try again.');
+      return;
+    }
+
+    try {
+      setSaving(true);
+      await openCustomerCenter();
+    } catch (e: any) {
+      Alert.alert('Manage subscription', String(e?.message || e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const restorePurchasesSafe = async () => {
+    if (!requireAuthOrAlert()) return;
+    if (!rcReady) {
+      Alert.alert('Subscriptions', 'Purchases are still initializing. Please try again.');
+      return;
+    }
+
+    try {
+      setSaving(true);
+      const r = await restore();
+      if (!r.ok) {
+        Alert.alert('Restore purchases', r.message || 'Restore failed.');
+        return;
+      }
+      Alert.alert('Restore purchases', 'Restore complete.');
+    } catch (e: any) {
+      Alert.alert('Restore purchases', String(e?.message || e));
+    } finally {
+      setSaving(false);
+    }
   };
 
   // If another screen navigates here with { openUpgrade: true }, auto-open the upgrade modal.
@@ -527,43 +646,155 @@ const Account: React.FC<AccountScreenProps> = ({
     }
   };
 
-  const startSubscription = async (targetTier: PlanTier) => {
+  const submitSupport = async () => {
     if (!requireAuthOrAlert()) return;
+
+    const message = supportMessage.trim();
+    if (!message) {
+      Alert.alert('Support', 'Please describe the issue.');
+      return;
+    }
+
+    try {
+      setSaving(true);
+
+      await postJson(
+        '/support',
+        {
+          message,
+          meta: {
+            email: emailTrimmed || null,
+            userId: userId ?? null,
+            accountName: accountName || null,
+            platform: Platform.OS,
+            appVersion:
+              (Constants as any)?.expoConfig?.version ??
+              (Constants as any)?.manifest?.version ??
+              null,
+          },
+        },
+        tokenTrimmed
+      );
+
+      closeModal();
+      Alert.alert('Submitted', 'Thanks — your message has been sent.');
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (/404|not found/i.test(msg)) {
+        Alert.alert('Support', 'Support submission is not configured yet.');
+      } else {
+        Alert.alert('Could not submit', msg);
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const sendReferralInvite = async () => {
+    if (!requireAuthOrAlert()) return;
+
+    const toEmail = inviteEmail.trim();
+    if (!toEmail) {
+      Alert.alert('Refer user', 'Please enter an email address.');
+      return;
+    }
+
+    const looksValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail);
+    if (!looksValid) {
+      Alert.alert('Refer user', 'Please enter a valid email address.');
+      return;
+    }
+
+    try {
+      setSaving(true);
+
+      await postJson(
+        '/referrals/invite',
+        {
+          email: toEmail,
+          meta: {
+            fromEmail: emailTrimmed || null,
+            userId: userId ?? null,
+            accountName: accountName || null,
+          },
+        },
+        tokenTrimmed
+      );
+
+      setInviteEmail('');
+      Alert.alert('Invite sent', `Invite sent to ${toEmail}.`);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (/404|not found/i.test(msg)) {
+        Alert.alert('Refer user', 'Referral invites are not configured yet.');
+      } else {
+        Alert.alert('Could not send invite', msg);
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+
+
+  const startSubscription = async (targetTier: PlanTier, cycle: BillingCycle) => {
+    if (!requireAuthOrAlert()) return;
+
+    if (!rcReady) {
+      Alert.alert('Purchases', 'Purchases are still initializing. Please try again.');
+      return;
+    }
+
+    let directResult: { ok: boolean; cancelled?: boolean; message?: string } | null = null;
 
     try {
       setSaving(true);
       setPendingPlanTier(targetTier);
 
-      // Server should create a checkout session (Stripe / IAP bridge) and return a URL.
-      // Example response: { ok: true, url: "https://..." }
-      const data = await postJson('/start-subscription', { plan: targetTier }, tokenTrimmed);
-
-      const url = String(data?.url || data?.checkoutUrl || data?.checkout_url || '').trim();
-
-      if (!url) {
-        Alert.alert('Upgrade', 'Subscription flow is not configured yet.');
-        return;
-      }
-
-      const canOpen = await Linking.canOpenURL(url);
-      if (!canOpen) {
-        Alert.alert('Upgrade', 'Could not open the checkout link on this device.');
-        return;
-      }
-
-      await Linking.openURL(url);
-      closeModal();
+      directResult = cycle === 'yearly' ? await buyYearly() : await buyMonthly();
     } catch (e: any) {
-      Alert.alert('Could not start subscription', String(e?.message || e));
+      directResult = { ok: false, cancelled: false, message: String(e?.message || e) };
     } finally {
       setSaving(false);
       setPendingPlanTier(null);
     }
+
+    if (directResult?.ok) {
+      setPlanTier('pro');
+      if (onPlanTierChanged) onPlanTierChanged('pro');
+      closeModal();
+      Alert.alert('Success', 'Undertone Pro unlocked.');
+      return;
+    }
+
+    // If the direct purchase attempt didn't complete, fall back to the RevenueCat paywall
+    // (so the user can retry, pick a different package, restore, etc.)
+    closeModal();
+
+    try {
+      // Give the modal a beat to dismiss before presenting another native modal.
+      await new Promise((r) => setTimeout(r, 250));
+      const purchased = await showPaywall();
+      if (purchased) {
+        setPlanTier('pro');
+        if (onPlanTierChanged) onPlanTierChanged('pro');
+        Alert.alert('Success', 'Undertone Pro unlocked.');
+      } else if (!directResult?.cancelled && directResult?.message) {
+        Alert.alert('Upgrade', directResult.message);
+      }
+    } catch (e: any) {
+      const msg = String(directResult?.message || e?.message || e);
+      if (msg && !directResult?.cancelled) Alert.alert('Upgrade', msg);
+    }
   };
 
   const renderModal = () => {
+    // Support/Updates/Refer are rendered as in-screen full-white panels (not overlay modals)
+    // so they visually replace the settings list area.
+    if (activeModal === 'support' || activeModal === 'updates' || activeModal === 'refer') {
+      return null;
+    }
     if (!activeModal) return null;
-
     if (activeModal === 'plan') {
       const tiers: PlanTier[] = ['pro'];
 
@@ -586,35 +817,32 @@ const Account: React.FC<AccountScreenProps> = ({
               behavior={Platform.OS === 'ios' ? 'padding' : undefined}
               style={styles.modalCenter}
             >
-              <Pressable style={styles.modalCard} onPress={() => {}}>
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Upgrade</Text>
-                  <TouchableOpacity
-                    onPress={closeModal}
-                    activeOpacity={0.85}
-                    style={styles.modalClose}
-                    accessibilityRole="button"
-                    accessibilityLabel="Close"
-                    disabled={saving}
-                  >
-                    <Ionicons name="close" size={20} color="#6b7280" />
-                  </TouchableOpacity>
-                </View>
-
-                <Text style={styles.planIntro}>
-                  Upgrade to increase usage limit. Billed monthly. Cancel anytime.
-                </Text>
-
-                <ScrollView
+              <Pressable style={[styles.modalCard, styles.modalCardPlan]} onPress={() => {}}>
+<ScrollView
                   style={styles.planScroll}
                   contentContainerStyle={styles.planScrollContent}
                   showsVerticalScrollIndicator={false}
                 >
                   {tiers.map((tier) => {
                     const cfg = PLAN_CONFIG[tier];
-                    const isCurrent = planTier === tier;
-                    const isUpgrade = PLAN_RANK[tier] > PLAN_RANK[planTier];
+                    const isCurrent = effectivePlanTier === tier;
+                    const isUpgrade = PLAN_RANK[tier] > PLAN_RANK[effectivePlanTier];
                     const isPending = saving && pendingPlanTier === tier;
+
+                    const priceLabel = billingCycle === 'yearly' ? '$200 / yr' : cfg.priceLabel;
+
+                    const features = (() => {
+                      if (billingCycle !== 'yearly') return cfg.features;
+                      let swapped = false;
+                      return cfg.features.map((f) => {
+                        if (swapped) return f;
+                        if (/scans/i.test(String(f))) {
+                          swapped = true;
+                          return 'Up to 1,200 scans per year';
+                        }
+                        return f;
+                      });
+                    })();
 
                     return (
                       <View
@@ -631,79 +859,126 @@ const Account: React.FC<AccountScreenProps> = ({
                             )}
                           </View>
 
-                          <Text style={styles.planPrice}>{cfg.priceLabel}</Text>
+                          <Text style={styles.planPrice}>{priceLabel}</Text>
                         </View>
 
+                        <View style={styles.planDivider} />
+
                         <View style={styles.planFeatures}>
-                          {cfg.features.map((f) => (
-                            <View key={f} style={styles.planFeatureRow}>
+                          {features.map((f, idx) => (
+                            <View key={`${tier}-${billingCycle}-${idx}`} style={styles.planFeatureRow}>
                               <Ionicons name="checkmark" size={16} color="#111827" />
                               <Text style={styles.planFeatureText}>{f}</Text>
                             </View>
                           ))}
                         </View>
 
-                        <View style={styles.planActionRow}>
+                        <View style={[styles.planActionRow, isUpgrade && styles.planActionRowWithToggle]}>
                           {isCurrent ? (
                             <View style={styles.planPillMuted}>
                               <Text style={styles.planPillMutedText}>Current plan</Text>
                             </View>
                           ) : isUpgrade ? (
-                            <TouchableOpacity
-                              style={[
-                                styles.planButton,
-                                styles.planButtonPrimary,
-                                saving && { opacity: 0.75 },
-                              ]}
-                              onPress={() => startSubscription(tier)}
-                              activeOpacity={0.85}
-                              disabled={saving}
-                            >
-                              {isPending ? (
-                                <ActivityIndicator size="small" color="#ffffff" />
-                              ) : (
-                                <Text style={styles.planButtonPrimaryText}>Get Pro</Text>
-                              )}
-                            </TouchableOpacity>
+                            <>
+                              <View style={styles.planBillingToggleGroup}>
+                                <View style={styles.planBillingToggleOuter}>
+                                  <TouchableOpacity
+                                    style={[
+                                      styles.planBillingToggleOption,
+                                      billingCycle === 'monthly' && styles.planBillingToggleOptionActive,
+                                    ]}
+                                    onPress={() => setBillingCycle('monthly')}
+                                    activeOpacity={0.9}
+                                    disabled={saving}
+                                    accessibilityRole="button"
+                                    accessibilityLabel="Monthly"
+                                  >
+                                    <Text
+                                      style={[
+                                        styles.planBillingToggleText,
+                                        billingCycle === 'monthly' && styles.planBillingToggleTextActive,
+                                      ]}
+                                    >
+                                      Monthly
+                                    </Text>
+                                  </TouchableOpacity>
+
+                                  <View style={styles.planBillingToggleYearlyWrap}>
+                                    {billingCycle === 'yearly' && (
+                                      <Text style={styles.planSavePct}>Save 20%</Text>
+                                    )}
+                                    <TouchableOpacity
+                                      style={[
+                                        styles.planBillingToggleOption,
+                                        billingCycle === 'yearly' && styles.planBillingToggleOptionActive,
+                                      ]}
+                                      onPress={() => setBillingCycle('yearly')}
+                                      activeOpacity={0.9}
+                                      disabled={saving}
+                                      accessibilityRole="button"
+                                      accessibilityLabel="Yearly"
+                                    >
+                                      <Text
+                                        style={[
+                                          styles.planBillingToggleText,
+                                          billingCycle === 'yearly' && styles.planBillingToggleTextActive,
+                                        ]}
+                                      >
+                                        Yearly
+                                      </Text>
+                                    </TouchableOpacity>
+                                  </View>
+                                </View>
+                              </View>
+
+                              <TouchableOpacity
+                                style={[
+                                  styles.planButton,
+                                  styles.planButtonPrimary,
+                                  saving && { opacity: 0.75 },
+                                ]}
+                                onPress={() => startSubscription(tier, billingCycle)}
+                                activeOpacity={0.85}
+                                disabled={saving}
+                              >
+                                {isPending ? (
+                                  <ActivityIndicator size="small" color="#111827" />
+                                ) : (
+                                  <Text style={styles.planButtonPrimaryText}>Get Pro</Text>
+                                )}
+                              </TouchableOpacity>
+                            </>
+
                           ) : (
                             <View style={styles.planPillMuted}>
                               <Text style={styles.planPillMutedText}>Lower tier</Text>
                             </View>
                           )}
                         </View>
+
+                        {isUpgrade && (
+                          <>
+                            <View style={styles.planActionDivider} />
+                            <Text style={styles.planCancelAnytime}>Instant access, cancel anytime</Text>
+                            <TouchableOpacity
+                              onPress={restorePurchasesSafe}
+                              activeOpacity={0.85}
+                              disabled={saving}
+                              style={{ marginTop: 10, alignSelf: 'center' }}
+                              accessibilityRole="button"
+                              accessibilityLabel="Restore purchases"
+                            >
+                              <Text style={{ fontSize: 12, color: '#6b7280', fontWeight: '500' }}>
+                                Restore purchases
+                              </Text>
+                            </TouchableOpacity>
+                          </>
+                        )}
                       </View>
                     );
                   })}
                 </ScrollView>
-
-                <Text style={styles.planFinePrint}>
-                  After checkout, come back here and tap Refresh to update your plan.
-                </Text>
-
-                <View style={styles.planFooter}>
-                  <TouchableOpacity
-                    style={[styles.planButton, styles.planButtonSecondary, { marginLeft: 0 }]}
-                    onPress={closeModal}
-                    activeOpacity={0.85}
-                    disabled={saving}
-                  >
-                    <Text style={styles.planButtonSecondaryText}>Close</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[
-                      styles.planButton,
-                      styles.planButtonSecondary,
-                      saving && { opacity: 0.55 },
-                    ]}
-                    onPress={refreshAccount}
-                    activeOpacity={0.85}
-                    disabled={saving}
-                  >
-                    <Text style={styles.planButtonSecondaryText}>Refresh</Text>
-                  </TouchableOpacity>
-                </View>
-              </Pressable>
+</Pressable>
             </KeyboardAvoidingView>
           </Pressable>
         </Modal>
@@ -782,7 +1057,6 @@ const Account: React.FC<AccountScreenProps> = ({
         </Modal>
       );
     }
-
     const isName = activeModal === 'name';
     const isEmail = activeModal === 'email';
     const isPassword = activeModal === 'password';
@@ -954,10 +1228,10 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const nameValue = accountName.trim().length > 0 ? accountName.trim() : 'Not set';
   const emailValue = tokenTrimmed ? (emailTrimmed || 'Loading…') : 'Not set';
-  const planValue = tokenTrimmed ? PLAN_CONFIG[planTier].label : 'Not set';
-  const planActionLabel = planTier === 'pro' ? 'Manage' : 'Upgrade';
+  const planValue = tokenTrimmed ? PLAN_CONFIG[effectivePlanTier].label : 'Not set';
+  const planActionLabel = effectivePlanTier === 'pro' ? 'Manage' : 'Upgrade';
 
-  const limits = PLAN_LIMITS[planTier];
+  const limits = PLAN_LIMITS[effectivePlanTier];
 
   const usagePercentValue = formatPercent(uploadsUsedThisMonth, limits.uploads);
 
@@ -1017,19 +1291,165 @@ const Account: React.FC<AccountScreenProps> = ({
 
         {/* Middle area */}
         <View style={styles.content}>
-          <ScrollView
-            style={styles.scroll}
-            contentContainerStyle={styles.scrollContent}
-            keyboardShouldPersistTaps="always"
-            showsVerticalScrollIndicator={false}
-          >
-            <View style={styles.listContent}>
-              {!anyRowsVisible && isFiltering ? (
-                <View style={styles.noResults}>
-                  <Text style={styles.noResultsText}>No settings match your search.</Text>
+          {activeModal === 'support' ? (
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+              style={styles.supportScreen}
+            >
+              <View style={styles.supportPanel}>
+                <View style={styles.supportPanelHeaderRow}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!saving) closeModal();
+                    }}
+                    activeOpacity={0.85}
+                    style={styles.supportBackButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Back"
+                    disabled={saving}
+                  >
+                    <Ionicons name="chevron-back" size={20} color="#111827" />
+                  </TouchableOpacity>
+
+                  <Text style={styles.supportPanelTitle}>Support</Text>
                 </View>
-              ) : (
-                <>
+
+                <View style={styles.supportPanelBody}>
+                  <TextInput
+                    value={supportMessage}
+                    onChangeText={setSupportMessage}
+                    placeholder="Describe the issue"
+                    placeholderTextColor="#9ca3af"
+                    style={[styles.supportTextArea, styles.supportTextAreaPanel]}
+                    multiline
+                    textAlignVertical="top"
+                    autoCorrect
+                  />
+                </View>
+
+                <View style={styles.supportPanelFooter}>
+                  <TouchableOpacity
+                    style={[styles.supportSubmitButton, saving && { opacity: 0.7 }]}
+                    onPress={submitSupport}
+                    activeOpacity={0.85}
+                    disabled={saving}
+                  >
+                    {saving ? (
+                      <ActivityIndicator size="small" color="#111827" />
+                    ) : (
+                      <Text style={styles.supportSubmitText}>Submit</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </KeyboardAvoidingView>
+          ) : activeModal === 'updates' ? (
+            <View style={styles.supportScreen}>
+              <View style={styles.supportPanel}>
+                <View style={styles.supportPanelHeaderRow}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!saving) closeModal();
+                    }}
+                    activeOpacity={0.85}
+                    style={styles.supportBackButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Back"
+                    disabled={saving}
+                  >
+                    <Ionicons name="chevron-back" size={20} color="#111827" />
+                  </TouchableOpacity>
+
+                  <Text style={styles.supportPanelTitle}>Updates</Text>
+                </View>
+
+                <Text style={[styles.modalInfoText, styles.updatesEmptyText]}>No updates yet</Text>
+              </View>
+            </View>
+          ) : activeModal === 'refer' ? (
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+              style={styles.supportScreen}
+            >
+              <View style={styles.supportPanel}>
+                <View style={styles.supportPanelHeaderRow}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!saving) closeModal();
+                    }}
+                    activeOpacity={0.85}
+                    style={styles.supportBackButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Back"
+                    disabled={saving}
+                  >
+                    <Ionicons name="chevron-back" size={20} color="#111827" />
+                  </TouchableOpacity>
+
+                  <Text style={[styles.supportPanelTitle, { flex: 1 }]} numberOfLines={1}>Refer user</Text>
+
+                  <TouchableOpacity
+                    onPress={openReferInfo}
+                    activeOpacity={0.85}
+                    style={styles.referInfoButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Referral info"
+                    disabled={saving}
+                  >
+                    <Text style={styles.referInfoText}>INFO</Text>
+                  </TouchableOpacity>
+                </View>
+
+<View style={styles.referInviteRow}>
+                  <TextInput
+                    value={inviteEmail}
+                    onChangeText={setInviteEmail}
+                    placeholder="Email address"
+                    placeholderTextColor="#9ca3af"
+                    style={styles.referEmailInput}
+                    keyboardType="email-address"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType="send"
+                    onSubmitEditing={sendReferralInvite}
+                  />
+
+                  <TouchableOpacity
+                    style={[styles.referSendButton, saving && { opacity: 0.7 }]}
+                    onPress={sendReferralInvite}
+                    activeOpacity={0.85}
+                    disabled={saving}
+                    accessibilityRole="button"
+                    accessibilityLabel="Send invite"
+                  >
+                    {saving ? (
+                      <ActivityIndicator size="small" color="#111827" />
+                    ) : (
+                      <Text style={styles.referSendText}>Send</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.referRewardBlock}>
+                  <Text style={[styles.referRewardText, { marginBottom: 14 }]}>1 invite = 1 month of Pro free</Text>
+                  <Text style={[styles.referRewardText, { marginBottom: 0 }]}>10 invites = 1 year of Pro free</Text>
+                </View>
+              </View>
+            </KeyboardAvoidingView>
+          ) : (
+            <ScrollView
+              style={styles.scroll}
+              contentContainerStyle={styles.scrollContent}
+              keyboardShouldPersistTaps="always"
+              showsVerticalScrollIndicator={false}
+            >
+              <View style={styles.listContent}>
+                {!anyRowsVisible && isFiltering ? (
+                  <View style={styles.noResults}>
+                    <Text style={styles.noResultsText}>No settings match your search.</Text>
+                  </View>
+                ) : (
+                  <>
                   {/* Profile */}
                   {profileRowsVisible && (
                     <View style={styles.group}>
@@ -1113,7 +1533,7 @@ const Account: React.FC<AccountScreenProps> = ({
                             {tokenTrimmed ? (
                               <TouchableOpacity
                                 style={styles.chip}
-                                onPress={openPlanModal}
+                                onPress={effectivePlanTier === 'pro' ? openCustomerCenterSafe : openPlanModal}
                                 activeOpacity={0.85}
                               >
                                 <Text style={styles.chipText}>{planActionLabel}</Text>
@@ -1128,7 +1548,7 @@ const Account: React.FC<AccountScreenProps> = ({
                           <Text style={styles.rowLabel}>Billing</Text>
                           <TouchableOpacity
                             activeOpacity={0.8}
-                            onPress={() => console.log('Update billing')}
+                            onPress={effectivePlanTier === 'pro' ? openCustomerCenterSafe : openPlanModal}
                           >
                             <Text style={styles.rowRightAction}>Update</Text>
                           </TouchableOpacity>
@@ -1140,37 +1560,44 @@ const Account: React.FC<AccountScreenProps> = ({
                   {/* Divider between plan/billing and catalog/kit */}
                   {planRowsVisible && catalogRowsVisible ? <View style={styles.sectionDivider} /> : null}
 
-                  {/* Catalog & kit */}
+                  {/* Catalog */}
                   {catalogRowsVisible && (
                     <View style={styles.group}>
-                      {showUploadUsage && (
-                        <View style={styles.row}>
-                          <Text style={styles.rowLabel}>Scans</Text>
-                          <Text style={styles.rowValue}>{usagePercentValue}</Text>
-                        </View>
-                      )}
-
-                      {showCatalog && (
+                      {showUpdates && (
                         <TouchableOpacity
                           style={styles.row}
-                          activeOpacity={0.8}
-                          onPress={() => navigation.navigate('Clients')}
+                          activeOpacity={0.85}
+                          onPress={openUpdatesModal}
                           accessibilityRole="button"
+                          accessibilityLabel="Updates"
                         >
-                          <Text style={styles.rowLabel}>Your list</Text>
-                          <Text style={styles.rowValue}>{catalogPercentValue}</Text>
+                          <Text style={styles.rowLabel}>Updates</Text>
+                          <Text style={styles.rowValue}>0</Text>
                         </TouchableOpacity>
                       )}
 
-                      {showYourKit && (
+                      {showReferUser && (
+                        <TouchableOpacity
+                          style={styles.row}
+                          activeOpacity={0.85}
+                          onPress={openReferModal}
+                          accessibilityRole="button"
+                          accessibilityLabel="Refer user"
+                        >
+                          <Text style={styles.rowLabel}>Refer user</Text>
+                          <Text style={styles.rowValue}>0</Text>
+                        </TouchableOpacity>
+                      )}
+
+                      {showSupport && (
                         <TouchableOpacity
                           style={styles.row}
                           activeOpacity={0.8}
-                          onPress={() => navigation.navigate('YourKit')}
+                          onPress={openSupportModal}
                           accessibilityRole="button"
                         >
-                          <Text style={styles.rowLabel}>Your kit</Text>
-                          <Text style={styles.rowValue}>{kitPercentValue}</Text>
+                          <Text style={styles.rowLabel}>Support</Text>
+                          <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
                         </TouchableOpacity>
                       )}
                     </View>
@@ -1179,7 +1606,7 @@ const Account: React.FC<AccountScreenProps> = ({
                   {/* Divider between catalog/kit and communication/support */}
                   {catalogRowsVisible && commRowsVisible ? <View style={styles.sectionDivider} /> : null}
 
-                  {/* Communication: email updates + support */}
+                  {/* Communication: email updates */}
                   {commRowsVisible && (
                     <View style={styles.group}>
                       {showEmailUpdates && (
@@ -1208,21 +1635,10 @@ const Account: React.FC<AccountScreenProps> = ({
                           <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
                         </TouchableOpacity>
                       )}
-
-                      {showSupport && (
-                        <TouchableOpacity
-                          style={styles.row}
-                          activeOpacity={0.8}
-                          onPress={() => console.log('Support pressed')}
-                        >
-                          <Text style={styles.rowLabel}>Support</Text>
-                          <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
-                        </TouchableOpacity>
-                      )}
                     </View>
                   )}
 
-                  {/* Divider under email/support */}
+                  {/* Divider under email settings */}
                   {commRowsVisible && actionRowsVisible ? <View style={styles.sectionDivider} /> : null}
 
                   {/* Account actions */}
@@ -1253,8 +1669,9 @@ const Account: React.FC<AccountScreenProps> = ({
                   )}
                 </>
               )}
-            </View>
-          </ScrollView>
+              </View>
+            </ScrollView>
+          )}
         </View>
 
         {renderModal()}
@@ -1295,7 +1712,7 @@ const styles = StyleSheet.create({
     minHeight: 38,
   },
   searchIcon: {
-    marginRight: 10,
+    marginRight: 14,
   },
   searchInput: {
     flex: 1,
@@ -1437,8 +1854,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   toggleOuterOn: {
-    borderColor: '#111827',
-    backgroundColor: '#111827',
+    borderColor: '#9ca3af',
+    backgroundColor: '#9ca3af',
   },
   toggleThumb: {
     width: 16,
@@ -1478,12 +1895,20 @@ const styles = StyleSheet.create({
     padding: 20,
     justifyContent: 'center',
   },
-  modalCard: {
+    modalCard: {
     backgroundColor: '#ffffff',
     borderRadius: 16,
     borderWidth: 1,
     borderColor: '#e5e7eb',
-    padding: 16,
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    paddingBottom: 18,
+  },
+  // Slightly less padding for the plan (upgrade) modal so content doesn't feel too inset.
+  modalCardPlan: {
+    paddingHorizontal: 22,
+    paddingTop: 20,
+    paddingBottom: 28,
   },
   modalHeader: {
     flexDirection: 'row',
@@ -1493,7 +1918,7 @@ const styles = StyleSheet.create({
   },
   modalTitle: {
     fontSize: 15,
-    fontWeight: '600',
+    fontWeight: '500',
     color: '#111827',
   },
   modalClose: {
@@ -1523,6 +1948,17 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#6b7280',
   },
+  modalInfoText: {
+    marginTop: 18,
+    marginBottom: 6,
+    fontSize: 13,
+    color: '#6b7280',
+    textAlign: 'center',
+  },
+  updatesEmptyText: {
+    textAlign: 'left',
+    alignSelf: 'stretch',
+  },
   modalWarningText: {
     fontSize: 12,
     color: '#6b7280',
@@ -1549,7 +1985,7 @@ const styles = StyleSheet.create({
   modalButtonSecondaryText: {
     fontSize: 13,
     color: '#111827',
-    fontWeight: '600',
+    fontWeight: '500',
   },
   modalButtonPrimary: {
     backgroundColor: '#111827',
@@ -1557,7 +1993,7 @@ const styles = StyleSheet.create({
   modalButtonPrimaryText: {
     fontSize: 13,
     color: '#ffffff',
-    fontWeight: '600',
+    fontWeight: '500',
   },
   modalButtonDanger: {
     backgroundColor: '#b91c1c',
@@ -1565,7 +2001,148 @@ const styles = StyleSheet.create({
   modalButtonDangerText: {
     fontSize: 13,
     color: '#ffffff',
-    fontWeight: '600',
+    fontWeight: '500',
+  },
+
+  // Support screen (covers the settings list area)
+  supportScreen: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+  },
+  supportPanel: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 8,
+    paddingTop: 22,
+    paddingBottom: 14,
+  },
+  supportPanelHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  supportBackButton: {
+    paddingVertical: 6,
+    paddingRight: 10,
+  },
+    supportPanelTitle: {
+    fontSize: 15,
+    fontWeight: '500',
+    color: '#111827',
+    textAlign: 'left',
+    marginLeft: 2,
+  },
+
+  supportHeaderSpacer: {
+    width: 30,
+  },
+  supportPanelBody: {
+    // Keep the submit button visually close to the input.
+    // (Avoid pushing the footer to the bottom of the panel.)
+    marginBottom: 12,
+  },
+  supportLabel: {
+    fontSize: 12,
+    color: '#6b7280',
+    marginBottom: 8,
+  },
+    supportTextArea: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 13,
+    color: '#111827',
+    backgroundColor: '#ffffff',
+  },
+
+    supportTextAreaPanel: {
+    height: 140,
+  },
+
+    supportPanelFooter: {
+    paddingTop: 14,
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+
+    supportSubmitButton: {
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#111827',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'flex-end',
+  },
+
+  supportSubmitText: {
+    fontSize: 13,
+    color: '#111827',
+    fontWeight: '500',
+  },
+
+
+  // Refer a friend
+  referInfoButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+  },
+  referInfoText: {
+    fontSize: 12,
+    color: '#9ca3af',
+    fontWeight: '400',
+  },
+
+
+  referInviteRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 6,
+    marginBottom: 22,
+  },
+  referEmailInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 13,
+    color: '#111827',
+    backgroundColor: '#ffffff',
+    minHeight: 42,
+    marginRight: 14,
+  },
+  referSendButton: {
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    minWidth: 72,
+    minHeight: 42,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#111827',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  referSendText: {
+    fontSize: 13,
+    color: '#111827',
+    fontWeight: '500',
+  },
+  referRewardBlock: {
+    marginTop: 14,
+  },
+  referRewardText: {
+    fontSize: 12,
+    color: '#6b7280',
+    lineHeight: 16,
+    marginBottom: 6,
   },
 
 
@@ -1576,37 +2153,106 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     lineHeight: 16,
   },
-  planScroll: {
-    maxHeight: 420,
+  planBillingToggleGroup: {
+    marginRight: 29,
+    alignItems: 'center',
+    position: 'relative',
   },
-  planScrollContent: {
-    paddingBottom: 6,
+  planSavePct: {
+    position: 'absolute',
+    top: -18,
+    left: 0,
+    right: 0,
+    textAlign: 'center',
+    fontSize: 11,
+    color: '#6b7280',
+    fontWeight: '500',
   },
-  planCard: {
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    borderRadius: 16,
-    padding: 14,
-    marginBottom: 12,
+  planBillingToggleOuter: {
+    flexDirection: 'row',
+    backgroundColor: '#f3f4f6',
+    borderRadius: 999,
+    overflow: 'visible',
+    padding: 3,
+  },
+  planBillingToggleYearlyWrap: {
+    position: 'relative',
+  },
+    planBillingToggleOption: {
+    paddingVertical: 8,
+    paddingHorizontal: 18,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+    planBillingToggleOptionActive: {
     backgroundColor: '#ffffff',
   },
+    planBillingToggleText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#6b7280',
+  },
+    planBillingToggleTextActive: {
+    color: '#111827',
+  },
+  planBillingHint: {
+    marginTop: 10,
+    textAlign: 'center',
+    fontSize: 11,
+    color: '#6b7280',
+    fontWeight: '400',
+  },
+  planScroll: {
+    maxHeight: 520,
+  },
+  planScrollContent: {
+    paddingTop: 0,
+    paddingBottom: 0,
+    paddingHorizontal: 0,
+  },
+  planCard: {
+    paddingHorizontal: 0,
+    paddingVertical: 4,
+    marginBottom: 0,
+    backgroundColor: 'transparent',
+  },
   planCardCurrent: {
-    borderColor: '#111827',
-    backgroundColor: '#f9fafb',
+    backgroundColor: 'transparent',
+    shadowOpacity: 0,
+    elevation: 0,
   },
   planTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 10,
+    marginBottom: 0,
   },
+  planDivider: {
+    height: 1,
+    backgroundColor: '#f1f1f1',
+    marginTop: 20,
+    marginBottom: 28,
+  },
+  planActionDivider: {
+    height: 1,
+    backgroundColor: '#f1f1f1',
+    marginTop: 32,
+    marginBottom: 22,
+  },
+  planCancelAnytime: {
+    fontSize: 11,
+    color: '#6b7280',
+    fontWeight: '400',
+  },
+
   planNameRow: {
     flexDirection: 'row',
     alignItems: 'center',
   },
   planName: {
     fontSize: 14,
-    fontWeight: '600',
+    fontWeight: '500',
     color: '#111827',
   },
   planCurrentTag: {
@@ -1619,20 +2265,21 @@ const styles = StyleSheet.create({
   planCurrentTagText: {
     fontSize: 11,
     color: '#ffffff',
-    fontWeight: '600',
+    fontWeight: '500',
   },
   planPrice: {
     fontSize: 13,
     color: '#111827',
-    fontWeight: '600',
+    fontWeight: '500',
   },
   planFeatures: {
-    marginBottom: 12,
+    marginTop: 0,
+    marginBottom: 14,
   },
-  planFeatureRow: {
+    planFeatureRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 8,
+    marginBottom: 10,
   },
   planFeatureText: {
     marginLeft: 8,
@@ -1642,7 +2289,13 @@ const styles = StyleSheet.create({
   },
   planActionRow: {
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'flex-end',
+    marginTop: 12,
+  },
+  planActionRowWithToggle: {
+    alignItems: 'flex-start',
+    marginTop: 14,
   },
   planPillMuted: {
     paddingHorizontal: 10,
@@ -1655,7 +2308,7 @@ const styles = StyleSheet.create({
   planPillMutedText: {
     fontSize: 12,
     color: '#6b7280',
-    fontWeight: '600',
+    fontWeight: '500',
   },
   planFinePrint: {
     marginTop: 2,
@@ -1676,12 +2329,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   planButtonPrimary: {
-    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#111827',
+    backgroundColor: '#ffffff',
   },
   planButtonPrimaryText: {
     fontSize: 13,
-    color: '#ffffff',
-    fontWeight: '600',
+    color: '#111827',
+    fontWeight: '500',
   },
   planButtonSecondary: {
     borderWidth: 1,
@@ -1692,8 +2347,9 @@ const styles = StyleSheet.create({
   planButtonSecondaryText: {
     fontSize: 13,
     color: '#111827',
-    fontWeight: '600',
+    fontWeight: '500',
   },
+
 });
 
 export default Account;

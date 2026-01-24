@@ -77,9 +77,14 @@ const STORAGE_KEY = DOC_KEYS.kitlog;
 const CATEGORY_BAR_TARGET = 12;
 
 
-// How the bar sits when keyboard is CLOSED
-// (Adds a little more breathing room above the bottom nav divider)
-const CLOSED_BOTTOM_PADDING = 28;
+// Where the bottom input bar rests when the keyboard is CLOSED.
+// (Matches the old visual spacing above the tab bar, but we dock the bar absolutely
+// so there is no non-scrollable "dead" zone at the bottom.)
+const FOOTER_REST_OFFSET = 28;
+
+// Approximate height footprint of the bottom input bar.
+// Used to pad ScrollView content so the last rows aren't hidden behind the docked bar.
+const FOOTER_BAR_HEIGHT = 62;
 
 // Extra space ABOVE the keyboard when it’s OPEN
 // (Raised to make the lift clearly noticeable)
@@ -102,7 +107,7 @@ const CORE_CATEGORY_ORDER = [
   'Lashes',
   'Tools',
   'Hygiene & Disposables',
-  'Body / FX / Extras',
+  'Other',
 ];
 
 const CORE_CATEGORY_NAME_SET = new Set(CORE_CATEGORY_ORDER.map((n) => n.trim().toLowerCase()));
@@ -116,6 +121,15 @@ function normalizeCategoryName(raw: any): string {
   if (!t) return '';
   // Migration: "Base" -> "Foundation".
   if (t.toLowerCase() === 'base') return FOUNDATION_CATEGORY_NAME;
+  // Migration: "Body / FX / Extras" -> "Other".
+  const key = t.toLowerCase();
+  if (
+    key === 'body / fx / extras' ||
+    key === 'body/fx/extras' ||
+    key === 'body fx extras'
+  ) {
+    return 'Other';
+  }
   return t;
 }
 
@@ -353,7 +367,11 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
 
   // Screens render ABOVE the tab bar, so subtract its height to avoid a jump.
   const keyboardInset = keyboardHeight > 0 ? Math.max(0, keyboardHeight - tabBarHeight) : 0;
-  const bottomPadding = keyboardHeight > 0 ? keyboardInset + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
+
+  // Dock the input bar absolutely (so swipes in the lower area still scroll), and
+  // keep its resting position consistent with the previous layout.
+  const footerBottom = keyboardHeight > 0 ? keyboardInset + KEYBOARD_GAP : FOOTER_REST_OFFSET;
+  const scrollPadBottom = footerBottom + FOOTER_BAR_HEIGHT + 14;
 
   const activeCategory = useMemo(() => {
     if (!activeCategoryId) return null;
@@ -816,7 +834,7 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
       <SafeAreaView style={[styles.safeArea, { paddingTop: stableTopInset }]} edges={['left', 'right']}>
-        <View style={[styles.container, { paddingBottom: bottomPadding }]}>
+        <View style={styles.container}>
           {/* Top bar */}
           <View style={styles.topBar}>
             <View style={styles.searchPill}>
@@ -846,7 +864,12 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
             <View style={{ flex: 1 }}>
               <ScrollView
                 style={{ flex: 1 }}
-                contentContainerStyle={{ paddingBottom: 26, paddingTop: 18, paddingLeft: 6, paddingRight: 0 }}
+                contentContainerStyle={{
+                  paddingBottom: scrollPadBottom,
+                  paddingTop: 18,
+                  paddingLeft: 6,
+                  paddingRight: 0,
+                }}
                 keyboardShouldPersistTaps="handled"
                 showsVerticalScrollIndicator={false}
               >
@@ -1065,9 +1088,13 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                 </View>
               </ScrollView>
 
+              {/* White underlay to mask scroll content between the docked bar and the tab bar */}
+              <View style={[styles.inputBarUnderlay, { height: footerBottom }]} pointerEvents="none" />
+
               {/* Bottom bar (home) – create category */}
-              <View style={styles.inputBar}>
-                <View style={styles.inputContainer}>
+              <View style={[styles.inputBarDock, { bottom: footerBottom }]} pointerEvents="box-none">
+                <View style={styles.inputBar} pointerEvents="box-none">
+                  <View style={styles.inputContainer} pointerEvents="box-none">
                   <TextInput
                     style={styles.textInput}
                     value={newCategoryText}
@@ -1082,6 +1109,7 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                   <TouchableOpacity style={styles.iconButton} onPress={addCategoryFromBar} accessibilityRole="button">
                     <Ionicons name="add" size={20} color="#ffffff" />
                   </TouchableOpacity>
+                  </View>
                 </View>
               </View>
             </View>
@@ -1121,7 +1149,7 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
 
               <ScrollView
                 style={{ flex: 1 }}
-                contentContainerStyle={{ paddingBottom: 18, paddingTop: 12 }}
+                contentContainerStyle={{ paddingBottom: scrollPadBottom, paddingTop: 12 }}
                 keyboardShouldPersistTaps="handled"
                 showsVerticalScrollIndicator={false}
               >
@@ -1186,9 +1214,13 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                 </View>
               </ScrollView>
 
+              {/* White underlay to mask scroll content between the docked bar and the tab bar */}
+              <View style={[styles.inputBarUnderlay, { height: footerBottom }]} pointerEvents="none" />
+
               {/* Bottom bar (category) – add item */}
-              <View style={styles.inputBar}>
-                <View style={styles.inputContainer}>
+              <View style={[styles.inputBarDock, { bottom: footerBottom }]} pointerEvents="box-none">
+                <View style={styles.inputBar} pointerEvents="box-none">
+                  <View style={styles.inputContainer} pointerEvents="box-none">
                   <TextInput
                     style={styles.textInput}
                     value={quickAddText}
@@ -1200,9 +1232,10 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                     blurOnSubmit={false}
                   />
 
-                  <TouchableOpacity style={styles.iconButton} onPress={quickAddItem} accessibilityRole="button">
-                    <Ionicons name="add" size={20} color="#ffffff" />
-                  </TouchableOpacity>
+                    <TouchableOpacity style={styles.iconButton} onPress={quickAddItem} accessibilityRole="button">
+                      <Ionicons name="add" size={20} color="#ffffff" />
+                    </TouchableOpacity>
+                  </View>
                 </View>
               </View>
             </View>
@@ -2003,6 +2036,19 @@ const styles = StyleSheet.create({
   },
 
   // Bottom bar
+  inputBarUnderlay: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#ffffff',
+  },
+  inputBarDock: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    backgroundColor: '#ffffff',
+  },
   inputBar: {
     paddingTop: 8,
   },

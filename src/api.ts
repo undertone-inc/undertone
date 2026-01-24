@@ -210,9 +210,9 @@ export const PLAN_CONFIG: Record<
     priceLabel: '$20 / mo',
     features: [
       'Up to 100 scans per month',
-      'Up to 1,000 total clients',
-      'Up to 1,000 total kit items',
-      'Increase in scan accuracy',
+      'Up to 1,000 scans on your list',
+      'Up to 1,000 items in your kit',
+      'Undertone e-mail support',
     ],
   },
 };
