@@ -8,9 +8,34 @@ CREATE TABLE IF NOT EXISTS users (
   email_norm TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   account_name TEXT NOT NULL DEFAULT '',
+
+  -- Subscription state (synced from RevenueCat)
+  -- plan_tier: 'free' | 'pro'
+  plan_tier TEXT NOT NULL DEFAULT 'free',
+  -- plan_interval: 'month' | 'year'
+  plan_interval TEXT NOT NULL DEFAULT 'month',
+  -- Product identifier that granted access (e.g. 'monthly' | 'yearly')
+  plan_product_id TEXT,
+  -- Start of the current entitlement period (used for yearly quota enforcement)
+  plan_started_at TIMESTAMPTZ,
+  -- Entitlement expiration (when available)
+  plan_expires_at TIMESTAMPTZ,
+  -- Last time we synced plan state from RevenueCat
+  rc_last_synced_at TIMESTAMPTZ,
+
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Backfill / upgrade existing tables (idempotent)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_tier TEXT NOT NULL DEFAULT 'free';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_interval TEXT NOT NULL DEFAULT 'month';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_product_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_started_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS rc_last_synced_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_users_plan_tier ON users(plan_tier);
 
 CREATE TABLE IF NOT EXISTS user_docs (
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -52,7 +77,7 @@ CREATE TABLE IF NOT EXISTS password_resets (
 CREATE INDEX IF NOT EXISTS idx_password_resets_user_id ON password_resets(user_id);
 CREATE INDEX IF NOT EXISTS idx_password_resets_expires_at ON password_resets(expires_at);
 
--- --- Face analyses (for monthly upload counts + optional history) ---
+-- --- Face analyses (for upload counts + optional history) ---
 -- NOTE: We do NOT store the raw image bytes. Only a sha256 hash (optional)
 -- and the structured analysis JSON for later reference.
 CREATE TABLE IF NOT EXISTS face_analyses (

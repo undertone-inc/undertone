@@ -13,7 +13,8 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "io.undertoneapp.undertone"
     },
     "android": {
       "adaptiveIcon": {
@@ -21,7 +22,11 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "softwareKeyboardLayoutMode": "pan"
+      "softwareKeyboardLayoutMode": "pan",
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "io.undertoneapp.undertone"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -39,7 +44,8 @@
           "photosPermission": "Allow Undertone to access your photos so you can analyze your undertone.",
           "cameraPermission": "Allow Undertone to use your camera so you can take a photo for undertone analysis."
         }
-      ]
+      ],
+      "expo-web-browser"
     ]
   }
 }

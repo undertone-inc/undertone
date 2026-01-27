@@ -2,20 +2,53 @@ import { Platform } from 'react-native';
 import Purchases, { LOG_LEVEL, PURCHASES_ERROR_CODE } from 'react-native-purchases';
 import RevenueCatUI, { PAYWALL_RESULT } from 'react-native-purchases-ui';
 
-// IMPORTANT:
-// - ENTITLEMENT_ID must match the *entitlement identifier* configured in RevenueCat.
-// - This is NOT the product ID. Products are monthly/yearly, entitlement is undertone_pro.
+// Must match the entitlement identifier in RevenueCat dashboard
 export const ENTITLEMENT_ID = 'undertone_pro';
 
-function getApiKey(): string {
-  const ios = process.env.EXPO_PUBLIC_RC_IOS_KEY;
-  const android = process.env.EXPO_PUBLIC_RC_ANDROID_KEY;
+function isTestStoreKey(key: string): boolean {
+  return /^test_/i.test(String(key || '').trim());
+}
 
-  if (Platform.OS === 'ios' && ios) return ios;
-  if (Platform.OS === 'android' && android) return android;
+function isSecretKey(key: string): boolean {
+  return /^sk_/i.test(String(key || '').trim());
+}
 
-  // Fallback for local testing. Prefer platform-specific keys when available.
-  return ios || android || 'test_mOZPRCLAoyTEMVWEtCTbCMrWPGh';
+function getApiKeyOrThrow(): string {
+  const ios = String(process.env.EXPO_PUBLIC_RC_IOS_KEY || '').trim();
+  const android = String(process.env.EXPO_PUBLIC_RC_ANDROID_KEY || '').trim();
+
+  const apiKey =
+    Platform.OS === 'ios' ? ios : Platform.OS === 'android' ? android : ios || android;
+
+  const varName =
+    Platform.OS === 'ios'
+      ? 'EXPO_PUBLIC_RC_IOS_KEY'
+      : Platform.OS === 'android'
+      ? 'EXPO_PUBLIC_RC_ANDROID_KEY'
+      : 'EXPO_PUBLIC_RC_IOS_KEY / EXPO_PUBLIC_RC_ANDROID_KEY';
+
+  if (!apiKey) {
+    throw new Error(
+      `[revenuecat] Missing ${varName}. Set it to your RevenueCat *public* SDK key (or a Test Store key for dev builds).`
+    );
+  }
+
+  // Never embed secret keys in the client app.
+  if (isSecretKey(apiKey)) {
+    throw new Error(
+      '[revenuecat] You configured a Secret API key (sk_...) in the app. Use the app-specific PUBLIC SDK key instead.'
+    );
+  }
+
+  // RevenueCat explicitly warns: never ship a release build configured with the Test Store key.
+  // In release builds (__DEV__ === false), require a platform key.
+  if (!__DEV__ && isTestStoreKey(apiKey)) {
+    throw new Error(
+      '[revenuecat] This build is using a Test Store API key (test_...). Do not ship with the Test Store key. Use your platform (Apple/Google) public SDK key.'
+    );
+  }
+
+  return apiKey;
 }
 
 export function hasProEntitlement(customerInfo: any): boolean {
@@ -33,9 +66,9 @@ export function getReadablePurchaseError(err: any): string {
 }
 
 export async function configureRevenueCat(): Promise<void> {
-  const apiKey = getApiKey();
+  const apiKey = getApiKeyOrThrow();
 
-  // When debugging, set the log level BEFORE configure.
+  // Helpful during dev. Set BEFORE configure.
   if (__DEV__) {
     try {
       await Purchases.setLogLevel(LOG_LEVEL.DEBUG);
@@ -47,6 +80,7 @@ export async function configureRevenueCat(): Promise<void> {
   Purchases.configure({ apiKey });
 }
 
+// Use your stable backend user id (not email) as appUserID
 export async function identifyUser(appUserID: string): Promise<any | null> {
   const { customerInfo } = await Purchases.logIn(String(appUserID));
   return customerInfo ?? null;
@@ -84,7 +118,7 @@ function pickPackageFromOffering(offering: any, cycle: 'monthly' | 'yearly'): an
   const byProductId = (id: string) =>
     pkgs.find((p) => String(p?.product?.identifier || '').trim() === id) || null;
 
-  // Your configured product identifiers.
+  // Your product identifiers in the stores + RevenueCat
   if (cycle === 'monthly') {
     return (
       byProductId('monthly') ||
@@ -103,12 +137,9 @@ function pickPackageFromOffering(offering: any, cycle: 'monthly' | 'yearly'): an
   );
 }
 
-export async function purchaseCycle(cycle: 'monthly' | 'yearly'): Promise<{
-  ok: boolean;
-  cancelled?: boolean;
-  customerInfo?: any;
-  message?: string;
-}> {
+export async function purchaseCycle(
+  cycle: 'monthly' | 'yearly'
+): Promise<{ ok: boolean; cancelled?: boolean; customerInfo?: any; message?: string }> {
   try {
     const offerings = await Purchases.getOfferings();
     const offering = offerings?.current;
@@ -137,6 +168,7 @@ export async function restorePurchases(): Promise<{ ok: boolean; customerInfo?: 
   }
 }
 
+// ---------- Paywalls ----------
 export async function presentPaywall(offering?: any): Promise<boolean> {
   const result: PAYWALL_RESULT = offering
     ? await RevenueCatUI.presentPaywall({ offering })
@@ -151,6 +183,7 @@ export async function presentPaywallIfNeeded(offering?: any): Promise<PAYWALL_RE
   return await RevenueCatUI.presentPaywallIfNeeded(params);
 }
 
+// ---------- Customer Center ----------
 export async function presentCustomerCenter(): Promise<void> {
   await RevenueCatUI.presentCustomerCenter();
 }

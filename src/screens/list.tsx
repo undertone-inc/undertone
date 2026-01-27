@@ -605,11 +605,11 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     if (limit !== Infinity && used >= limit) {
       const isPro = planTier === 'pro';
       const msg = isPro
-        ? `You’ve reached the Pro plan limit of ${limit.toLocaleString()} clients.`
-        : `Free plan allows up to ${limit.toLocaleString()} clients. Upgrade to Pro to add more.`;
+        ? `You’ve reached the Pro plan limit of ${limit.toLocaleString()} list items.`
+        : `Free plan allows up to ${limit.toLocaleString()} list items. Upgrade to Pro to add more.`;
 
       Alert.alert(
-        'Client limit reached',
+        'List limit reached',
         msg,
         isPro
           ? [{ text: 'OK' }]
@@ -710,7 +710,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
   function deleteClient() {
     if (!draft) return;
-    Alert.alert('Delete client', 'This removes the client from your catalog.', [
+    Alert.alert('Delete from list', 'This removes the item from your list.', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Delete',
@@ -837,7 +837,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
             ListEmptyComponent={
               searchActive ? (
                 <View style={styles.emptyPad}>
-                  <Text style={styles.emptyPadText}>No clients found.</Text>
+                  <Text style={styles.emptyPadText}>No items found.</Text>
                 </View>
               ) : (
                 <View style={{ height: 0 }} />

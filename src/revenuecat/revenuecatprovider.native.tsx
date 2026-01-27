@@ -10,7 +10,6 @@ import {
   logoutUser,
   presentCustomerCenter,
   presentPaywall,
-  presentPaywallIfNeeded,
   purchaseCycle,
   restorePurchases,
 } from './revenuecat';
@@ -18,16 +17,20 @@ import {
 export type RevenueCatPurchaseResult = { ok: boolean; cancelled?: boolean; message?: string };
 
 export type RevenueCatContextValue = {
+  /** True when RevenueCat is configured and safe to use. */
   ready: boolean;
+  /** Set when RevenueCat failed to initialize (missing key, wrong key, etc.). */
+  initError: string | null;
+
   isPro: boolean;
   customerInfo: any | null;
   offerings: any | null;
+
   refresh: () => Promise<void>;
   buyMonthly: () => Promise<RevenueCatPurchaseResult>;
   buyYearly: () => Promise<RevenueCatPurchaseResult>;
   restore: () => Promise<RevenueCatPurchaseResult>;
   showPaywall: () => Promise<boolean>;
-  showPaywallIfNeeded: () => Promise<any>;
   openCustomerCenter: () => Promise<void>;
 };
 
@@ -39,8 +42,16 @@ export function useRevenueCat(): RevenueCatContextValue {
   return v;
 }
 
-export function RevenueCatProvider({ appUserID, children }: { appUserID: string | null; children: React.ReactNode }) {
+export function RevenueCatProvider({
+  appUserID,
+  children,
+}: {
+  appUserID: string | null;
+  children: React.ReactNode;
+}) {
   const [ready, setReady] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
+
   const [customerInfo, setCustomerInfo] = useState<any | null>(null);
   const [offerings, setOfferings] = useState<any | null>(null);
   const [isPro, setIsPro] = useState(false);
@@ -54,24 +65,34 @@ export function RevenueCatProvider({ appUserID, children }: { appUserID: string 
     if (off) setOfferings(off);
   }, []);
 
+  // Configure once
   useEffect(() => {
     let alive = true;
+
     (async () => {
       try {
         await configureRevenueCat();
-      } catch (e) {
-        console.warn('[revenuecat] configure failed', e);
-      } finally {
         if (!alive) return;
+        setInitError(null);
         setReady(true);
         refresh().catch(() => {});
+      } catch (e: any) {
+        console.warn('[revenuecat] configure failed', e);
+        if (!alive) return;
+        setReady(false);
+        setInitError(String(e?.message || e || 'RevenueCat failed to initialize.'));
       }
     })();
-    return () => { alive = false; };
+
+    return () => {
+      alive = false;
+    };
   }, [refresh]);
 
+  // Identify/log out when auth changes
   useEffect(() => {
     if (!ready) return;
+
     (async () => {
       try {
         if (appUserID) {
@@ -92,6 +113,7 @@ export function RevenueCatProvider({ appUserID, children }: { appUserID: string 
     })();
   }, [appUserID, ready]);
 
+  // Listen for entitlement/customerInfo updates (renewals, refunds, restores, etc.)
   useEffect(() => {
     if (!ready) return;
 
@@ -101,13 +123,25 @@ export function RevenueCatProvider({ appUserID, children }: { appUserID: string 
     };
 
     const P: any = Purchases as any;
-    try { P.addCustomerInfoUpdateListener?.(listener); } catch {}
-    return () => { try { P.removeCustomerInfoUpdateListener?.(listener); } catch {} };
+    try {
+      P.addCustomerInfoUpdateListener?.(listener);
+    } catch {
+      // ignore
+    }
+
+    return () => {
+      try {
+        P.removeCustomerInfoUpdateListener?.(listener);
+      } catch {
+        // ignore
+      }
+    };
   }, [ready]);
 
   const value = useMemo<RevenueCatContextValue>(
     () => ({
       ready,
+      initError,
       isPro,
       customerInfo,
       offerings,
@@ -140,15 +174,11 @@ export function RevenueCatProvider({ appUserID, children }: { appUserID: string 
         const offering = offerings?.current ?? undefined;
         return await presentPaywall(offering);
       },
-      showPaywallIfNeeded: async () => {
-        const offering = offerings?.current ?? undefined;
-        return await presentPaywallIfNeeded(offering);
-      },
       openCustomerCenter: async () => {
         await presentCustomerCenter();
       },
     }),
-    [ready, isPro, customerInfo, offerings, refresh]
+    [ready, initError, isPro, customerInfo, offerings, refresh]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

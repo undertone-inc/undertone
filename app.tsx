@@ -9,16 +9,16 @@ import Svg, { Line, Rect, Path } from 'react-native-svg';
 
 import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-context';
 
-import { clearToken, getToken } from './src/auth';
+import { clearToken, getAuthProfile, saveAuthProfile, getToken } from './src/auth';
 import { migrateLegacySecureStoreIfNeeded } from './src/localstore';
 import { PlanTier, normalizePlanTier } from './src/api';
-import { RevenueCatProvider, useRevenueCat } from './src/revenuecat/revenuecatprovider';
 import Login from './src/screens/login';
 import Upload from './src/screens/upload';
 import Account from './src/screens/account';
 import List from './src/screens/list';
 import Inventory from './src/screens/inventory';
 import CameraScreen from './src/screens/camera';
+import { RevenueCatProvider, useRevenueCat } from './src/revenuecat/revenuecatprovider';
 
 export type AuthStackParamList = {
   Login: undefined;
@@ -44,18 +44,6 @@ const AppStack = createNativeStackNavigator<AppStackParamList>();
 const AuthStackNavigator = AuthStack.Navigator as React.ComponentType<any>;
 const TabNavigator = Tabs.Navigator as React.ComponentType<any>;
 const AppStackNavigator = AppStack.Navigator as React.ComponentType<any>;
-
-function RevenueCatPlanBridge({
-  serverPlanTier,
-  children,
-}: {
-  serverPlanTier: PlanTier;
-  children: (effectivePlanTier: PlanTier) => React.ReactNode;
-}) {
-  const { isPro } = useRevenueCat();
-  const effectivePlanTier: PlanTier = isPro || serverPlanTier === 'pro' ? 'pro' : 'free';
-  return <>{children(effectivePlanTier)}</>;
-}
 
 function TabBarBackground() {
   return (
@@ -321,6 +309,19 @@ function AppTabsShell({
     </TabNavigator>
   );
 }
+
+function RevenueCatPlanBridge({
+  serverPlanTier,
+  children,
+}: {
+  serverPlanTier: PlanTier;
+  children: (effectivePlanTier: PlanTier) => React.ReactNode;
+}) {
+  const { isPro } = useRevenueCat();
+  const effectivePlanTier: PlanTier = isPro || serverPlanTier === 'pro' ? 'pro' : 'free';
+  return <>{children(effectivePlanTier)}</>;
+}
+
 export default function App() {
   const [booting, setBooting] = useState(true);
   const [authToken, setAuthToken] = useState<string | null>(null);
@@ -342,11 +343,32 @@ export default function App() {
         token = null;
       }
 
+      // Restore cached profile (so Account screen never shows "Loading…" when the API is unreachable).
+      let cachedProfile: any = null;
+      try {
+        cachedProfile = await getAuthProfile();
+      } catch {
+        cachedProfile = null;
+      }
+
       if (!alive) return;
 
       if (token) {
         // Optimistically render the authed app immediately.
         setAuthToken(token);
+
+        // Apply cached profile immediately (best-effort).
+        try {
+          const cachedEmail = String(cachedProfile?.email || '').trim();
+          const cachedId = String(cachedProfile?.userId || '').trim();
+          const cachedTier = normalizePlanTier(cachedProfile?.planTier);
+          if (cachedEmail) setUserEmail(cachedEmail);
+          if (cachedId) setUserId(cachedId);
+          if (cachedTier) setPlanTier(cachedTier);
+          if (cachedId) migrateLegacySecureStoreIfNeeded(cachedId).catch(() => {});
+        } catch {
+          // ignore
+        }
 
         // Fetch canonical user + plan tier (background; do not block startup).
         (async () => {
@@ -356,6 +378,7 @@ export default function App() {
 
             const email = String(data?.user?.email || '').trim();
             const id = String(data?.user?.id || '').trim();
+            const accountName = String(data?.user?.accountName || '').trim();
             const tier = normalizePlanTier(
               data?.user?.planTier ??
                 data?.user?.plan ??
@@ -367,6 +390,14 @@ export default function App() {
             if (email) setUserEmail(email);
             if (id) setUserId(id);
             setPlanTier(tier);
+
+            // Keep cached profile in sync for offline / unreachable API scenarios.
+            saveAuthProfile({
+              email: email || null,
+              userId: id || null,
+              accountName: accountName || null,
+              planTier: tier || null,
+            }).catch(() => {});
 
             // One-time migration: move large blobs out of SecureStore.
             // Best-effort; do not block rendering.
@@ -395,6 +426,8 @@ export default function App() {
           }
         })();
       } else {
+        // No token means no authenticated session; ensure cached profile is cleared.
+        clearToken().catch(() => {});
         setAuthToken(null);
         setUserEmail(null);
         setUserId(null);
@@ -425,6 +458,7 @@ export default function App() {
         const data = await fetchMe(token);
         const nextEmail = String(data?.user?.email || '').trim();
         const nextId = String(data?.user?.id || '').trim();
+        const accountName = String(data?.user?.accountName || '').trim();
         const tier = normalizePlanTier(
           data?.user?.planTier ??
             data?.user?.plan ??
@@ -436,6 +470,15 @@ export default function App() {
         if (nextEmail) setUserEmail(nextEmail);
         if (nextId) setUserId(nextId);
         setPlanTier(tier);
+
+        // Keep cached profile in sync.
+        saveAuthProfile({
+          email: nextEmail || email || null,
+          userId: nextId || idStr || null,
+          accountName: accountName || null,
+          planTier: tier || null,
+        }).catch(() => {});
+
         if (nextId) migrateLegacySecureStoreIfNeeded(nextId).catch(() => {});
       } catch {
         // ignore
@@ -455,11 +498,11 @@ export default function App() {
 
   const handleEmailUpdated = (nextEmail: string) => {
     setUserEmail(nextEmail);
+    saveAuthProfile({ email: nextEmail || null }).catch(() => {});
   };
 
   return (
-    <RevenueCatProvider appUserID={authToken ? (userId ? String(userId) : null) : null}>
-      <SafeAreaProvider initialMetrics={initialWindowMetrics} style={{ flex: 1 }}>
+    <SafeAreaProvider initialMetrics={initialWindowMetrics} style={{ flex: 1 }}>
       <StatusBar barStyle="dark-content" />
 
       <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
@@ -471,35 +514,37 @@ export default function App() {
           <NavigationContainer key={authToken ? 'app' : 'auth'}>
             <View style={{ flex: 1, backgroundColor: '#ffffff' }}>
               {authToken ? (
-                <RevenueCatPlanBridge serverPlanTier={planTier}>
-                  {(effectivePlanTier) => (
-                    <AppStackNavigator screenOptions={{ headerShown: false }}>
-                      <AppStack.Screen name="Tabs">
-                        {() => (
-                          <AppTabsShell
-                            userEmail={userEmail}
-                            userId={userId}
-                            token={authToken as string}
-                            planTier={effectivePlanTier}
-                            onEmailUpdated={handleEmailUpdated}
-                            onPlanTierChanged={(nextTier) => setPlanTier(nextTier)}
-                            onLogout={handleLogout}
-                          />
-                        )}
-                      </AppStack.Screen>
+                <RevenueCatProvider appUserID={userId ? String(userId) : null}>
+                  <RevenueCatPlanBridge serverPlanTier={planTier}>
+                    {(effectivePlanTier) => (
+                      <AppStackNavigator screenOptions={{ headerShown: false }}>
+                        <AppStack.Screen name="Tabs">
+                          {() => (
+                            <AppTabsShell
+                              userEmail={userEmail}
+                              userId={userId}
+                              token={authToken as string}
+                              planTier={effectivePlanTier}
+                              onEmailUpdated={handleEmailUpdated}
+                              onPlanTierChanged={(nextTier) => setPlanTier(nextTier)}
+                              onLogout={handleLogout}
+                            />
+                          )}
+                        </AppStack.Screen>
 
-                      <AppStack.Screen
-                        name="Camera"
-                        component={CameraScreen}
-                        options={{
-                          headerShown: false,
-                          presentation: 'fullScreenModal',
-                          animation: 'slide_from_bottom',
-                        }}
-                      />
-                    </AppStackNavigator>
-                  )}
-                </RevenueCatPlanBridge>
+                        <AppStack.Screen
+                          name="Camera"
+                          component={CameraScreen}
+                          options={{
+                            headerShown: false,
+                            presentation: 'fullScreenModal',
+                            animation: 'slide_from_bottom',
+                          }}
+                        />
+                      </AppStackNavigator>
+                    )}
+                  </RevenueCatPlanBridge>
+                </RevenueCatProvider>
               ) : (
                 <AuthStackNavigator
                   screenOptions={{
@@ -517,8 +562,7 @@ export default function App() {
           </NavigationContainer>
         )}
       </View>
-      </SafeAreaProvider>
-    </RevenueCatProvider>
+    </SafeAreaProvider>
   );
 }
 

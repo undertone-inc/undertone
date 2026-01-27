@@ -8,7 +8,8 @@ import {
   Alert,
 } from 'react-native';
 import Constants from 'expo-constants';
-import { saveToken } from '../auth';
+import { saveAuthProfile, saveToken } from '../auth';
+import { openInAppBrowser } from '../in-app-browser';
 
 type LoginProps = {
   navigation: any;
@@ -24,6 +25,9 @@ const RAW_API_BASE =
   process.env.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
+
+const TERMS_URL = 'https://undertoneapp.io/undertone-legal/terms/index.html';
+const PRIVACY_URL = 'https://undertoneapp.io/undertone-legal/privacy/index.html';
 
 // Keep placeholders consistent across fields.
 const PLACEHOLDER_COLOR = '#999999';
@@ -43,9 +47,21 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
 
   const trimmedEmail = email.trim();
 
-  const completeAuth = async (token: string, authEmail: string, id?: string | number) => {
+  const completeAuth = async (
+    token: string,
+    authEmail: string,
+    id?: string | number,
+    accountName?: string | null,
+    planTier?: string | null,
+  ) => {
     try {
       await saveToken(token);
+      await saveAuthProfile({
+        email: authEmail,
+        userId: id == null ? null : String(id),
+        accountName: accountName ? String(accountName).trim() : null,
+        planTier: planTier ? String(planTier).trim().toLowerCase() : null,
+      });
     } catch {
       // If token can't be persisted, still allow session for this run.
     }
@@ -108,12 +124,25 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
       const token = String(data?.token || '').trim();
       const emailFromServer = String(data?.user?.email || trimmedEmail).trim();
       const idFromServer = data?.user?.id;
+      const accountNameFromServer = String(data?.user?.accountName || '').trim();
+      const planTierFromServer =
+        data?.user?.planTier ??
+        data?.user?.plan ??
+        data?.user?.tier ??
+        data?.user?.subscriptionPlan ??
+        data?.user?.subscription?.plan;
       if (!token) {
         Alert.alert('Login failed', 'Server did not return an auth token.');
         return;
       }
 
-      await completeAuth(token, emailFromServer, idFromServer);
+      await completeAuth(
+        token,
+        emailFromServer,
+        idFromServer,
+        accountNameFromServer || null,
+        planTierFromServer ? String(planTierFromServer) : null,
+      );
     } catch (error) {
       console.error('Login error:', error);
       Alert.alert(
@@ -155,12 +184,25 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
       const token = String(data?.token || '').trim();
       const emailFromServer = String(data?.user?.email || trimmedEmail).trim();
       const idFromServer = data?.user?.id;
+      const accountNameFromServer = String(data?.user?.accountName || '').trim();
+      const planTierFromServer =
+        data?.user?.planTier ??
+        data?.user?.plan ??
+        data?.user?.tier ??
+        data?.user?.subscriptionPlan ??
+        data?.user?.subscription?.plan;
       if (!token) {
         Alert.alert('Sign up failed', 'Server did not return an auth token.');
         return;
       }
 
-      await completeAuth(token, emailFromServer, idFromServer);
+      await completeAuth(
+        token,
+        emailFromServer,
+        idFromServer,
+        accountNameFromServer || null,
+        planTierFromServer ? String(planTierFromServer) : null,
+      );
     } catch (error) {
       console.error('Signup error:', error);
       Alert.alert(
@@ -212,8 +254,8 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
   };
 
   const handleResetPassword = async () => {
-    if (!resetCode.trim() || !newPassword) {
-      Alert.alert('Missing info', 'Please enter the reset code and a new password.');
+    if (!trimmedEmail || !resetCode.trim() || !newPassword) {
+      Alert.alert('Missing info', 'Please enter your email, the reset code, and a new password.');
       return;
     }
 
@@ -223,7 +265,7 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
       const response = await fetch(`${API_BASE}/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: resetCode.trim(), newPassword }),
+        body: JSON.stringify({ email: trimmedEmail, token: resetCode.trim(), newPassword }),
       });
 
       const data = await response.json().catch(() => ({}));
@@ -379,9 +421,14 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
                   <TextInput
                     style={styles.input}
                     value={resetCode}
-                    onChangeText={setResetCode}
-                    placeholder="Reset code"
+                    onChangeText={(value) =>
+                      setResetCode(value.replace(/[^0-9]/g, '').slice(0, 6))
+                    }
+                    placeholder="6-digit code"
                     placeholderTextColor={PLACEHOLDER_COLOR}
+                    keyboardType="number-pad"
+                    textContentType="oneTimeCode"
+                    maxLength={6}
                     autoCapitalize="none"
                     autoCorrect={false}
                     returnKeyType="next"
@@ -428,6 +475,28 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
           </>
         )}
       </View>
+{isSignup && (
+  <View style={styles.legalFooter} pointerEvents="box-none">
+    <Text style={styles.legalText}>
+      By signing up you agree to our{' '}
+      <Text
+        style={styles.legalLink}
+        onPress={() => openInAppBrowser(TERMS_URL)}
+        accessibilityRole="link"
+      >
+        Terms
+      </Text>{' '}
+      and{' '}
+      <Text
+        style={styles.legalLink}
+        onPress={() => openInAppBrowser(PRIVACY_URL)}
+        accessibilityRole="link"
+      >
+        Privacy Policy
+      </Text>
+    </Text>
+  </View>
+)}
     </View>
   );
 };
@@ -512,6 +581,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#555555',
     fontWeight: '500',
+  },
+  legalFooter: {
+    position: 'absolute',
+    left: 24,
+    right: 24,
+    bottom: 40,
+    alignItems: 'center',
+  },
+  legalText: {
+    fontSize: 12,
+    color: '#555555',
+    textAlign: 'center',
+  },
+  legalLink: {
+    textDecorationLine: 'underline',
   },
 });
 

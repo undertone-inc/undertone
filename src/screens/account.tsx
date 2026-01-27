@@ -15,8 +15,11 @@ import {
   KeyboardAvoidingView,
   ActivityIndicator,
   Alert,
+  Linking,
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import { openInAppBrowser } from '../in-app-browser';
+import { getAuthProfile, saveAuthProfile } from '../auth';
 import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
 import Constants from 'expo-constants';
 import { PlanTier, PLAN_CONFIG, PLAN_LIMITS, PLAN_RANK, normalizePlanTier } from '../api';
@@ -47,6 +50,9 @@ const API_BASE =
   (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
+
+const TERMS_URL = 'https://undertoneapp.io/undertone-legal/terms/index.html';
+const PRIVACY_URL = 'https://undertoneapp.io/undertone-legal/privacy/index.html';
 
 function countKitUsageFromRaw(raw: string | null): { categories: number; items: number } {
   if (!raw) return { categories: 0, items: 0 };
@@ -183,6 +189,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const {
     ready: rcReady,
+    initError: rcInitError,
     isPro: rcIsPro,
     buyMonthly,
     buyYearly,
@@ -192,14 +199,6 @@ const Account: React.FC<AccountScreenProps> = ({
   } = useRevenueCat();
 
   const effectivePlanTier: PlanTier = rcIsPro || planTier === 'pro' ? 'pro' : 'free';
-
-  // If RevenueCat says the user is Pro, never let server refreshes downgrade the local UI.
-  useEffect(() => {
-    if (!rcIsPro) return;
-    if (planTier === 'pro') return;
-    setPlanTier('pro');
-    if (onPlanTierChanged) onPlanTierChanged('pro');
-  }, [rcIsPro, planTier]);
 
   // Keep local plan state in sync with app-level plan state.
   useEffect(() => {
@@ -243,6 +242,39 @@ const Account: React.FC<AccountScreenProps> = ({
     };
   }, []);
 
+  // Hydrate cached profile immediately so the screen looks "logged in" even when /me is unreachable.
+  useEffect(() => {
+    let alive = true;
+
+    const hydrate = async () => {
+      if (!tokenTrimmed) return;
+      try {
+        const cached = await getAuthProfile();
+        if (!alive) return;
+
+        // Name is managed locally in this screen, so pull a cached value if present.
+        if (!accountName.trim() && cached?.accountName) {
+          setAccountName(String(cached.accountName).trim());
+        }
+
+        // If the parent hasn't hydrated email yet, push cached email up.
+        if (!emailTrimmed && cached?.email && onEmailUpdated) {
+          onEmailUpdated(String(cached.email).trim());
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    hydrate();
+
+    return () => {
+      alive = false;
+    };
+    // Intentionally not depending on accountName/email to avoid repeated SecureStore reads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenTrimmed]);
+
   const refreshAccount = async () => {
     if (!tokenTrimmed) return;
 
@@ -250,6 +282,7 @@ const Account: React.FC<AccountScreenProps> = ({
       const data = await getJson(`/me`, tokenTrimmed);
       const nextEmail = String(data?.user?.email || '').trim();
       if (nextEmail && onEmailUpdated) onEmailUpdated(nextEmail);
+      const nextId = String(data?.user?.id || data?.user?.userId || '').trim();
       const nextName = String(data?.user?.accountName || '').trim();
       setAccountName(nextName);
       const nextTier = normalizePlanTier(
@@ -259,10 +292,16 @@ const Account: React.FC<AccountScreenProps> = ({
           data?.user?.subscriptionPlan ??
           data?.user?.subscription?.plan
       );
+      setPlanTier(nextTier);
+      if (onPlanTierChanged) onPlanTierChanged(nextTier);
 
-      const resolvedTier: PlanTier = rcIsPro ? 'pro' : nextTier;
-      setPlanTier(resolvedTier);
-      if (onPlanTierChanged) onPlanTierChanged(resolvedTier);
+      // Cache the profile so the Account screen is usable even when the API is unreachable.
+      saveAuthProfile({
+        email: nextEmail || null,
+        userId: nextId || null,
+        accountName: nextName || null,
+        planTier: nextTier || null,
+      }).catch(() => {});
 
       // Optional usage fields from the server (fallbacks to local/defaults when absent).
       const usage = data?.usage ?? data?.limitsUsage ?? data?.counters ?? data?.stats ?? {};
@@ -429,7 +468,7 @@ const Account: React.FC<AccountScreenProps> = ({
   );
 
   const showEmailUpdates = matchesQuery('Email updates');
-  const showUserAgreement = matchesQuery('User agreement');
+  const showPrivacyPolicy = matchesQuery('Privacy Policy', 'Privacy policy', 'User agreement');
   const showSupport = matchesQuery('Support');
 
   const showDeleteAccount = matchesQuery('Delete account');
@@ -438,7 +477,7 @@ const Account: React.FC<AccountScreenProps> = ({
   const profileRowsVisible = showAccountName || showEmailRow || showPassword;
   const planRowsVisible = showPlan || showBilling;
   const catalogRowsVisible = showUpdates || showReferUser || showSupport;
-  const commRowsVisible = showEmailUpdates || showUserAgreement;
+  const commRowsVisible = showEmailUpdates || showPrivacyPolicy;
   const actionRowsVisible = showDeleteAccount || showLogout;
 
   const anyRowsVisible =
@@ -500,14 +539,6 @@ const Account: React.FC<AccountScreenProps> = ({
     setActiveModal('refer');
   };
 
-  const openReferInfo = () => {
-    Alert.alert(
-      'INFO',
-      'User counts as referred if account was created using an e-mail to which an invite link was sent and account is in use for over 30 days'
-    );
-  };
-
-
   const openSupportModal = () => {
     if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
@@ -520,45 +551,6 @@ const Account: React.FC<AccountScreenProps> = ({
     if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
     setActiveModal('plan');
-  };
-
-  const openCustomerCenterSafe = async () => {
-    if (!requireAuthOrAlert()) return;
-    if (!rcReady) {
-      Alert.alert('Subscriptions', 'Purchases are still initializing. Please try again.');
-      return;
-    }
-
-    try {
-      setSaving(true);
-      await openCustomerCenter();
-    } catch (e: any) {
-      Alert.alert('Manage subscription', String(e?.message || e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const restorePurchasesSafe = async () => {
-    if (!requireAuthOrAlert()) return;
-    if (!rcReady) {
-      Alert.alert('Subscriptions', 'Purchases are still initializing. Please try again.');
-      return;
-    }
-
-    try {
-      setSaving(true);
-      const r = await restore();
-      if (!r.ok) {
-        Alert.alert('Restore purchases', r.message || 'Restore failed.');
-        return;
-      }
-      Alert.alert('Restore purchases', 'Restore complete.');
-    } catch (e: any) {
-      Alert.alert('Restore purchases', String(e?.message || e));
-    } finally {
-      setSaving(false);
-    }
   };
 
   // If another screen navigates here with { openUpgrade: true }, auto-open the upgrade modal.
@@ -586,6 +578,7 @@ const Account: React.FC<AccountScreenProps> = ({
       setSaving(true);
       await postJson('/update-account-name', { accountName: name }, tokenTrimmed);
       setAccountName(name);
+      saveAuthProfile({ accountName: name }).catch(() => {});
       closeModal();
       Alert.alert('Saved', 'Your account name has been updated.');
     } catch (e: any) {
@@ -612,6 +605,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
       const updated = String(data?.user?.email || nextEmail).trim();
       if (onEmailUpdated) onEmailUpdated(updated);
+      saveAuthProfile({ email: updated }).catch(() => {});
 
       closeModal();
       Alert.alert('Email updated', 'Your email has been updated.');
@@ -735,56 +729,161 @@ const Account: React.FC<AccountScreenProps> = ({
     }
   };
 
+  const syncServerBilling = async () => {
+    if (!tokenTrimmed) return;
+    try {
+      await postJson('/billing/sync', {}, tokenTrimmed);
+    } catch {
+      // Best-effort only. If this fails, the app can still unlock Pro via RevenueCat,
+      // but the server might not enforce the correct scan limits until the next sync.
+    }
+  };
+
+
 
 
   const startSubscription = async (targetTier: PlanTier, cycle: BillingCycle) => {
     if (!requireAuthOrAlert()) return;
 
     if (!rcReady) {
-      Alert.alert('Purchases', 'Purchases are still initializing. Please try again.');
+      const msg = rcInitError
+        ? `Purchases are unavailable right now.\n\n${rcInitError}`
+        : 'Purchases are still initializing. Please try again.';
+      Alert.alert('Purchases', msg);
       return;
     }
-
-    let directResult: { ok: boolean; cancelled?: boolean; message?: string } | null = null;
 
     try {
       setSaving(true);
       setPendingPlanTier(targetTier);
 
-      directResult = cycle === 'yearly' ? await buyYearly() : await buyMonthly();
+      // One-tap purchase attempt for the selected billing cycle.
+      // On real iOS subscriptions this triggers the Apple purchase sheet.
+      const result = cycle === 'yearly' ? await buyYearly() : await buyMonthly();
+
+      if (result?.ok) {
+        setPlanTier('pro');
+        onPlanTierChanged?.('pro');
+        await syncServerBilling();
+        closeModal();
+        Alert.alert('Success', 'Undertone Pro unlocked.');
+        return;
+      }
+
+      // If purchase fails/cancels, fall back to the RevenueCat paywall.
+      closeModal();
+      try {
+        const purchasedViaPaywall = await showPaywall();
+        if (purchasedViaPaywall) {
+          setPlanTier('pro');
+          onPlanTierChanged?.('pro');
+          await syncServerBilling();
+          Alert.alert('Success', 'Undertone Pro unlocked.');
+        }
+      } catch (paywallErr: any) {
+        const fallbackMsg = String(paywallErr?.message || paywallErr);
+        const baseMsg = result?.message ? String(result.message) : 'Could not complete purchase.';
+        Alert.alert('Upgrade', `${baseMsg}\n\n${fallbackMsg}`);
+      }
     } catch (e: any) {
-      directResult = { ok: false, cancelled: false, message: String(e?.message || e) };
+      closeModal();
+      try {
+        const purchasedViaPaywall = await showPaywall();
+        if (purchasedViaPaywall) {
+          setPlanTier('pro');
+          onPlanTierChanged?.('pro');
+          await syncServerBilling();
+          Alert.alert('Success', 'Undertone Pro unlocked.');
+        }
+      } catch {
+        Alert.alert('Could not start subscription', String(e?.message || e));
+      }
     } finally {
       setSaving(false);
       setPendingPlanTier(null);
     }
+  };
 
-    if (directResult?.ok) {
-      setPlanTier('pro');
-      if (onPlanTierChanged) onPlanTierChanged('pro');
-      closeModal();
-      Alert.alert('Success', 'Undertone Pro unlocked.');
+  const restorePurchasesFromUpgrade = async () => {
+    if (!requireAuthOrAlert()) return;
+
+    if (!rcReady) {
+      const msg = rcInitError
+        ? `Purchases are unavailable right now.\n\n${rcInitError}`
+        : 'Purchases are still initializing. Please try again.';
+      Alert.alert('Restore purchases', msg);
       return;
     }
 
-    // If the direct purchase attempt didn't complete, fall back to the RevenueCat paywall
-    // (so the user can retry, pick a different package, restore, etc.)
-    closeModal();
+    try {
+      setSaving(true);
+      const r = await restore();
+
+      if (!r?.ok) {
+        Alert.alert('Restore purchases', String(r?.message || 'Restore failed.'));
+        return;
+      }
+
+      setPlanTier('pro');
+      onPlanTierChanged?.('pro');
+      await syncServerBilling();
+      Alert.alert('Restore purchases', 'Restore complete.');
+    } catch (e: any) {
+      Alert.alert('Restore purchases', String(e?.message || e));
+    } finally {
+      setSaving(false);
+      setPendingPlanTier(null);
+    }
+  };
+
+  const openAppleSubscriptions = async () => {
+    // Apple’s subscription management page
+    // Prefer itms-apps to open the App Store directly; fall back to https.
+    const urls = [
+      'itms-apps://apps.apple.com/account/subscriptions',
+      'https://apps.apple.com/account/subscriptions',
+    ];
+
+    for (const url of urls) {
+      try {
+        await Linking.openURL(url);
+        return;
+      } catch {
+        // try next
+      }
+    }
+
+    Alert.alert('Manage subscription', 'Unable to open Apple subscription settings.');
+  };
+
+  const openCustomerCenterSafe = async () => {
+    if (!requireAuthOrAlert()) return;
+
+    // If RevenueCat isn't ready, fall back to Apple subscription settings.
+    if (!rcReady) {
+      await openAppleSubscriptions();
+      return;
+    }
+
+    Keyboard.dismiss();
+
+    const startedAt = Date.now();
 
     try {
-      // Give the modal a beat to dismiss before presenting another native modal.
-      await new Promise((r) => setTimeout(r, 250));
-      const purchased = await showPaywall();
-      if (purchased) {
-        setPlanTier('pro');
-        if (onPlanTierChanged) onPlanTierChanged('pro');
-        Alert.alert('Success', 'Undertone Pro unlocked.');
-      } else if (!directResult?.cancelled && directResult?.message) {
-        Alert.alert('Upgrade', directResult.message);
+      setSaving(true);
+
+      // Customer Center (RevenueCat UI).
+      // If it doesn't present (returns immediately), fall back to Apple's page.
+      await openCustomerCenter();
+
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < 600) {
+        await openAppleSubscriptions();
       }
-    } catch (e: any) {
-      const msg = String(directResult?.message || e?.message || e);
-      if (msg && !directResult?.cancelled) Alert.alert('Upgrade', msg);
+    } catch {
+      await openAppleSubscriptions();
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -959,19 +1058,41 @@ const Account: React.FC<AccountScreenProps> = ({
                         {isUpgrade && (
                           <>
                             <View style={styles.planActionDivider} />
-                            <Text style={styles.planCancelAnytime}>Instant access, cancel anytime</Text>
-                            <TouchableOpacity
-                              onPress={restorePurchasesSafe}
-                              activeOpacity={0.85}
-                              disabled={saving}
-                              style={{ marginTop: 10, alignSelf: 'center' }}
-                              accessibilityRole="button"
-                              accessibilityLabel="Restore purchases"
-                            >
-                              <Text style={{ fontSize: 12, color: '#6b7280', fontWeight: '500' }}>
-                                Restore purchases
-                              </Text>
-                            </TouchableOpacity>
+                            <View style={styles.planFootRow}>
+  <View style={styles.planFootLeft}>
+    <Text style={styles.planCancelAnytime}>Cancel anytime</Text>
+    <Text style={styles.planFootSep}> · </Text>
+    <TouchableOpacity
+      onPress={restorePurchasesFromUpgrade}
+      activeOpacity={0.8}
+      disabled={saving}
+      accessibilityRole="button"
+      accessibilityLabel="Restore purchase"
+    >
+      <Text style={styles.planCancelAnytime}>Restore purchase</Text>
+    </TouchableOpacity>
+  </View>
+
+  <View style={styles.planFootRight}>
+    <TouchableOpacity
+      onPress={() => openInAppBrowser(TERMS_URL)}
+      activeOpacity={0.8}
+      accessibilityRole="link"
+      accessibilityLabel="Terms"
+    >
+      <Text style={[styles.planCancelAnytime, styles.planFootLink]}>Terms</Text>
+    </TouchableOpacity>
+    <Text style={styles.planFootSep}> · </Text>
+    <TouchableOpacity
+      onPress={() => openInAppBrowser(PRIVACY_URL)}
+      activeOpacity={0.8}
+      accessibilityRole="link"
+      accessibilityLabel="Privacy Policy"
+    >
+      <Text style={[styles.planCancelAnytime, styles.planFootLink]}>Privacy Policy</Text>
+    </TouchableOpacity>
+  </View>
+</View>
                           </>
                         )}
                       </View>
@@ -1386,18 +1507,7 @@ const Account: React.FC<AccountScreenProps> = ({
                     <Ionicons name="chevron-back" size={20} color="#111827" />
                   </TouchableOpacity>
 
-                  <Text style={[styles.supportPanelTitle, { flex: 1 }]} numberOfLines={1}>Refer user</Text>
-
-                  <TouchableOpacity
-                    onPress={openReferInfo}
-                    activeOpacity={0.85}
-                    style={styles.referInfoButton}
-                    accessibilityRole="button"
-                    accessibilityLabel="Referral info"
-                    disabled={saving}
-                  >
-                    <Text style={styles.referInfoText}>INFO</Text>
-                  </TouchableOpacity>
+                  <Text style={styles.supportPanelTitle}>Refer user</Text>
                 </View>
 
 <View style={styles.referInviteRow}>
@@ -1430,10 +1540,7 @@ const Account: React.FC<AccountScreenProps> = ({
                   </TouchableOpacity>
                 </View>
 
-                <View style={styles.referRewardBlock}>
-                  <Text style={[styles.referRewardText, { marginBottom: 14 }]}>1 invite = 1 month of Pro free</Text>
-                  <Text style={[styles.referRewardText, { marginBottom: 0 }]}>10 invites = 1 year of Pro free</Text>
-                </View>
+                <View style={{ height: 10 }} />
               </View>
             </KeyboardAvoidingView>
           ) : (
@@ -1548,7 +1655,7 @@ const Account: React.FC<AccountScreenProps> = ({
                           <Text style={styles.rowLabel}>Billing</Text>
                           <TouchableOpacity
                             activeOpacity={0.8}
-                            onPress={effectivePlanTier === 'pro' ? openCustomerCenterSafe : openPlanModal}
+                            onPress={() => console.log('Update billing')}
                           >
                             <Text style={styles.rowRightAction}>Update</Text>
                           </TouchableOpacity>
@@ -1625,13 +1732,13 @@ const Account: React.FC<AccountScreenProps> = ({
                         </View>
                       )}
 
-                      {showUserAgreement && (
+                      {showPrivacyPolicy && (
                         <TouchableOpacity
                           style={styles.row}
                           activeOpacity={0.8}
-                          onPress={() => console.log('User agreement pressed')}
+                          onPress={() => openInAppBrowser(PRIVACY_URL)}
                         >
-                          <Text style={styles.rowLabel}>User agreement</Text>
+                          <Text style={styles.rowLabel}>Privacy Policy</Text>
                           <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
                         </TouchableOpacity>
                       )}
@@ -1854,8 +1961,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   toggleOuterOn: {
-    borderColor: '#9ca3af',
-    backgroundColor: '#9ca3af',
+    borderColor: '#d1d5db',
+    backgroundColor: '#e5e7eb',
   },
   toggleThumb: {
     width: 16,
@@ -2244,6 +2351,28 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#6b7280',
     fontWeight: '400',
+  },
+  planFootRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+  },
+  planFootLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  planFootRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  planFootSep: {
+    fontSize: 11,
+    color: '#6b7280',
+    fontWeight: '400',
+  },
+  planFootLink: {
+    textDecorationLine: 'underline',
   },
 
   planNameRow: {

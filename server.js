@@ -49,6 +49,17 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 
 const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
 const RESET_TTL_MINUTES = Number(process.env.RESET_TTL_MINUTES || 30);
+// Email (password reset delivery via Resend)
+// Docs: https://resend.com/docs/api-reference/introduction (Bearer auth) and
+//       https://resend.com/docs/api-reference/emails/send-email (send email)
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || "").trim();
+const EMAIL_FROM = String(process.env.EMAIL_FROM || "").trim();
+const APP_NAME = String(process.env.APP_NAME || "Undertone").trim();
+const EMAIL_ENABLED = Boolean(RESEND_API_KEY && EMAIL_FROM);
+
+if (NODE_ENV === "production" && !EMAIL_ENABLED) {
+  console.warn("WARN: Email delivery is not configured. Password reset will not email codes.");
+}
 
 // OpenAI (server-side only)
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
@@ -266,16 +277,108 @@ function requireDb(res) {
 }
 
 function publicUserRow(row) {
+  const rawTier = row?.plan_tier ?? row?.planTier ?? "free";
+  const planTier = normalizePlanTier(rawTier);
+
+  const rawInterval = row?.plan_interval ?? row?.planInterval ?? null;
+  const rawProductId = row?.plan_product_id ?? row?.planProductId ?? null;
+  const planInterval = normalizePlanInterval(rawInterval, rawProductId);
+
   return {
     id: row.id,
     email: row.email,
     accountName: row.account_name || "",
-    planTier: "free",
+    planTier,
+    planInterval,
+    planProductId: rawProductId ? String(rawProductId) : null,
+    planExpiresAt: row?.plan_expires_at ? new Date(row.plan_expires_at).toISOString() : null,
   };
 }
 
 function hashToken(token) {
   return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function generateNumericCode(length = 6) {
+  const n = Number(length);
+  const digits = Number.isFinite(n) && n > 0 && n <= 12 ? Math.floor(n) : 6;
+  const max = 10 ** digits;
+  const num = crypto.randomInt(0, max);
+  return String(num).padStart(digits, "0");
+}
+
+function hashResetCodeForUser(userId, code) {
+  return hashToken(`${String(userId)}:${String(code || "").trim()}`);
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function sendEmailViaResend({ to, subject, html, text }) {
+  if (!EMAIL_ENABLED) {
+    throw new Error("Email delivery is not configured (missing RESEND_API_KEY or EMAIL_FROM)");
+  }
+
+  const payload = {
+    from: EMAIL_FROM,
+    to: Array.isArray(to) ? to : [String(to)],
+    subject: String(subject || ""),
+    html: String(html || ""),
+    text: typeof text === "string" ? text : undefined,
+  };
+
+  const r = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.message || data?.error?.message || data?.error || `Resend error HTTP ${r.status}`;
+    const err = new Error(String(msg));
+    err.status = r.status;
+    err.resend = data;
+    throw err;
+  }
+
+  return data;
+}
+
+async function sendPasswordResetEmail({ to, token, ttlMinutes }) {
+  const safeApp = escapeHtml(APP_NAME || "Undertone");
+  const safeToken = escapeHtml(token);
+  const minutes = Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? Math.round(ttlMinutes) : 30;
+
+  const subject = `${APP_NAME} password reset code`;
+  const text =
+    `${APP_NAME} password reset\n\n` +
+    `Your reset code is:\n${token}\n\n` +
+    `This code expires in ${minutes} minutes.\n\n` +
+    `If you didn't request a password reset, you can ignore this email.`;
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height: 1.45;">
+      <h2 style="margin:0 0 12px 0;">${safeApp} password reset</h2>
+      <p style="margin:0 0 10px 0;">Use this code to reset your password:</p>
+      <p style="margin:0 0 16px 0;">
+        <code style="display:inline-block; padding:10px 12px; border:1px solid #ddd; border-radius:10px; font-size:16px; letter-spacing:0.5px;">${safeToken}</code>
+      </p>
+      <p style="margin:0 0 10px 0; color:#555;">This code expires in ${minutes} minutes.</p>
+      <p style="margin:0; color:#777;">If you didn't request a password reset, you can ignore this email.</p>
+    </div>
+  `.trim();
+
+  return sendEmailViaResend({ to, subject, html, text });
 }
 
 function getBearerToken(req) {
@@ -286,7 +389,7 @@ function getBearerToken(req) {
 
 async function getUserByEmailNorm(emailNorm) {
   const { rows } = await pool.query(
-    "SELECT id, email, email_norm, password_hash, account_name FROM users WHERE email_norm = $1 LIMIT 1",
+    "SELECT id, email, email_norm, password_hash, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at FROM users WHERE email_norm = $1 LIMIT 1",
     [emailNorm]
   );
   return rows[0] || null;
@@ -335,7 +438,13 @@ async function authRequired(req, res, next) {
         s.user_id,
         u.email,
         u.account_name,
-        u.password_hash
+        u.password_hash,
+        u.plan_tier,
+        u.plan_interval,
+        u.plan_product_id,
+        u.plan_started_at,
+        u.plan_expires_at,
+        u.rc_last_synced_at
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = $1
@@ -356,6 +465,12 @@ async function authRequired(req, res, next) {
         email: row.email,
         account_name: row.account_name,
         password_hash: row.password_hash,
+        plan_tier: row.plan_tier,
+        plan_interval: row.plan_interval,
+        plan_product_id: row.plan_product_id,
+        plan_started_at: row.plan_started_at,
+        plan_expires_at: row.plan_expires_at,
+        rc_last_synced_at: row.rc_last_synced_at,
       },
     };
 
@@ -391,7 +506,7 @@ async function getUploadsUsedThisMonth(userId) {
 //   UPLOAD_LIMIT_FREE=9999
 //   UPLOAD_LIMIT_PRO=9999
 const PLAN_UPLOAD_LIMITS = {
-  free: Number(process.env.UPLOAD_LIMIT_FREE || 100),
+  free: Number(process.env.UPLOAD_LIMIT_FREE || 5),
   pro: Number(process.env.UPLOAD_LIMIT_PRO || 100),
 };
 
@@ -406,6 +521,213 @@ function uploadLimitForPlan(planTier) {
   // "Plus" is no longer offered; treat it as "Pro" so legacy values don't reduce limits.
   if (t === "plus") return PLAN_UPLOAD_LIMITS.pro;
   return PLAN_UPLOAD_LIMITS[t] ?? PLAN_UPLOAD_LIMITS.free;
+}
+
+
+const UPLOAD_LIMIT_PRO_YEAR = Number(process.env.UPLOAD_LIMIT_PRO_YEAR || process.env.UPLOAD_LIMIT_PRO_YEARLY || 1200);
+
+// RevenueCat (server-side subscription verification)
+// NOTE: This requires a Secret API key (sk_...) stored on the SERVER only.
+const REVENUECAT_API_KEY = String(
+  process.env.REVENUECAT_SECRET_KEY ||
+  process.env.REVENUECAT_API_KEY ||
+  ""
+).trim();
+const REVENUECAT_ENTITLEMENT_ID = String(process.env.REVENUECAT_ENTITLEMENT_ID || "undertone_pro").trim();
+const REVENUECAT_PRODUCT_ID_MONTHLY = String(process.env.REVENUECAT_PRODUCT_ID_MONTHLY || "monthly").trim();
+const REVENUECAT_PRODUCT_ID_YEARLY = String(process.env.REVENUECAT_PRODUCT_ID_YEARLY || "yearly").trim();
+const REVENUECAT_SYNC_TTL_MS = Math.max(
+  30_000,
+  Math.min(6 * 60 * 60 * 1000, Number(process.env.REVENUECAT_SYNC_TTL_MS || 10 * 60 * 1000))
+);
+
+function normalizePlanTier(value) {
+  const v = String(value ?? "").trim().toLowerCase();
+  if (v === "pro" || v === "plus") return "pro";
+  if (v.includes("pro") || v.includes("plus")) return "pro";
+  return "free";
+}
+
+function normalizePlanInterval(value, productId) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  const pid = String(productId ?? "").trim().toLowerCase();
+
+  if (raw === "year" || raw === "yearly" || raw === "annual") return "year";
+  if (raw === "month" || raw === "monthly") return "month";
+
+  // Infer from product id when interval isn't stored yet.
+  if (pid) {
+    if (pid === REVENUECAT_PRODUCT_ID_YEARLY.toLowerCase()) return "year";
+    if (pid.includes("year") || pid.includes("annual")) return "year";
+  }
+
+  return "month";
+}
+
+function startOfYearUtc() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
+}
+
+function parseIsoDateOrNull(value) {
+  const s = String(value || "").trim();
+  if (!s) return null;
+  const d = new Date(s);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+async function getUploadsUsedSince(userId, from, to = null) {
+  // If the table doesn't exist yet (migration not run), default to 0.
+  try {
+    const params = [userId, from];
+    let sql = "SELECT COUNT(*)::int AS c FROM face_analyses WHERE user_id = $1 AND created_at >= $2";
+    if (to) {
+      params.push(to);
+      sql += " AND created_at < $3";
+    }
+    const { rows } = await pool.query(sql, params);
+    return Number(rows?.[0]?.c || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function usageWindowForUser(user) {
+  const tier = normalizePlanTier(user?.plan_tier ?? user?.planTier);
+  const interval = normalizePlanInterval(user?.plan_interval, user?.plan_product_id);
+
+  if (tier === "pro" && interval === "year") {
+    const started = user?.plan_started_at instanceof Date
+      ? user.plan_started_at
+      : (user?.plan_started_at ? new Date(user.plan_started_at) : null);
+    const start = started && Number.isFinite(started.getTime()) ? started : startOfYearUtc();
+
+    const expires = user?.plan_expires_at instanceof Date
+      ? user.plan_expires_at
+      : (user?.plan_expires_at ? new Date(user.plan_expires_at) : null);
+    const end = expires && Number.isFinite(expires.getTime()) ? expires : null;
+
+    return { tier, interval, period: "year", start, end, limit: UPLOAD_LIMIT_PRO_YEAR };
+  }
+
+  return {
+    tier,
+    interval,
+    period: "month",
+    start: startOfMonthUtc(),
+    end: null,
+    limit: tier === "pro" ? PLAN_UPLOAD_LIMITS.pro : PLAN_UPLOAD_LIMITS.free,
+  };
+}
+
+async function fetchRevenueCatSubscriber(appUserId) {
+  if (!REVENUECAT_API_KEY) {
+    const err = new Error("Missing REVENUECAT_SECRET_KEY (or REVENUECAT_API_KEY) on the server.");
+    err.code = "REVENUECAT_NOT_CONFIGURED";
+    throw err;
+  }
+
+  const url = `https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(String(appUserId))}`;
+
+  const r = await withTimeout(
+    fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${REVENUECAT_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }),
+    8000,
+    "revenuecat"
+  );
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.message || data?.error || `RevenueCat HTTP ${r.status}`;
+    const err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
+
+  return data;
+}
+
+function planFromRevenueCatPayload(payload) {
+  const now = new Date();
+  const sub = payload?.subscriber || payload?.data?.subscriber || payload?.customer || null;
+  const entitlements = sub?.entitlements || {};
+  const ent = entitlements?.[REVENUECAT_ENTITLEMENT_ID] || null;
+
+  if (!ent) {
+    return { tier: "free", interval: "month", productId: null, startedAt: null, expiresAt: null };
+  }
+
+  const productId = String(ent?.product_identifier || ent?.productIdentifier || "").trim() || null;
+  const expiresAt = parseIsoDateOrNull(ent?.expires_date || ent?.expiresDate || ent?.expires_at || ent?.expiresAt);
+  const startedAt = parseIsoDateOrNull(ent?.purchase_date || ent?.purchaseDate || ent?.purchased_at || ent?.purchasedAt);
+
+  const active = !expiresAt || expiresAt.getTime() > now.getTime();
+  const tier = active ? "pro" : "free";
+  const interval = normalizePlanInterval(null, productId);
+
+  return { tier, interval, productId, startedAt, expiresAt };
+}
+
+function shouldSyncRevenueCat(user, force = false) {
+  if (force) return true;
+
+  const last = user?.rc_last_synced_at instanceof Date
+    ? user.rc_last_synced_at
+    : (user?.rc_last_synced_at ? new Date(user.rc_last_synced_at) : null);
+
+  if (!last || !Number.isFinite(last.getTime())) return true;
+  if (Date.now() - last.getTime() > REVENUECAT_SYNC_TTL_MS) return true;
+
+  // If we think the plan has expired, sync.
+  const exp = user?.plan_expires_at instanceof Date
+    ? user.plan_expires_at
+    : (user?.plan_expires_at ? new Date(user.plan_expires_at) : null);
+  if (exp && Number.isFinite(exp.getTime()) && exp.getTime() <= Date.now()) return true;
+
+  return false;
+}
+
+async function syncUserPlanFromRevenueCat(user, { force = false } = {}) {
+  if (!pool) return user;
+  if (!REVENUECAT_API_KEY) return user;
+
+  if (!shouldSyncRevenueCat(user, force)) return user;
+
+  try {
+    const payload = await fetchRevenueCatSubscriber(user.id);
+    const plan = planFromRevenueCatPayload(payload);
+
+    await pool.query(
+      `UPDATE users
+       SET plan_tier = $2,
+           plan_interval = $3,
+           plan_product_id = $4,
+           plan_started_at = $5,
+           plan_expires_at = $6,
+           rc_last_synced_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [user.id, plan.tier, plan.interval, plan.productId, plan.startedAt, plan.expiresAt]
+    );
+
+    return {
+      ...user,
+      plan_tier: plan.tier,
+      plan_interval: plan.interval,
+      plan_product_id: plan.productId,
+      plan_started_at: plan.startedAt || user.plan_started_at,
+      plan_expires_at: plan.expiresAt || null,
+      rc_last_synced_at: new Date(),
+    };
+  } catch (e) {
+    console.warn("[RevenueCat] sync failed:", String(e?.message || e).slice(0, 200));
+    return user;
+  }
 }
 
 
@@ -579,7 +901,7 @@ app.post("/signup", async (req, res) => {
     const accountName = "";
 
     const { rows } = await pool.query(
-      "INSERT INTO users (email, email_norm, password_hash, account_name) VALUES ($1, $2, $3, $4) RETURNING id, email, account_name",
+      "INSERT INTO users (email, email_norm, password_hash, account_name) VALUES ($1, $2, $3, $4) RETURNING id, email, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at, plan_tier, plan_interval, plan_product_id, plan_expires_at",
       [trimmed, norm, passwordHash, accountName]
     );
 
@@ -677,20 +999,59 @@ app.post("/request-password-reset", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    const resetToken = crypto.randomBytes(20).toString("hex");
-    const tokenHash = hashToken(resetToken);
+    // Invalidate any previously-issued (unused) reset codes so only the newest one works.
+    await pool.query("DELETE FROM password_resets WHERE user_id = $1 AND used_at IS NULL", [user.id]);
 
     const ttlMinutes = Number.isFinite(RESET_TTL_MINUTES) && RESET_TTL_MINUTES > 0 ? RESET_TTL_MINUTES : 30;
     const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
 
-    await pool.query(
-      "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-      [user.id, tokenHash, expiresAt]
-    );
+    // 6-digit numeric code (easy to type). We hash `${user.id}:${code}` so the same
+    // code can exist for different users without DB uniqueness collisions.
+    const codeLengthRaw = Number(process.env.RESET_CODE_LENGTH || 6);
+    const codeLength = Number.isFinite(codeLengthRaw) ? Math.max(4, Math.min(12, Math.floor(codeLengthRaw))) : 6;
 
-    // In production, deliver resetToken out-of-band (email/SMS). We do NOT return it.
+    let resetCode = "";
+    let tokenHash = "";
+    let inserted = false;
+
+    // Retry a few times in the extremely unlikely event of a DB uniqueness collision.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      resetCode = generateNumericCode(codeLength);
+      tokenHash = hashResetCodeForUser(user.id, resetCode);
+
+      try {
+        await pool.query(
+          "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+          [user.id, tokenHash, expiresAt]
+        );
+        inserted = true;
+        break;
+      } catch (e) {
+        // Unique violation: possible if this user was previously issued the same code.
+        if (e && String(e.code) === "23505") continue;
+        throw e;
+      }
+    }
+
+    if (!inserted) {
+      console.error("Failed to generate a unique password reset code after several attempts.");
+      return res.json({ ok: true });
+    }
+
+    // In production, deliver resetCode out-of-band (email). We do NOT return it.
     if (NODE_ENV !== "production") {
-      return res.json({ ok: true, resetToken });
+      return res.json({ ok: true, resetToken: resetCode });
+    }
+
+    if (EMAIL_ENABLED) {
+      try {
+        await sendPasswordResetEmail({ to: user.email, token: resetCode, ttlMinutes });
+      } catch (e) {
+        // Don't leak details to the client. Log for diagnostics and keep ok:true.
+        console.error("password reset email error:", e);
+      }
+    } else {
+      console.warn("password reset requested but email is not configured (RESEND_API_KEY / EMAIL_FROM).");
     }
 
     return res.json({ ok: true });
@@ -701,35 +1062,43 @@ app.post("/request-password-reset", async (req, res) => {
   }
 });
 
-// Reset password (consumes reset token)
+// Reset password (consumes reset code)
 app.post("/reset-password", async (req, res) => {
   if (!requireDb(res)) return;
 
-  const { token, newPassword } = req.body || {};
+  const { email, token, newPassword } = req.body || {};
   const t = String(token || "").trim();
+  const { trimmed, norm } = normalizeEmail(email);
 
-  if (!t) return res.status(400).json({ ok: false, error: "Missing reset token" });
+  if (!isValidEmail(trimmed)) return res.status(400).json({ ok: false, error: "Missing email" });
+  if (!t) return res.status(400).json({ ok: false, error: "Missing reset code" });
   if (typeof newPassword !== "string" || newPassword.length < 6) {
     return res.status(400).json({ ok: false, error: "New password must be at least 6 characters" });
   }
 
   try {
-    const tokenHash = hashToken(t);
+    const user = await getUserByEmailNorm(norm);
+
+    // Do not reveal whether the email exists.
+    if (!user) return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
+
+    const tokenHash = hashResetCodeForUser(user.id, t);
 
     const { rows } = await pool.query(
       `
       SELECT id, user_id
       FROM password_resets
-      WHERE token_hash = $1
+      WHERE user_id = $1
+        AND token_hash = $2
         AND used_at IS NULL
         AND expires_at > NOW()
       LIMIT 1
       `,
-      [tokenHash]
+      [user.id, tokenHash]
     );
 
     const pr = rows[0];
-    if (!pr) return res.status(400).json({ ok: false, error: "Invalid or expired reset token" });
+    if (!pr) return res.status(400).json({ ok: false, error: "Invalid or expired reset code" });
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
 
@@ -761,19 +1130,42 @@ app.post("/reset-password", async (req, res) => {
 // Me (auth required)
 app.get("/me", authRequired, async (req, res) => {
   try {
-    const user = req?.auth?.user;
-    const used = await getUploadsUsedThisMonth(user.id);
-    const limit = uploadLimitForPlan("free");
+    let user = req?.auth?.user;
+
+    // Keep server-side plan state reasonably fresh so limits are enforced correctly.
+    user = await syncUserPlanFromRevenueCat(user, { force: false });
+    if (req.auth) req.auth.user = user;
+
+    const window = usageWindowForUser(user);
+    const usedThisMonth = await getUploadsUsedThisMonth(user.id);
+    const usedThisPeriod = await getUploadsUsedSince(user.id, window.start, window.end);
 
     return res.json({
       ok: true,
       user: publicUserRow(user),
+      plan: {
+        tier: window.tier,
+        interval: window.interval,
+        productId: user?.plan_product_id || null,
+        period: window.period,
+        periodStart: window.start?.toISOString?.() || null,
+        periodEnd: window.end?.toISOString?.() || null,
+        expiresAt: user?.plan_expires_at ? new Date(user.plan_expires_at).toISOString() : null,
+        lastSyncedAt: user?.rc_last_synced_at ? new Date(user.rc_last_synced_at).toISOString() : null,
+      },
       usage: {
-        uploadsThisMonth: used,
+        uploadsThisMonth: usedThisMonth,
+        uploadsUsedThisPeriod: usedThisPeriod,
+        uploadsPeriod: window.period,
+        uploadsPeriodStart: window.start?.toISOString?.() || null,
+        uploadsPeriodEnd: window.end?.toISOString?.() || null,
         clientsThisMonth: 0,
       },
       limits: {
-        uploadsPerMonth: limit,
+        uploadsPerMonth: window.period === "month" ? window.limit : null,
+        uploadsPerYear: window.period === "year" ? window.limit : null,
+        uploadsPerPeriod: window.limit,
+        uploadsPeriod: window.period,
         uploadLimitsDisabled: DISABLE_UPLOAD_LIMITS,
       },
     });
@@ -792,7 +1184,7 @@ app.post("/update-account-name", authRequired, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      "UPDATE users SET account_name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email, account_name",
+      "UPDATE users SET account_name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at, plan_tier, plan_interval, plan_product_id, plan_expires_at",
       [name, userId]
     );
 
@@ -819,7 +1211,7 @@ app.post("/update-email", authRequired, async (req, res) => {
     if (!ok) return res.status(401).json({ ok: false, error: "Invalid password" });
 
     const { rows } = await pool.query(
-      "UPDATE users SET email = $1, email_norm = $2, updated_at = NOW() WHERE id = $3 RETURNING id, email, account_name",
+      "UPDATE users SET email = $1, email_norm = $2, updated_at = NOW() WHERE id = $3 RETURNING id, email, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at, plan_tier, plan_interval, plan_product_id, plan_expires_at",
       [next.trimmed, next.norm, userId]
     );
 
@@ -876,6 +1268,45 @@ app.post("/start-subscription", authRequired, async (req, res) => {
     url: null,
     message: "Subscription checkout is not implemented on the server. Use in-app purchase on iOS/Android.",
   });
+});
+
+app.post("/billing/sync", authRequired, async (req, res) => {
+  try {
+    if (!REVENUECAT_API_KEY) {
+      return res.status(501).json({
+        ok: false,
+        error: "Server is missing REVENUECAT_SECRET_KEY (or REVENUECAT_API_KEY). Add it to .env.server to enable Pro limit enforcement.",
+      });
+    }
+
+    let user = req?.auth?.user;
+    user = await syncUserPlanFromRevenueCat(user, { force: true });
+    if (req.auth) req.auth.user = user;
+
+    const window = usageWindowForUser(user);
+
+    return res.json({
+      ok: true,
+      user: publicUserRow(user),
+      plan: {
+        tier: window.tier,
+        interval: window.interval,
+        productId: user?.plan_product_id || null,
+        period: window.period,
+        periodStart: window.start?.toISOString?.() || null,
+        periodEnd: window.end?.toISOString?.() || null,
+        expiresAt: user?.plan_expires_at ? new Date(user.plan_expires_at).toISOString() : null,
+        lastSyncedAt: user?.rc_last_synced_at ? new Date(user.rc_last_synced_at).toISOString() : null,
+      },
+      limits: {
+        uploadsPerPeriod: window.limit,
+        uploadsPeriod: window.period,
+      },
+    });
+  } catch (e) {
+    console.error("billing sync error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
 });
 
 // ---- Product recommendations (best-match color names) ----
@@ -4323,11 +4754,24 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
     if (!OPENAI_API_KEY) {
       return res.status(500).json({ ok: false, error: "Server is missing OPENAI_API_KEY" });
     }
+    // Enforce scan limits based on the user's actual plan (synced from RevenueCat).
+    let userForLimits = req?.auth?.user;
+    userForLimits = await syncUserPlanFromRevenueCat(userForLimits, { force: false });
+    if (req.auth) req.auth.user = userForLimits;
 
-    const used = await getUploadsUsedThisMonth(userId);
-    const limit = uploadLimitForPlan("free");
-    if (!DISABLE_UPLOAD_LIMITS && used >= limit) {
-      return res.status(402).json({ ok: false, error: "Monthly upload limit reached", used, limit });
+    const window = usageWindowForUser(userForLimits);
+    const usedThisPeriod = await getUploadsUsedSince(userId, window.start, window.end);
+
+    if (!DISABLE_UPLOAD_LIMITS && usedThisPeriod >= window.limit) {
+      const periodLabel = window.period === "year" ? "yearly" : "monthly";
+      return res.status(402).json({
+        ok: false,
+        code: "UPLOAD_LIMIT_REACHED",
+        error: `${periodLabel} upload limit reached`,
+        used: usedThisPeriod,
+        limit: window.limit,
+        period: window.period,
+      });
     }
 
     const file = req.file;
@@ -4446,8 +4890,11 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
       analysis,
       analysisStable,
       stability,
-      usage: { uploadsThisMonth: used + 1 },
-      limits: { uploadsPerMonth: limit },
+      // NOTE: `used` and `limit` were previously referenced here, but they
+      // are not defined in this scope. That caused a ReferenceError and a 500.
+      // We already computed these values above as `usedThisPeriod` and `window.limit`.
+      usage: { uploadsThisMonth: usedThisPeriod + 1 },
+      limits: { uploadsPerMonth: window.period === "month" ? window.limit : null },
     });
   } catch (e) {
     console.error("analyze-face error:", e);
