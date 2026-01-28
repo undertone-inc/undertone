@@ -110,21 +110,36 @@ li{margin:0 0 6px;}
 </section>
 <section id="information-we-collect"><h2>Information we collect</h2>
 <ul>
-  <li><strong>Account information:</strong> email address and account name (if you set one).</li>
-  <li><strong>Uploads:</strong> photos/images you upload for analysis, and any information you include with them.</li>
-  <li><strong>Usage & device data:</strong> app version, device/OS, basic diagnostics, approximate region/timezone, and feature usage events for reliability and security.</li>
-  <li><strong>Subscription info:</strong> purchase/entitlement status and subscription identifiers needed to confirm access to paid features.</li>
-  <li><strong>Support communications:</strong> messages you send us (and any info you choose to include).</li>
+  <li><strong>Account information:</strong> email address and account name (if you set one). Your password is stored on our servers only as a cryptographic hash.</li>
+
+  <li><strong>Uploads (photos):</strong> images you choose to upload for undertone analysis.</li>
+
+  <li><strong>Analysis outputs:</strong> the results we generate from your uploads (for example undertone/season/confidence and tone number/depth). To support scan history and usage-limit enforcement, we store the analysis output and may store a cryptographic hash of the uploaded image. <strong>We do not store the raw image bytes on our servers.</strong></li>
+
+  <li><strong>Chat messages:</strong> messages you send in the analysis chat feature and limited recent chat history you provide with your request.</li>
+
+  <li><strong>Subscription and purchase data:</strong> entitlement status (for example whether you have Pro), plan interval, and identifiers needed to confirm access to paid features. Purchases are processed through Apple In-App Purchase. We use a subscription management provider (currently RevenueCat) to help verify entitlements.</li>
+
+  <li><strong>Device and usage data:</strong> basic diagnostics and device information (such as app version, device/OS, language/timezone) and server logs (such as IP address and timestamps) used for security, fraud prevention, reliability, and enforcing usage limits.</li>
+
+  <li><strong>Support communications:</strong> messages you send to us and information you choose to include.</li>
 </ul>
-<p class="note">If you add analytics, ads, or tracking SDKs later, you must update this policy and your App Store “App Privacy” disclosures to match.</p>
+
+<p class="note"><strong>On-device storage:</strong> certain information may be stored locally on your device (for example your product list/kit, saved analysis history, and chat history) using device storage. This local data remains on your device unless you delete it (for example by uninstalling the app) or unless we later add an explicit sync feature.</p>
 </section>
 <section id="how-we-use-information"><h2>How we use information</h2>
 <ul>
-  <li>Provide, operate, and maintain the Service (including processing uploads to generate results).</li>
-  <li>Create and manage accounts and subscription access.</li>
-  <li>Secure the Service, prevent fraud/abuse, debug and troubleshoot.</li>
-  <li>Improve performance and user experience (for example, reliability and feature improvements).</li>
-  <li>Communicate with you (support, important service updates, and administrative messages).</li>
+  <li><strong>Provide the Service:</strong> create and manage your account, authenticate you, and provide core app functionality.</li>
+
+  <li><strong>Photo analysis:</strong> process your uploaded photos to generate undertone analysis results.</li>
+
+  <li><strong>AI chat and recommendations:</strong> answer questions about your results and provide recommendations based on your analysis.</li>
+
+  <li><strong>Subscriptions:</strong> confirm purchases and entitlement status for paid features.</li>
+
+  <li><strong>Password reset and support:</strong> deliver password reset emails and respond to support requests.</li>
+
+  <li><strong>Safety, security, and reliability:</strong> prevent abuse, troubleshoot, and enforce usage limits.</li>
 </ul>
 </section>
 <section id="legal-bases-eea-uk-switzerland"><h2>Legal bases (EEA/UK/Switzerland)</h2>
@@ -138,11 +153,18 @@ li{margin:0 0 6px;}
 </section>
 <section id="how-we-share-information"><h2>How we share information</h2>
 <p>We do not sell your personal information.</p>
+
 <p>We may share information with:</p>
 <ul>
-  <li><strong>Service providers</strong> that help us run the Service (hosting, storage, customer support tools, subscription management). They may process data only on our instructions and as needed to provide their services to us.</li>
-  <li><strong>Apple</strong> for payments and subscription management (handled through Apple’s systems for iOS purchases).</li>
-  <li><strong>Legal/safety</strong> when required to comply with law, enforce our terms, or protect rights, users, and the Service.</li>
+  <li><strong>AI service providers:</strong> to analyze uploaded photos and generate chat responses/recommendations (currently OpenAI). This may include processing your uploaded image and related context. These providers process data on our behalf to provide their services and may handle data according to their policies and security requirements.</li>
+
+  <li><strong>Email delivery providers:</strong> to send password reset emails (when enabled; currently Resend).</li>
+
+  <li><strong>Subscription and payment providers:</strong> Apple processes in-app purchases. We also use a subscription management provider (currently RevenueCat) to verify entitlements and manage subscription status.</li>
+
+  <li><strong>Infrastructure providers:</strong> hosting, database, and other providers that help operate the Service.</li>
+
+  <li><strong>Legal and safety:</strong> if required to comply with law, enforce our terms, or protect rights, users, and the Service.</li>
 </ul>
 </section>
 <section id="international-transfers"><h2>International transfers</h2>
@@ -150,8 +172,11 @@ li{margin:0 0 6px;}
 <p>If you are in the EEA/UK/Switzerland and your data is transferred internationally, we rely on recognized transfer mechanisms where required (such as adequacy decisions or contractual safeguards like Standard Contractual Clauses) and implement supplementary measures as appropriate.</p>
 </section>
 <section id="retention"><h2>Retention</h2>
-<p>We keep personal information only as long as necessary for the purposes described above, including to provide the Service, comply with legal obligations, resolve disputes, and enforce agreements.</p>
-<p>Retention may vary based on the type of data, whether you have an active account, and legal or operational requirements. You can request deletion (see “Your rights and choices”).</p>
+<p>We keep personal information only as long as necessary for the purposes described in this policy, including to provide the Service, comply with legal obligations, resolve disputes, and enforce agreements.</p>
+
+<p><strong>Photos:</strong> we do not store raw uploaded image bytes on our servers after processing. We may retain analysis outputs (and a cryptographic hash of the uploaded image) to support scan history, improve consistency of results, and enforce usage limits.</p>
+
+<p><strong>On-device data:</strong> some information (such as your product list/kit and chat history) may be stored locally on your device and will remain there unless you delete it (for example by uninstalling the app).</p>
 </section>
 <section id="security"><h2>Security</h2>
 <p>We use reasonable administrative, technical, and organizational safeguards appropriate to the sensitivity of the information. No method of transmission or storage is 100% secure.</p>
@@ -159,10 +184,11 @@ li{margin:0 0 6px;}
 <section id="your-rights-and-choices"><h2>Your rights and choices</h2>
 <p>Depending on where you live, you may have rights to access, correct, delete, restrict or object to certain processing, and (where applicable) portability.</p>
 <p><strong>EEA/UK:</strong> you also have the right to lodge a complaint with your local data protection authority, and you may withdraw consent at any time where processing is based on consent.</p>
+<p><strong>Account deletion:</strong> if you have an account, you can initiate deletion in the app (Account → Delete account). Deleting your account removes your server-side data associated with your account (such as sessions and stored analysis outputs), subject to limited legal/operational retention.</p>
 <p>To make a request, contact <a href="mailto:privacy@yourdomain.com">privacy@yourdomain.com</a>. We may need to verify your identity.</p>
 </section>
 <section id="automated-processing"><h2>Automated processing</h2>
-<p>The Service may use automated processing to analyze images and generate results. This processing is intended to provide the Service’s features and does not make decisions that produce legal or similarly significant effects for you.</p>
+<p>The Service uses automated processing, including AI-based analysis of images, to generate undertone results and to answer questions about those results. This processing is intended to provide the Service’s features and does not make decisions that produce legal or similarly significant effects for you.</p>
 </section>
 <section id="children"><h2>Children</h2>
 <p>The Service is not intended for children under 13 (or the minimum age required by local law). If you believe a child provided personal information, contact us so we can address it.</p>
