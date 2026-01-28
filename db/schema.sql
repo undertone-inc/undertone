@@ -27,6 +27,23 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Legacy upgrade: ensure required auth columns exist even if the users table pre-exists.
+-- NOTE: The CREATE TABLE above is only applied when the table doesn't already exist.
+-- If you're upgrading from an older deployment that created a different `users` table,
+-- these ALTERs ensure the auth flow won't crash on missing columns.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_norm TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS account_name TEXT NOT NULL DEFAULT '';
+
+-- Backfill email_norm for legacy rows.
+UPDATE users
+SET email_norm = COALESCE(NULLIF(LOWER(TRIM(email)), ''), 'legacy_' || id::text)
+WHERE email_norm IS NULL OR email_norm = '';
+
+-- Enforce not-null + uniqueness on email_norm (required by auth flow).
+ALTER TABLE users ALTER COLUMN email_norm SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_norm_key ON users(email_norm);
+
 -- Backfill / upgrade existing tables (idempotent)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_tier TEXT NOT NULL DEFAULT 'free';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_interval TEXT NOT NULL DEFAULT 'month';
