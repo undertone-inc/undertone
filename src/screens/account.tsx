@@ -46,10 +46,12 @@ function formatPercent(used: number, limit: number): string {
 // normalizePlanTier is imported from ../api
 
 // Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
-const API_BASE =
+// IMPORTANT: Strip trailing slashes so we never generate URLs like "//billing/sync".
+const RAW_API_BASE =
   (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
+const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
 const TERMS_URL = 'https://undertoneapp.io/undertone-legal/terms/index.html';
 const PRIVACY_URL = 'https://undertoneapp.io/undertone-legal/privacy/index.html';
@@ -450,6 +452,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const showPlan = matchesQuery('Plan', 'Free', 'Pro', 'Upgrade', 'Manage');
   const showBilling = matchesQuery('Billing', 'Update billing');
+  const showRestorePurchases = matchesQuery('Restore', 'Restore purchases', 'Restore purchase', 'Purchases');
 
   const showUpdates = matchesQuery('Updates', 'Update', 'Location', 'Locations');
   const showReferUser = matchesQuery(
@@ -475,7 +478,7 @@ const Account: React.FC<AccountScreenProps> = ({
   const showLogout = matchesQuery('Log out', 'Logout');
 
   const profileRowsVisible = showAccountName || showEmailRow || showPassword;
-  const planRowsVisible = showPlan || showBilling;
+  const planRowsVisible = showPlan || showBilling || showRestorePurchases;
   const catalogRowsVisible = showUpdates || showReferUser || showSupport;
   const commRowsVisible = showEmailUpdates || showPrivacyPolicy;
   const actionRowsVisible = showDeleteAccount || showLogout;
@@ -761,12 +764,27 @@ const Account: React.FC<AccountScreenProps> = ({
       // On real iOS subscriptions this triggers the Apple purchase sheet.
       const result = cycle === 'yearly' ? await buyYearly() : await buyMonthly();
 
-      if (result?.ok) {
+      // RevenueCat can return a successful transaction even if the entitlement mapping
+      // is misconfigured (rare). Only unlock Pro when the entitlement is active.
+      const hasPro = result?.ok ? (result?.hasPro ?? true) : false;
+
+      if (result?.ok && hasPro) {
         setPlanTier('pro');
         onPlanTierChanged?.('pro');
         await syncServerBilling();
         closeModal();
         Alert.alert('Success', 'Undertone Pro unlocked.');
+        return;
+      }
+
+      if (result?.ok && !hasPro) {
+        // Transaction succeeded but entitlement didn't activate. Don't unlock Pro.
+        closeModal();
+        await syncServerBilling();
+        Alert.alert(
+          'Purchase pending',
+          'Your purchase completed, but Undertone Pro is not active yet. Please tap Restore purchases, or try again in a moment.'
+        );
         return;
       }
 
@@ -804,7 +822,7 @@ const Account: React.FC<AccountScreenProps> = ({
     }
   };
 
-  const restorePurchasesFromUpgrade = async () => {
+  const restorePurchases = async () => {
     if (!requireAuthOrAlert()) return;
 
     if (!rcReady) {
@@ -821,6 +839,15 @@ const Account: React.FC<AccountScreenProps> = ({
 
       if (!r?.ok) {
         Alert.alert('Restore purchases', String(r?.message || 'Restore failed.'));
+        return;
+      }
+
+      // Only unlock Pro if the user actually has an active entitlement.
+      if (!r?.hasPro) {
+        Alert.alert(
+          'Restore purchases',
+          'No active Undertone Pro subscription was found for this Apple ID.'
+        );
         return;
       }
 
@@ -1059,21 +1086,11 @@ const Account: React.FC<AccountScreenProps> = ({
                           <>
                             <View style={styles.planActionDivider} />
                             <View style={styles.planFootRow}>
-  <View style={styles.planFootLeft}>
-    <Text style={styles.planCancelAnytime}>Cancel anytime</Text>
-    <Text style={styles.planFootSep}> · </Text>
-    <TouchableOpacity
-      onPress={restorePurchasesFromUpgrade}
-      activeOpacity={0.8}
-      disabled={saving}
-      accessibilityRole="button"
-      accessibilityLabel="Restore purchase"
-    >
-      <Text style={styles.planCancelAnytime}>Restore purchase</Text>
-    </TouchableOpacity>
-  </View>
+                              <View style={styles.planFootLeft}>
+                                <Text style={styles.planCancelAnytime}>Cancel anytime</Text>
+                              </View>
 
-  <View style={styles.planFootRight}>
+                              <View style={styles.planFootRight}>
     <TouchableOpacity
       onPress={() => openInAppBrowser(TERMS_URL)}
       activeOpacity={0.8}
@@ -1647,6 +1664,21 @@ const Account: React.FC<AccountScreenProps> = ({
                               </TouchableOpacity>
                             ) : null}
                           </View>
+                        </View>
+                      )}
+
+                      {showRestorePurchases && (
+                        <View style={styles.row}>
+                          <Text style={styles.rowLabel}>Restore purchases</Text>
+                          <TouchableOpacity
+                            activeOpacity={0.8}
+                            onPress={restorePurchases}
+                            disabled={saving}
+                            accessibilityRole="button"
+                            accessibilityLabel="Restore purchases"
+                          >
+                            <Text style={[styles.rowRightAction, saving && { opacity: 0.6 }]}>Restore</Text>
+                          </TouchableOpacity>
                         </View>
                       )}
 

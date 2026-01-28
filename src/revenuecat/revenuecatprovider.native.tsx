@@ -14,7 +14,13 @@ import {
   restorePurchases,
 } from './revenuecat';
 
-export type RevenueCatPurchaseResult = { ok: boolean; cancelled?: boolean; message?: string };
+export type RevenueCatPurchaseResult = {
+  ok: boolean;
+  cancelled?: boolean;
+  message?: string;
+  /** True when the customer info contains the Pro entitlement. */
+  hasPro?: boolean;
+};
 
 export type RevenueCatContextValue = {
   /** True when RevenueCat is configured and safe to use. */
@@ -148,27 +154,33 @@ export function RevenueCatProvider({
       refresh,
       buyMonthly: async () => {
         const r = await purchaseCycle('monthly');
+        let nextHasPro = false;
         if (r.ok && r.customerInfo) {
+          nextHasPro = hasProEntitlement(r.customerInfo);
           setCustomerInfo(r.customerInfo);
-          setIsPro(hasProEntitlement(r.customerInfo));
+          setIsPro(nextHasPro);
         }
-        return { ok: r.ok, cancelled: r.cancelled, message: r.message };
+        return { ok: r.ok, cancelled: r.cancelled, message: r.message, hasPro: nextHasPro };
       },
       buyYearly: async () => {
         const r = await purchaseCycle('yearly');
+        let nextHasPro = false;
         if (r.ok && r.customerInfo) {
+          nextHasPro = hasProEntitlement(r.customerInfo);
           setCustomerInfo(r.customerInfo);
-          setIsPro(hasProEntitlement(r.customerInfo));
+          setIsPro(nextHasPro);
         }
-        return { ok: r.ok, cancelled: r.cancelled, message: r.message };
+        return { ok: r.ok, cancelled: r.cancelled, message: r.message, hasPro: nextHasPro };
       },
       restore: async () => {
         const r = await restorePurchases();
+        let nextHasPro = false;
         if (r.ok && r.customerInfo) {
+          nextHasPro = hasProEntitlement(r.customerInfo);
           setCustomerInfo(r.customerInfo);
-          setIsPro(hasProEntitlement(r.customerInfo));
+          setIsPro(nextHasPro);
         }
-        return { ok: r.ok, message: r.message };
+        return { ok: r.ok, message: r.message, hasPro: nextHasPro };
       },
       showPaywall: async () => {
         const offering = offerings?.current ?? undefined;
