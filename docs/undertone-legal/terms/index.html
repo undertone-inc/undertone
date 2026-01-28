@@ -12,7 +12,7 @@
   --muted:#555555;
   --link:#111111;
   --border:#e0e0e0;
-  --max:980px;
+  --max:1040px;
   --radius:12px;
 }
 *{box-sizing:border-box}
@@ -24,17 +24,17 @@ body{
   line-height:1.6;
 }
 a{color:var(--link); text-decoration:underline;}
-header{padding:28px 18px 10px;}
+header{padding:28px 26px 10px;}
 .wrap{max-width:var(--max); margin:0 auto;}
 h1{font-size:28px; font-weight:600; margin:0 0 6px;}
 .meta{color:var(--muted); font-size:14px; margin:0 0 18px;}
-.card{
-  background:transparent;
-  border:none;
-  border-radius:0;
-  padding:0;
-  margin:18px 0;
+.toc{
+  margin: 8px 0 22px;
 }
+.content{
+  margin: 0;
+}
+
 .toc-title{
   font-size:12px;
   margin:0 0 10px;
@@ -43,14 +43,17 @@ h1{font-size:28px; font-weight:600; margin:0 0 6px;}
   letter-spacing:.10em;
 }
 .toc ol{margin:0; padding-left:18px;}
-section{padding-top:18px; margin-top:18px; border-top:1px solid var(--border);}
-section:first-of-type{border-top:none; padding-top:0; margin-top:0;}
+section{
+  padding-top:18px;
+  margin-top:18px;
+}
+section:first-of-type{padding-top:0; margin-top:0;}
 h2{font-size:18px; font-weight:600; margin:0 0 10px;}
 p{margin:0 0 12px;}
 ul{margin:0 0 12px; padding-left:18px;}
 li{margin:0 0 6px;}
 .footer{
-  padding:26px 18px 34px;
+  padding:26px 26px 34px;
   color:var(--muted);
   font-size:13px;
 }
@@ -76,7 +79,7 @@ li{margin:0 0 6px;}
       <h1>Undertone Terms of Service</h1>
       <p class="meta">UNDERTONE BEAUTY Inc. • Last updated: January 26, 2026</p>
 
-      <div class="card">
+      <div class="toc">
         <div class="toc-title">Contents</div>
         <ol>
           <li><a href="#acceptance-of-these-terms">Acceptance of these Terms</a></li>
@@ -97,7 +100,7 @@ li{margin:0 0 6px;}
         </ol>
       </div>
 
-      <div class="card">
+      <div class="content">
         <section id="acceptance-of-these-terms"><h2>Acceptance of these Terms</h2>
 <p>These Terms of Service (“Terms”) govern your access to and use of the Undertone mobile application and related services (the “Service”). The Service is provided by UNDERTONE BEAUTY Inc. (“we”, “us”, “our”). By creating an account or using the Service, you agree to these Terms. If you do not agree, do not use the Service.</p>
 <p class="note">This template is provided for general informational purposes and isn’t legal advice. You should have counsel review before launch.</p>
