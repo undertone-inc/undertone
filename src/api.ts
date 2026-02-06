@@ -206,7 +206,7 @@ export const PLAN_CONFIG: Record<
     features: ['Up to 5 scans / mo', 'Up to 5 names on your list', 'Up to 5 custom categories', 'Up to 5 kit items'],
   },
   pro: {
-    label: 'Pro',
+    label: 'Undertone Pro',
     priceLabel: '$20 / mo',
     features: [
       'Up to 100 scans per month',

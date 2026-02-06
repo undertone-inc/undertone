@@ -30,22 +30,57 @@ const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
 // but still scroll safely if the list grows.
 const SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.8);
 
+// Filter sheet should be taller so the date field stays visible when the keyboard is open.
+const FILTER_SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.9);
+const FILTER_SHEET_MIN_HEIGHT = Math.round(Dimensions.get('window').height * 0.62);
+
 // Default KitLog categories (used only if KitLog hasn't been opened yet)
 const DEFAULT_KITLOG_CATEGORIES = [
   // Match KitLog category ordering
-  'Prep & Skin',
-  'Foundation',
-  'Lips',
+  'Prep & Finish',
+  'Base',
   'Cheeks',
+  'Sculpt',
+  'Lips',
   'Eyes',
   'Brows',
-  'Lashes',
   'Tools',
   'Hygiene & Disposables',
   'Other',
 ];
 
-const FALLBACK_CATEGORY_NAME = 'Foundation';
+const FALLBACK_CATEGORY_NAME = 'Base';
+
+// Kit picker uses this sentinel category to show all items.
+const KIT_PICKER_ALL = '__all__';
+
+function normalizeKitlogCategoryName(raw: any): string {
+  const n = typeof raw === 'string' ? raw.trim() : '';
+  if (!n) return '';
+  const key = n.toLowerCase();
+
+  // Legacy name migrations.
+  if (key === 'foundation') return 'Base';
+  if (key === 'prep & skin' || key === 'prep and skin' || key === 'prep/skin') return 'Prep & Finish';
+  if (key === 'prep & finish' || key === 'prep and finish') return 'Prep & Finish';
+  if (key === 'lashes') return 'Eyes';
+  if (
+    key === 'body / fx / extras' ||
+    key === 'body/fx/extras' ||
+    key === 'body fx extras' ||
+    key === 'body & fx' ||
+    key === 'body and fx' ||
+    key === 'body / fx' ||
+    key === 'body/fx' ||
+    key === 'body fx' ||
+    key === 'bodyfx'
+  ) {
+    return 'Other';
+  }
+
+  return n;
+}
+
 
 // How the bottom bars sit when the keyboard is CLOSED
 // (Adds a little more breathing room above the bottom nav divider)
@@ -66,11 +101,18 @@ type Undertone = 'cool' | 'neutral-cool' | 'neutral' | 'neutral-warm' | 'warm' |
 
 const EVENT_TYPE_OPTIONS = [
   'Wedding',
+  'Engagement',
+  'Graduation',
+  'Party',
+  'Trial',
+  'Production',
+  'Fashion & editorial',
+  'Corporate',
   'Photoshoot',
   'Other',
 ] as const;
 
-type EventType = (typeof EVENT_TYPE_OPTIONS)[number];
+type EventType = string;
 
 // Category is driven by KitLog (dynamic), so store it as a string (category name).
 type PlanCategory = string;
@@ -81,8 +123,20 @@ type ClientProduct = {
   name: string;
   shade?: string;
   notes?: string;
+  // If added from KitLog, keep a reference to the KitLog item id.
+  kitItemId?: string;
   createdAt: number;
   updatedAt: number;
+};
+
+type KitPickItem = {
+  id: string;
+  category: PlanCategory;
+  name: string;
+  brand?: string;
+  shade?: string;
+  subcategory?: string;
+  type?: string;
 };
 
 type ClientRecord = {
@@ -91,8 +145,10 @@ type ClientRecord = {
   undertone: Undertone;
   season: Season4 | null;
   trialDate?: string; // YYYY-MM-DD
+  trialTime?: string; // HH:MM
   finalDate?: string; // YYYY-MM-DD
-  eventType: EventType | '';
+  finalTime?: string; // HH:MM
+  eventType: string;
   notes?: string;
   products: ClientProduct[];
   createdAt: number;
@@ -169,9 +225,48 @@ function formatDateInput(raw: string): string {
   return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6)}`;
 }
 
+function formatDateInputDMY(raw: string): string {
+  // Accept digits only and format as DD-MM-YYYY while typing.
+  const digits = (raw || '').replace(/\D/g, '').slice(0, 8);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 4) return `${digits.slice(0, 2)}-${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}-${digits.slice(2, 4)}-${digits.slice(4)}`;
+}
 
+function ymdToDmy(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((ymd || '').trim());
+  if (!m) return '';
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+function dmyToYmd(dmy: string): string {
+  const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec((dmy || '').trim());
+  if (!m) return '';
+  const dd = m[1];
+  const mm = m[2];
+  const yyyy = m[3];
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+
+
+
+
+function normalizeTimeString(raw: any): string {
+  if (typeof raw === 'string') return raw.trim();
+  return '';
+}
+
+function formatTimeInput(raw: string): string {
+  // Accept digits only and format as HH:MM while typing.
+  const digits = (raw || '').replace(/\D/g, '').slice(0, 4);
+  if (digits.length <= 2) return digits;
+  // Common shorthand: 930 => 09:30
+  if (digits.length === 3) return `0${digits.slice(0, 1)}:${digits.slice(1)}`;
+  return `${digits.slice(0, 2)}:${digits.slice(2)}`;
+}
 const DAY_MS = 24 * 60 * 60 * 1000;
-const UPCOMING_WINDOW_DAYS = 3;
+const UPCOMING_WINDOW_DAYS = 10;
 
 function parseYMDToUtcStartMs(ymd: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((ymd || '').trim());
@@ -221,7 +316,7 @@ function clientMatchesQuery(c: ClientRecord, q: string): boolean {
   const products = (c.products || [])
     .map((p) => `${categoryLabel(p.category)} ${p.name || ''} ${p.shade || ''} ${p.notes || ''}`.toLowerCase())
     .join(' ');
-  const dates = `${c.trialDate || ''} ${c.finalDate || ''}`.toLowerCase();
+  const dates = `${c.trialDate || ''} ${c.trialTime || ''} ${c.finalDate || ''} ${c.finalTime || ''}`.toLowerCase();
   const eventType = (String((c as any).eventType || '')).toLowerCase();
 
   return [name, notes, undertone, season, dates, products, eventType].some((s) => s.includes(needle));
@@ -236,7 +331,9 @@ function blankClient(): ClientRecord {
     undertone: 'unknown',
     season: null,
     trialDate: '',
+    trialTime: '',
     finalDate: '',
+    finalTime: '',
     eventType: '',
     notes: '',
     products: [],
@@ -250,7 +347,11 @@ function isBlankClient(c: ClientRecord): boolean {
   const notesEmpty = !(c.notes || '').trim();
   const noProducts = !Array.isArray(c.products) || c.products.length === 0;
   const noMatch = c.undertone === 'unknown' && !c.season;
-  const datesEmpty = !(c.trialDate || '').trim() && !(c.finalDate || '').trim();
+  const datesEmpty =
+    !(c.trialDate || '').trim() &&
+    !(c.trialTime || '').trim() &&
+    !(c.finalDate || '').trim() &&
+    !(c.finalTime || '').trim();
   const eventTypeEmpty = !(String((c as any).eventType || '')).trim();
   return nameEmpty && notesEmpty && noProducts && noMatch && datesEmpty && eventTypeEmpty;
 }
@@ -259,13 +360,14 @@ function isBlankClient(c: ClientRecord): boolean {
 // Earlier versions stored a small fixed set of category *codes*.
 // We now store the category *name* from KitLog.
 const LEGACY_CATEGORY_CODES: Record<string, string> = {
-  prep: 'Prep & Skin',
-  base: 'Foundation',
-  conceal: 'Foundation',
+  prep: 'Prep & Finish',
+  base: 'Base',
+  conceal: 'Base',
   cheek: 'Cheeks',
+  sculpt: 'Sculpt',
   brow: 'Brows',
   eye: 'Eyes',
-  lashes: 'Lashes',
+  lashes: 'Eyes',
   lip: 'Lips',
   tools: 'Tools',
   hygiene: 'Hygiene & Disposables',
@@ -278,8 +380,25 @@ function normalizeCategory(raw: any): PlanCategory {
     const trimmed = raw.trim();
     if (!trimmed) return FALLBACK_CATEGORY_NAME;
 
-    // Migration: older data used "Base"; it is now "Foundation".
-    if (trimmed.toLowerCase() === 'base') return 'Foundation';
+    // Migrations from legacy category *names* to current KitLog categories.
+    const key = trimmed.toLowerCase();
+    if (key === 'foundation') return 'Base';
+    if (key === 'prep & skin' || key === 'prep and skin' || key === 'prep/skin') return 'Prep & Finish';
+    if (key === 'prep & finish' || key === 'prep and finish') return 'Prep & Finish';
+    if (key === 'lashes') return 'Eyes';
+    if (
+      key === 'body / fx / extras' ||
+      key === 'body/fx/extras' ||
+      key === 'body fx extras' ||
+      key === 'body & fx' ||
+      key === 'body and fx' ||
+      key === 'body / fx' ||
+      key === 'body/fx' ||
+      key === 'body fx' ||
+      key === 'bodyfx'
+    ) {
+      return 'Other';
+    }
 
     // Only map exact legacy codes.
     const legacyMapped = (LEGACY_CATEGORY_CODES as any)[trimmed];
@@ -314,17 +433,26 @@ function normalizeData(input: any): ClientsData {
             : null;
 
         const rawEventType = typeof (c as any)?.eventType === 'string' ? String((c as any).eventType).trim() : '';
-        let eventType: EventType | '' = '';
+        let eventType = '';
         if (rawEventType) {
           const key = rawEventType.toLowerCase();
-          // Migrate legacy event types to new options.
-          if (key === 'corporate' || key === 'special occasion' || key === 'special_occasion' || key === 'special-occasion') {
-            eventType = 'Other';
-          } else if (key === 'tv' || key === 'fashion & editorial' || key === 'fashion&editorial') {
-            eventType = 'Other';
+
+          const match = EVENT_TYPE_OPTIONS.find((opt) => opt.toLowerCase() === key);
+          if (match) {
+            eventType = match;
+          } else if (
+            key === 'special occasion' ||
+            key === 'special_occasion' ||
+            key === 'special-occasion'
+          ) {
+            eventType = 'Party';
+          } else if (key === 'tv' || key === 'film' || key === 'television') {
+            eventType = 'Production';
+          } else if (key === 'fashion&editorial' || key === 'fashion and editorial' || key === 'editorial') {
+            eventType = 'Fashion & editorial';
           } else {
-            const match = EVENT_TYPE_OPTIONS.find((opt) => opt.toLowerCase() === key);
-            eventType = (match as any) || '';
+            // Allow custom event types.
+            eventType = rawEventType;
           }
         }
 
@@ -346,6 +474,7 @@ function normalizeData(input: any): ClientsData {
               name,
               shade: typeof p.shade === 'string' ? p.shade : '',
               notes: typeof p.notes === 'string' ? p.notes : '',
+              kitItemId: typeof (p as any).kitItemId === 'string' ? String((p as any).kitItemId) : undefined,
               createdAt: created,
               updatedAt: updated,
             } as ClientProduct;
@@ -358,7 +487,9 @@ function normalizeData(input: any): ClientsData {
           undertone,
           season,
           trialDate: normalizeDateString((c as any)?.trialDate),
+          trialTime: normalizeTimeString((c as any)?.trialTime),
           finalDate: normalizeDateString((c as any)?.finalDate),
+          finalTime: normalizeTimeString((c as any)?.finalTime),
           eventType,
           notes: typeof c.notes === 'string' ? c.notes : '',
           products,
@@ -386,14 +517,26 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const [search, setSearch] = useState('');
   const [newClientText, setNewClientText] = useState('');
 
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [filterEventType, setFilterEventType] = useState<string>('');
+  const [filterDate, setFilterDate] = useState<string>('');
+  const [filterEventMenuOpen, setFilterEventMenuOpen] = useState(false);
+
   // Client editor modal state
   const [draft, setDraft] = useState<ClientRecord | null>(null);
   const [isDraftNew, setIsDraftNew] = useState(false);
   const [newProductText, setNewProductText] = useState('');
+  const [kitlogItems, setKitlogItems] = useState<KitPickItem[]>([]);
+  const [kitPickerOpen, setKitPickerOpen] = useState(false);
+  const [kitPickerSearch, setKitPickerSearch] = useState('');
+  const [kitPickerCategory, setKitPickerCategory] = useState<string>(KIT_PICKER_ALL);
   const [kitlogCategories, setKitlogCategories] = useState<string[]>(DEFAULT_KITLOG_CATEGORIES);
   const [newProductCategory, setNewProductCategory] = useState<PlanCategory>(FALLBACK_CATEGORY_NAME);
   const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
   const [eventTypeMenuOpen, setEventTypeMenuOpen] = useState(false);
+  const [customEventTypeOpen, setCustomEventTypeOpen] = useState(false);
+  const [draftTrialDateText, setDraftTrialDateText] = useState('');
+  const [draftFinalDateText, setDraftFinalDateText] = useState('');
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const tabBarHeight = useBottomTabBarHeight();
 
@@ -408,6 +551,19 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const safeTop = Number(insets?.top || 0);
   const fallbackTop = Platform.OS === 'android' ? androidStatusBar : iosStatusBar;
   const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
+
+
+
+  // Keep DD-MM-YYYY text inputs in sync when switching between clients.
+  useEffect(() => {
+    if (!draft) {
+      setDraftTrialDateText('');
+      setDraftFinalDateText('');
+      return;
+    }
+    setDraftTrialDateText(ymdToDmy((draft.trialDate || '').trim()));
+    setDraftFinalDateText(ymdToDmy((draft.finalDate || '').trim()));
+  }, [draft ? draft.id : null]);
 
   // keyboard spacer (modal)
   useEffect(() => {
@@ -430,22 +586,20 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       const parsed = await getJson<any>(kitlogKey);
       if (!parsed) {
         setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
+        setKitlogItems([]);
         setNewProductCategory((prev) => {
           if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
           if (DEFAULT_KITLOG_CATEGORIES.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
           return DEFAULT_KITLOG_CATEGORIES[0] || FALLBACK_CATEGORY_NAME;
         });
+        setKitPickerCategory(KIT_PICKER_ALL);
         return;
       }
+
       const catsRaw = Array.isArray(parsed?.categories) ? parsed.categories : [];
+
       const names = catsRaw
-        .map((c: any) => {
-          const n = typeof c?.name === 'string' ? c.name.trim() : '';
-          if (!n) return '';
-          // Migration: "Base" -> "Foundation".
-          if (n.toLowerCase() === 'base') return 'Foundation';
-          return n;
-        })
+        .map((c: any) => normalizeKitlogCategoryName(c?.name))
         .filter(Boolean) as string[];
 
       // Deduplicate while preserving order.
@@ -455,19 +609,56 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       }
 
       const finalList = uniq.length > 0 ? uniq : DEFAULT_KITLOG_CATEGORIES;
+
+      const items: KitPickItem[] = [];
+      for (const c of catsRaw) {
+        const catName = normalizeKitlogCategoryName((c as any)?.name);
+        if (!catName) continue;
+        const itemsRaw = Array.isArray((c as any)?.items) ? (c as any).items : [];
+        for (const it of itemsRaw) {
+          const name = typeof (it as any)?.name === 'string' ? (it as any).name.trim() : '';
+          if (!name) continue;
+          const id = typeof (it as any)?.id === 'string' ? (it as any).id : uid('kit');
+          const brand = typeof (it as any)?.brand === 'string' ? (it as any).brand.trim() : '';
+          const shade = typeof (it as any)?.shade === 'string' ? (it as any).shade.trim() : '';
+          const subcategory = typeof (it as any)?.subcategory === 'string' ? (it as any).subcategory.trim() : '';
+          const type = typeof (it as any)?.type === 'string' ? (it as any).type.trim() : '';
+
+          items.push({
+            id,
+            category: catName,
+            name,
+            brand: brand || undefined,
+            shade: shade || undefined,
+            subcategory: subcategory || undefined,
+            type: type || undefined,
+          });
+        }
+      }
+
       setKitlogCategories(finalList);
+      setKitlogItems(items);
+
       setNewProductCategory((prev) => {
         if (finalList.includes(prev)) return prev;
         if (finalList.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
         return finalList[0] || FALLBACK_CATEGORY_NAME;
       });
+
+      setKitPickerCategory((prev) => {
+        if (prev === KIT_PICKER_ALL) return prev;
+        if (finalList.includes(prev)) return prev;
+        return KIT_PICKER_ALL;
+      });
     } catch {
       setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
+      setKitlogItems([]);
       setNewProductCategory((prev) => {
         if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
         if (DEFAULT_KITLOG_CATEGORIES.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
         return DEFAULT_KITLOG_CATEGORIES[0] || FALLBACK_CATEGORY_NAME;
       });
+      setKitPickerCategory(KIT_PICKER_ALL);
     }
   }
 
@@ -528,6 +719,52 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const todayUtcStart = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
   const query = search.trim().toLowerCase();
   const searchActive = query.length > 0;
+  const filterActive = !!filterEventType.trim() || !!filterDate.trim();
+
+  const filterEventTypeOptions = useMemo(() => {
+    const base = [...EVENT_TYPE_OPTIONS];
+    const seen = new Set(base.map((v) => v.toLowerCase()));
+    const custom: string[] = [];
+    for (const c of data.clients || []) {
+      const v = (c.eventType || '').toString().trim();
+      if (!v) continue;
+      const k = v.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      custom.push(v);
+    }
+    return [...base, ...custom];
+  }, [data.clients]);
+
+  const addedKitIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of (draft?.products || []) as any[]) {
+      const id = typeof (p as any)?.kitItemId === 'string' ? (p as any).kitItemId : '';
+      if (id) s.add(id);
+    }
+    return s;
+  }, [draft]);
+
+  const kitPickerVisibleItems = useMemo(() => {
+    const needle = kitPickerSearch.trim().toLowerCase();
+    const cat = kitPickerCategory;
+
+    const filtered = kitlogItems.filter((it) => {
+      if (cat !== KIT_PICKER_ALL && it.category !== cat) return false;
+      if (!needle) return true;
+      const hay = `${it.name} ${it.brand || ''} ${it.shade || ''}`.toLowerCase();
+      return hay.includes(needle);
+    });
+
+    return [...filtered].sort((a, b) => {
+      if (cat === KIT_PICKER_ALL) {
+        const c = a.category.localeCompare(b.category);
+        if (c) return c;
+      }
+      return a.name.localeCompare(b.name);
+    });
+  }, [kitlogItems, kitPickerSearch, kitPickerCategory]);
+
 
   const sortedClients = useMemo(() => {
     return [...data.clients].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
@@ -551,24 +788,54 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     return sortedClients.filter((c) => !isClientUpcoming(c, todayUtcStart, UPCOMING_WINDOW_DAYS));
   }, [sortedClients, todayUtcStart]);
 
+  const upcomingFiltered = useMemo(() => {
+    if (!filterActive) return upcomingAll;
+    const typeNeedle = filterEventType.trim().toLowerCase();
+    const dateNeedle = filterDate.trim();
+    return upcomingAll.filter((c) => {
+      if (typeNeedle && (c.eventType || '').toString().trim().toLowerCase() !== typeNeedle) return false;
+      if (dateNeedle) {
+        const t = (c.trialDate || '').trim();
+        const f = (c.finalDate || '').trim();
+        if (t !== dateNeedle && f !== dateNeedle) return false;
+      }
+      return true;
+    });
+  }, [upcomingAll, filterActive, filterEventType, filterDate]);
+
+  const nonUpcomingFiltered = useMemo(() => {
+    if (!filterActive) return nonUpcomingAll;
+    const typeNeedle = filterEventType.trim().toLowerCase();
+    const dateNeedle = filterDate.trim();
+    return nonUpcomingAll.filter((c) => {
+      if (typeNeedle && (c.eventType || '').toString().trim().toLowerCase() !== typeNeedle) return false;
+      if (dateNeedle) {
+        const t = (c.trialDate || '').trim();
+        const f = (c.finalDate || '').trim();
+        if (t !== dateNeedle && f !== dateNeedle) return false;
+      }
+      return true;
+    });
+  }, [nonUpcomingAll, filterActive, filterEventType, filterDate]);
+
   const upcomingVisible = useMemo(() => {
-    if (!searchActive) return upcomingAll;
-    return upcomingAll.filter((c) => clientMatchesQuery(c, query));
-  }, [upcomingAll, query, searchActive]);
+    if (!searchActive) return upcomingFiltered;
+    return upcomingFiltered.filter((c) => clientMatchesQuery(c, query));
+  }, [upcomingFiltered, query, searchActive]);
 
   const nonUpcomingVisible = useMemo(() => {
-    if (!searchActive) return nonUpcomingAll;
-    return nonUpcomingAll.filter((c) => clientMatchesQuery(c, query));
-  }, [nonUpcomingAll, query, searchActive]);
+    if (!searchActive) return nonUpcomingFiltered;
+    return nonUpcomingFiltered.filter((c) => clientMatchesQuery(c, query));
+  }, [nonUpcomingFiltered, query, searchActive]);
 
-  const hasUpcoming = upcomingAll.length > 0;
+  const hasUpcoming = upcomingFiltered.length > 0;
   const upcomingTotal = upcomingAll.length;
   const upcomingShowing = upcomingVisible.length;
   const clientsTotal = nonUpcomingAll.length;
   const clientsShowing = nonUpcomingVisible.length;
 
-  const upcomingMeta = searchActive ? `${upcomingShowing} / ${upcomingTotal}` : `${upcomingTotal}`;
-  const clientsMeta = searchActive ? `${clientsShowing} / ${clientsTotal}` : `${clientsTotal}`;
+  const upcomingMeta = (searchActive || filterActive) ? `${upcomingShowing} / ${upcomingTotal}` : `${upcomingTotal}`;
+  const clientsMeta = (searchActive || filterActive) ? `${clientsShowing} / ${clientsTotal}` : `${clientsTotal}`;
 
   type RowItem =
     | { kind: 'client'; key: string; client: ClientRecord }
@@ -595,6 +862,9 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const keyboardInset = keyboardHeight > 0 ? Math.max(0, keyboardHeight - tabBarHeight) : 0;
   const bottomPadding = keyboardHeight > 0 ? keyboardInset + KEYBOARD_GAP : CLOSED_BOTTOM_PADDING;
   const modalBottomPadding = keyboardHeight > 0 ? keyboardHeight + MODAL_KEYBOARD_GAP : MODAL_CLOSED_BOTTOM_PADDING;
+
+  const filterBackdropPadBottom =
+    keyboardHeight > 0 ? keyboardHeight + 12 : Math.max(insets.bottom, 16) + 12;
 
   function addClientFromBar() {
     const name = newClientText.trim();
@@ -640,6 +910,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     setDraft(c);
     setIsDraftNew(true);
     setNewProductText('');
+    setCustomEventTypeOpen(false);
     setNewProductCategory(
       kitlogCategories.includes(FALLBACK_CATEGORY_NAME) ? FALLBACK_CATEGORY_NAME : kitlogCategories[0] || FALLBACK_CATEGORY_NAME
     );
@@ -658,6 +929,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     setDraft(copy);
     setIsDraftNew(false);
     setNewProductText('');
+    setCustomEventTypeOpen(false);
     setNewProductCategory(
       kitlogCategories.includes(FALLBACK_CATEGORY_NAME) ? FALLBACK_CATEGORY_NAME : kitlogCategories[0] || FALLBACK_CATEGORY_NAME
     );
@@ -676,13 +948,16 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   function closeClient() {
     setEventTypeMenuOpen(false);
     setCategoryPickerOpen(false);
+    setCustomEventTypeOpen(false);
     if (!draft) return;
     const cleaned: ClientRecord = {
       ...draft,
       displayName: (draft.displayName || '').trim(),
       trialDate: formatDateInput((draft.trialDate || '').trim()),
+      trialTime: formatTimeInput((draft.trialTime || '').trim()),
       finalDate: formatDateInput((draft.finalDate || '').trim()),
-      eventType: (draft.eventType || '') as any,
+      finalTime: formatTimeInput((draft.finalTime || '').trim()),
+      eventType: (draft.eventType || '').toString().trim(),
       notes: (draft.notes || '').trim(),
       products: Array.isArray(draft.products)
         ? draft.products
@@ -739,8 +1014,13 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   }
 
   function addProduct() {
+    if (!draft) return;
     const trimmed = newProductText.trim();
-    if (!draft || !trimmed) return;
+    // If the user taps + with no text, open Kit picker.
+    if (!trimmed) {
+      void openKitPicker();
+      return;
+    }
     const now = Date.now();
 
     const prod: ClientProduct = {
@@ -782,8 +1062,68 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     setCategoryPickerOpen(true);
   }
 
+
+
+  function closeFilter() {
+    setFilterEventMenuOpen(false);
+    setFilterOpen(false);
+  }
+
+  function clearFilters() {
+    setFilterEventType('');
+    setFilterDate('');
+    setFilterEventMenuOpen(false);
+  }
+
+  async function openKitPicker() {
+    if (!draft) return;
+    Keyboard.dismiss();
+    setEventTypeMenuOpen(false);
+    setCategoryPickerOpen(false);
+    await refreshKitlogCategories();
+    setKitPickerSearch('');
+    setKitPickerCategory(KIT_PICKER_ALL);
+    setKitPickerOpen(true);
+  }
+
+  function addKitItemToDraft(item: KitPickItem) {
+    if (!draft) return;
+    const now = Date.now();
+
+    const already = (draft.products || []).some((p) => (p.kitItemId || '') === item.id);
+    if (already) return;
+
+    const brand = (item.brand || '').trim();
+    const name = (item.name || '').trim();
+    const displayName = brand && !name.toLowerCase().includes(brand.toLowerCase()) ? `${brand} ${name}` : name;
+
+    const prod: ClientProduct = {
+      id: uid('prod'),
+      category: item.category,
+      name: displayName,
+      shade: item.shade || '',
+      notes: '',
+      kitItemId: item.id,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        products: [...(prev.products || []), prod],
+        updatedAt: now,
+      };
+    });
+  }
   const topTitle = hasUpcoming ? 'Upcoming' : 'List';
   const topMeta = hasUpcoming ? upcomingMeta : clientsMeta;
+
+  const draftEventTypeValue = (draft?.eventType || '').toString().trim();
+  const draftEventTypeIsCustom =
+    !!draftEventTypeValue && !EVENT_TYPE_OPTIONS.some((opt) => opt.toLowerCase() === draftEventTypeValue.toLowerCase());
+  const draftEventTypeDisplay = draftEventTypeValue ? draftEventTypeValue : customEventTypeOpen ? 'Custom' : 'Select';
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
@@ -821,7 +1161,21 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
           <View style={styles.listHeaderWrap}>
             <View style={styles.listHeaderRow}>
               <Text style={styles.listHeaderTitle}>{topTitle}</Text>
-              <Text style={styles.listHeaderMeta}>{topMeta}</Text>
+              <View style={styles.listHeaderRight}>
+                <Text style={styles.listHeaderMeta}>{topMeta}</Text>
+                <TouchableOpacity
+                  style={[styles.filterBtn, filterActive ? styles.filterBtnOn : null]}
+                  activeOpacity={0.9}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setFilterEventMenuOpen(false);
+                    setFilterOpen(true);
+                  }}
+                  accessibilityRole="button"
+                >
+                  <Ionicons name="options-outline" size={16} color={filterActive ? '#111111' : '#6b7280'} />
+                </TouchableOpacity>
+              </View>
             </View>
             <View style={[styles.hairline, styles.listHeaderDivider]} />
           </View>
@@ -835,7 +1189,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
             ListEmptyComponent={
-              searchActive ? (
+              (searchActive || filterActive) ? (
                 <View style={styles.emptyPad}>
                   <Text style={styles.emptyPadText}>No items found.</Text>
                 </View>
@@ -849,7 +1203,21 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                   <View style={styles.listHeaderWrap}>
                     <View style={styles.listHeaderRow}>
                       <Text style={styles.listHeaderTitle}>{item.title}</Text>
-                      <Text style={styles.listHeaderMeta}>{item.meta}</Text>
+                      <View style={styles.listHeaderRight}>
+                        <Text style={styles.listHeaderMeta}>{item.meta}</Text>
+                        <TouchableOpacity
+                          style={[styles.filterBtn, filterActive ? styles.filterBtnOn : null]}
+                          activeOpacity={0.9}
+                          onPress={() => {
+                            Keyboard.dismiss();
+                            setFilterEventMenuOpen(false);
+                            setFilterOpen(true);
+                          }}
+                          accessibilityRole="button"
+                        >
+                          <Ionicons name="options-outline" size={16} color={filterActive ? '#111111' : '#6b7280'} />
+                        </TouchableOpacity>
+                      </View>
                     </View>
                     <View style={[styles.hairline, styles.listHeaderDivider]} />
                   </View>
@@ -857,12 +1225,33 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
               }
 
               const c = item.client;
-              const title = c.displayName?.trim() ? c.displayName.trim() : 'Untitled client';
-              const undertone = undertoneLabel(c.undertone);
-              const season = seasonLabel(c.season);
-              const updated = c.updatedAt ? formatShortDate(c.updatedAt) : '';
-              const planCount = Array.isArray(c.products) ? c.products.length : 0;
-              const planLabel = planCount === 1 ? '1 product' : `${planCount} products`;
+              const title = c.displayName?.trim() ? c.displayName.trim() : 'Untitled';
+
+              const chips: { key: string; text: string }[] = [];
+              const eventType = (c.eventType || '').toString().trim();
+              if (eventType) {
+                chips.push({ key: `type_${eventType}`, text: eventType });
+              }
+
+              const trialDate = (c.trialDate || '').trim();
+              const trialTime = (c.trialTime || '').trim();
+              const trialDisplay = trialDate ? (ymdToDmy(trialDate) || trialDate) : '';
+              if (trialDate) {
+                chips.push({
+                  key: `trial_${trialDate}_${trialTime}`,
+                  text: `Trial ${trialDisplay}${trialTime ? ' ' + trialTime : ''}`,
+                });
+              }
+
+              const finalDate = (c.finalDate || '').trim();
+              const finalTime = (c.finalTime || '').trim();
+              const finalDisplay = finalDate ? (ymdToDmy(finalDate) || finalDate) : '';
+              if (finalDate) {
+                chips.push({
+                  key: `event_${finalDate}_${finalTime}`,
+                  text: `Event ${finalDisplay}${finalTime ? ' ' + finalTime : ''}`,
+                });
+              }
 
               return (
                 <TouchableOpacity
@@ -875,20 +1264,19 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                     <Text style={styles.clientName} numberOfLines={1}>
                       {title}
                     </Text>
-                    {!!updated ? <Text style={styles.clientMeta}>{updated}</Text> : null}
                   </View>
 
-                  <View style={styles.chipRow}>
-                    <View style={styles.smallChip}>
-                      <Text style={styles.smallChipText}>{undertone}</Text>
+                  {chips.length ? (
+                    <View style={styles.chipRow}>
+                      {chips.map((ch) => (
+                        <View key={ch.key} style={styles.smallChip}>
+                          <Text style={styles.smallChipText} numberOfLines={1}>
+                            {ch.text}
+                          </Text>
+                        </View>
+                      ))}
                     </View>
-                    <View style={styles.smallChip}>
-                      <Text style={styles.smallChipText}>{season}</Text>
-                    </View>
-                    <View style={styles.smallChip}>
-                      <Text style={styles.smallChipText}>{planLabel}</Text>
-                    </View>
-                  </View>
+                  ) : null}
                 </TouchableOpacity>
               );
             }}
@@ -914,6 +1302,106 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
             </View>
           </View>
         </View>
+
+        {/* Filter (match the Add-to-list panel) */}
+        <Modal
+          visible={filterOpen}
+          animationType="slide"
+          presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
+          onRequestClose={closeFilter}
+        >
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+            <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
+              <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}> 
+                <View style={styles.modalHeader}>
+                  <TouchableOpacity style={styles.modalBack} onPress={closeFilter} accessibilityRole="button">
+                    <Ionicons name="chevron-back" size={20} color="#111111" />
+                    <Text style={styles.modalBackText}>List</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity style={styles.modalClear} onPress={clearFilters} accessibilityRole="button">
+                    <Text style={styles.modalClearText}>Clear</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView
+                  style={{ flex: 1 }}
+                  contentContainerStyle={{ paddingTop: 12, paddingBottom: 24 }}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}
+                >
+                  <View style={styles.editorCard}>
+                    <Text style={styles.sectionTitle}>Filter</Text>
+
+                    <TouchableOpacity
+                      style={styles.menuRow}
+                      activeOpacity={0.9}
+                      onPress={() => {
+                        Keyboard.dismiss();
+                        setFilterEventMenuOpen((v) => !v);
+                      }}
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.menuRowLabel}>Event type</Text>
+                      <View style={styles.menuRowRight}>
+                        <Text
+                          style={[styles.menuRowValue, !filterEventType.trim() ? styles.menuRowValueMuted : null]}
+                          numberOfLines={1}
+                        >
+                          {filterEventType.trim() ? filterEventType : 'Any'}
+                        </Text>
+                        <Ionicons name="chevron-down" size={14} color="#6b7280" style={{ marginLeft: 6 }} />
+                      </View>
+                    </TouchableOpacity>
+
+                    {filterEventMenuOpen ? (
+                      <View style={styles.eventMenu}>
+                        {[('Any' as const), ...filterEventTypeOptions].map((name, idx) => {
+                          const value = name === 'Any' ? '' : (name as any);
+                          const on = (filterEventType || '') === value;
+                          const isLast = idx === filterEventTypeOptions.length;
+                          return (
+                            <View key={String(name)}>
+                              <TouchableOpacity
+                                style={styles.eventMenuRow}
+                                activeOpacity={0.9}
+                                onPress={() => {
+                                  setFilterEventType(value);
+                                  setFilterEventMenuOpen(false);
+                                }}
+                                accessibilityRole="button"
+                              >
+                                <Text style={styles.eventMenuText}>{name}</Text>
+                                {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : <View style={{ width: 18 }} />}
+                              </TouchableOpacity>
+                              {!isLast ? <View style={styles.eventMenuDivider} /> : null}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    ) : null}
+
+                    <View style={{ marginTop: 12 }}>
+                      <Text style={styles.dateLabel}>Date</Text>
+                      <TextInput
+                        value={filterDate}
+                        onChangeText={(v) => setFilterDate(formatDateInput(v))}
+                        placeholder="YYYY-MM-DD"
+                        placeholderTextColor="#9ca3af"
+                        style={styles.dateInput}
+                        autoCorrect={false}
+                        keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                        maxLength={10}
+                        returnKeyType="done"
+                      />
+                      <Text style={styles.filterHint}>Matches trial or event date</Text>
+                    </View>
+                  </View>
+                </ScrollView>
+              </View>
+            </SafeAreaView>
+          </TouchableWithoutFeedback>
+        </Modal>
 
         {/* Client editor */}
         <Modal
@@ -956,44 +1444,90 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                       returnKeyType="done"
                     />
 
-                    <View style={styles.dateRow}>
-                      <View style={[styles.dateField, { marginRight: 10 }]}>
-                        <Text style={styles.dateLabel}>Trial date</Text>
-                        <TextInput
-                          value={draft?.trialDate ?? ''}
-                          onChangeText={(v) =>
-                            setDraft((prev) => (prev ? { ...prev, trialDate: formatDateInput(v), updatedAt: Date.now() } : prev))
-                          }
-                          placeholder="YYYY-MM-DD"
-                          placeholderTextColor="#9ca3af"
-                          style={styles.dateInput}
-                          autoCorrect={false}
-                          keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
-                          maxLength={10}
-                          returnKeyType="done"
-                        />
+                    {/* Trial + Event (date + time) in one row */}
+                    <View style={styles.dateRowCombined}>
+                      <View style={[styles.dateTimeGroup, { marginRight: 12 }]}>
+                        <View style={[styles.dateField, { marginRight: 8 }]}>
+                          <Text style={styles.dateLabel}>Trial date</Text>
+                          <TextInput
+                            value={draftTrialDateText}
+                            onChangeText={(v) => {
+                              const formatted = formatDateInputDMY(v);
+                              setDraftTrialDateText(formatted);
+                              const ymd = dmyToYmd(formatted);
+                              setDraft((prev) => (prev ? { ...prev, trialDate: ymd, updatedAt: Date.now() } : prev));
+                            }}
+                            placeholder="DD-MM-YYYY"
+                            placeholderTextColor="#9ca3af"
+                            style={styles.dateInput}
+                            autoCorrect={false}
+                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                            maxLength={10}
+                            returnKeyType="done"
+                          />
+                        </View>
+
+                        <View style={styles.timeFieldCompact}>
+                          <Text style={styles.dateLabel}>Time</Text>
+                          <TextInput
+                            value={draft?.trialTime ?? ''}
+                            onChangeText={(v) =>
+                              setDraft((prev) =>
+                                prev ? { ...prev, trialTime: formatTimeInput(v), updatedAt: Date.now() } : prev
+                              )
+                            }
+                            placeholder="HH:MM"
+                            placeholderTextColor="#9ca3af"
+                            style={styles.timeInputCompact}
+                            autoCorrect={false}
+                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                            maxLength={5}
+                            returnKeyType="done"
+                          />
+                        </View>
                       </View>
 
-                      <View style={styles.dateField}>
-                        <Text style={styles.dateLabel}>Event date</Text>
-                        <TextInput
-                          value={draft?.finalDate ?? ''}
-                          onChangeText={(v) =>
-                            setDraft((prev) => (prev ? { ...prev, finalDate: formatDateInput(v), updatedAt: Date.now() } : prev))
-                          }
-                          placeholder="YYYY-MM-DD"
-                          placeholderTextColor="#9ca3af"
-                          style={styles.dateInput}
-                          autoCorrect={false}
-                          keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
-                          maxLength={10}
-                          returnKeyType="done"
-                        />
+                      <View style={styles.dateTimeGroup}>
+                        <View style={[styles.dateField, { marginRight: 8 }]}>
+                          <Text style={styles.dateLabel}>Event date</Text>
+                          <TextInput
+                            value={draftFinalDateText}
+                            onChangeText={(v) => {
+                              const formatted = formatDateInputDMY(v);
+                              setDraftFinalDateText(formatted);
+                              const ymd = dmyToYmd(formatted);
+                              setDraft((prev) => (prev ? { ...prev, finalDate: ymd, updatedAt: Date.now() } : prev));
+                            }}
+                            placeholder="DD-MM-YYYY"
+                            placeholderTextColor="#9ca3af"
+                            style={styles.dateInput}
+                            autoCorrect={false}
+                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                            maxLength={10}
+                            returnKeyType="done"
+                          />
+                        </View>
+
+                        <View style={styles.timeFieldCompact}>
+                          <Text style={styles.dateLabel}>Time</Text>
+                          <TextInput
+                            value={draft?.finalTime ?? ''}
+                            onChangeText={(v) =>
+                              setDraft((prev) =>
+                                prev ? { ...prev, finalTime: formatTimeInput(v), updatedAt: Date.now() } : prev
+                              )
+                            }
+                            placeholder="HH:MM"
+                            placeholderTextColor="#9ca3af"
+                            style={styles.timeInputCompact}
+                            autoCorrect={false}
+                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
+                            maxLength={5}
+                            returnKeyType="done"
+                          />
+                        </View>
                       </View>
                     </View>
-
-
-
 
                     <TouchableOpacity
                       style={styles.menuRow}
@@ -1009,11 +1543,11 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                         <Text
                           style={[
                             styles.menuRowValue,
-                            !(draft?.eventType || '').toString().trim() ? styles.menuRowValueMuted : null,
+                            !draftEventTypeValue ? styles.menuRowValueMuted : null,
                           ]}
                           numberOfLines={1}
                         >
-                          {(draft?.eventType || '').toString().trim() ? (draft?.eventType as any) : 'Select'}
+                          {draftEventTypeDisplay}
                         </Text>
                         <Ionicons name="chevron-down" size={14} color="#6b7280" style={{ marginLeft: 6 }} />
                       </View>
@@ -1021,30 +1555,74 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
                     {eventTypeMenuOpen ? (
                       <View style={styles.eventMenu}>
-                        {[('None' as const), ...EVENT_TYPE_OPTIONS].map((name, idx) => {
-                          const value = name === 'None' ? '' : name;
-                          const on = (draft?.eventType || '') === value;
-                          const isLast = idx === EVENT_TYPE_OPTIONS.length;
+                        {(['None', ...EVENT_TYPE_OPTIONS, 'Custom'] as const).map((name, idx) => {
+                          const isCustom = name === 'Custom';
+                          const value = name === 'None' ? '' : isCustom ? '__custom__' : (name as any);
+
+                          const on =
+                            value === '__custom__'
+                              ? customEventTypeOpen || draftEventTypeIsCustom
+                              : !customEventTypeOpen && draftEventTypeValue === value;
+
+                          const isLast = idx === EVENT_TYPE_OPTIONS.length + 1;
+
                           return (
                             <View key={String(name)}>
                               <TouchableOpacity
                                 style={styles.eventMenuRow}
                                 activeOpacity={0.9}
                                 onPress={() => {
-                                  setDraft((prev) =>
-                                    prev ? { ...prev, eventType: value as any, updatedAt: Date.now() } : prev
-                                  );
+                                  if (value === '__custom__') {
+                                    setCustomEventTypeOpen(true);
+                                    setDraft((prev) => {
+                                      if (!prev) return prev;
+                                      const cur = (prev.eventType || '').toString().trim();
+                                      const curIsCustom =
+                                        !!cur && !EVENT_TYPE_OPTIONS.some((opt) => opt.toLowerCase() === cur.toLowerCase());
+                                      return {
+                                        ...prev,
+                                        eventType: curIsCustom ? (prev.eventType as any) : '',
+                                        updatedAt: Date.now(),
+                                      };
+                                    });
+                                    setEventTypeMenuOpen(false);
+                                    return;
+                                  }
+
+                                  setDraft((prev) => (prev ? { ...prev, eventType: value as any, updatedAt: Date.now() } : prev));
+                                  setCustomEventTypeOpen(false);
                                   setEventTypeMenuOpen(false);
                                 }}
                                 accessibilityRole="button"
                               >
                                 <Text style={styles.eventMenuText}>{name}</Text>
-                                {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : <View style={{ width: 18 }} />}
+                                {on ? (
+                                  <Ionicons name="checkmark" size={18} color="#111111" />
+                                ) : (
+                                  <View style={{ width: 18 }} />
+                                )}
                               </TouchableOpacity>
                               {!isLast ? <View style={styles.eventMenuDivider} /> : null}
                             </View>
                           );
                         })}
+                      </View>
+                    ) : null}
+
+                    {(customEventTypeOpen || draftEventTypeIsCustom) ? (
+                      <View style={{ marginTop: 10 }}>
+                        <Text style={styles.dateLabel}>Custom event type</Text>
+                        <TextInput
+                          value={draft?.eventType ?? ''}
+                          onChangeText={(v) =>
+                            setDraft((prev) => (prev ? { ...prev, eventType: v, updatedAt: Date.now() } : prev))
+                          }
+                          placeholder="Type…"
+                          placeholderTextColor="#9ca3af"
+                          style={styles.customEventInput}
+                          autoCorrect={false}
+                          returnKeyType="done"
+                        />
                       </View>
                     ) : null}
 
@@ -1232,6 +1810,146 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                     </View>
                   </TouchableWithoutFeedback>
                 </Modal>
+
+                {/* Kit picker (add from inventory) */}
+<Modal
+  visible={kitPickerOpen}
+  animationType="slide"
+  presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
+  onRequestClose={() => setKitPickerOpen(false)}
+>
+  <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+    <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
+      <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
+        <View style={styles.modalHeader}>
+          <TouchableOpacity
+            style={styles.modalBack}
+            onPress={() => setKitPickerOpen(false)}
+            accessibilityRole="button"
+          >
+            <Ionicons name="chevron-back" size={20} color="#111111" />
+            <Text style={styles.modalBackText}>Client</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.modalClear}
+            onPress={() => setKitPickerOpen(false)}
+            accessibilityRole="button"
+          >
+            <Text style={styles.modalClearText}>Done</Text>
+          </TouchableOpacity>
+        </View>
+
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={{ paddingTop: 12, paddingBottom: 24 }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.editorCard}>
+            <Text style={styles.sectionTitle}>Add from kit</Text>
+
+            <View style={styles.kitSearchPill}>
+              <Ionicons name="search-outline" size={16} color="#6b7280" style={{ marginRight: 8 }} />
+              <TextInput
+                value={kitPickerSearch}
+                onChangeText={setKitPickerSearch}
+                placeholder="Search kit…"
+                placeholderTextColor="#9ca3af"
+                style={styles.kitSearchInput}
+                autoCorrect={false}
+                returnKeyType="search"
+              />
+              {kitPickerSearch.trim() ? (
+                <TouchableOpacity
+                  style={styles.kitSearchClear}
+                  onPress={() => setKitPickerSearch('')}
+                  accessibilityRole="button"
+                >
+                  <Ionicons name="close-circle" size={18} color="#9ca3af" />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.kitCategoryRow}
+              keyboardShouldPersistTaps="handled"
+            >
+              {[KIT_PICKER_ALL, ...kitlogCategories].map((cat) => {
+                const label = cat === KIT_PICKER_ALL ? 'All' : cat;
+                const on = kitPickerCategory === cat;
+                return (
+                  <TouchableOpacity
+                    key={cat}
+                    style={[styles.pillBtn, on ? styles.pillBtnOn : null]}
+                    onPress={() => setKitPickerCategory(cat)}
+                    activeOpacity={0.9}
+                    accessibilityRole="button"
+                  >
+                    <Text style={[styles.pillBtnText, on ? styles.pillBtnTextOn : null]}>{label}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+
+            <View style={[styles.sheetList, { marginTop: 12 }]}>
+              {kitPickerVisibleItems.length === 0 ? (
+                <View style={styles.kitEmptyRow}>
+                  <Text style={styles.kitEmptyText}>No items found.</Text>
+                </View>
+              ) : (
+                kitPickerVisibleItems.map((it, idx) => {
+                  const isLast = idx === kitPickerVisibleItems.length - 1;
+                  const brand = (it.brand || '').trim();
+                  const nm = (it.name || '').trim();
+                  const title =
+                    brand && nm && !nm.toLowerCase().includes(brand.toLowerCase())
+                      ? `${brand} ${nm}`
+                      : nm;
+                  const metaParts: string[] = [];
+                  if (it.category) metaParts.push(it.category);
+                  if (it.shade) metaParts.push(it.shade);
+                  const meta = metaParts.join(' • ');
+                  const added = addedKitIds.has(it.id);
+
+                  return (
+                    <View key={it.id}>
+                      <TouchableOpacity
+                        style={styles.kitRow}
+                        activeOpacity={0.9}
+                        onPress={() => addKitItemToDraft(it)}
+                        accessibilityRole="button"
+                      >
+                        <View style={{ flex: 1, paddingRight: 10 }}>
+                          <Text style={styles.kitRowName} numberOfLines={2}>
+                            {title || it.name}
+                          </Text>
+                          {meta ? (
+                            <Text style={styles.kitRowMeta} numberOfLines={1}>
+                              {meta}
+                            </Text>
+                          ) : null}
+                        </View>
+                        {added ? (
+                          <Ionicons name="checkmark" size={18} color="#111111" />
+                        ) : (
+                          <Ionicons name="add" size={18} color="#111111" />
+                        )}
+                      </TouchableOpacity>
+                      {!isLast ? <View style={styles.sheetDivider} /> : null}
+                    </View>
+                  );
+                })
+              )}
+            </View>
+          </View>
+        </ScrollView>
+      </View>
+    </SafeAreaView>
+  </TouchableWithoutFeedback>
+</Modal>
               </View>
             </SafeAreaView>
           </TouchableWithoutFeedback>
@@ -1325,6 +2043,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#6b7280',
   },
+  listHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  filterBtn: {
+    marginLeft: 10,
+    width: 30,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  filterBtnOn: {},
   listHeaderDivider: {
     marginTop: 13,
     marginBottom: 26,
@@ -1466,9 +2196,32 @@ const styles = StyleSheet.create({
   dateRow: {
     flexDirection: 'row',
     marginTop: 12,
+    alignItems: 'flex-end',
+  },
+  dateRowCombined: {
+    flexDirection: 'row',
+    marginTop: 12,
+    alignItems: 'flex-end',
+  },
+  dateTimeGroup: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
   },
   dateField: {
     flex: 1,
+    minWidth: 0,
+  },
+  timeField: {
+    width: 96,
+    minWidth: 88,
+    flexShrink: 0,
+  },
+  timeFieldCompact: {
+    width: 72,
+    minWidth: 64,
+    flexShrink: 0,
   },
   dateLabel: {
     fontSize: 12,
@@ -1477,6 +2230,38 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   dateInput: {
+    fontSize: 13,
+    color: '#111111',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+  },
+  timeInput: {
+    fontSize: 13,
+    color: '#111111',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    textAlign: 'center',
+  },
+  timeInputCompact: {
+    fontSize: 13,
+    color: '#111111',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    textAlign: 'center',
+  },
+  customEventInput: {
     fontSize: 13,
     color: '#111111',
     paddingVertical: 10,
@@ -1697,6 +2482,19 @@ const styles = StyleSheet.create({
     paddingTop: 14,
     paddingBottom: 10,
   },
+  filterSheetContainer: {
+    minHeight: FILTER_SHEET_MIN_HEIGHT,
+    maxHeight: FILTER_SHEET_MAX_HEIGHT,
+  },
+  filterSheetScroll: {
+    flex: 1,
+  },
+  filterSheetScrollContent: {
+    paddingBottom: 16,
+  },
+  filterSheetFooter: {
+    paddingTop: 8,
+  },
   sheetTitle: {
     fontSize: 13,
     fontWeight: '600',
@@ -1743,6 +2541,117 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
     color: '#111111',
+  },
+
+
+  // Filter
+  filterHint: {
+    marginTop: 6,
+    fontSize: 12,
+    color: '#6b7280',
+  },
+
+  // Filter modal header
+  modalClear: {
+    paddingHorizontal: 12,
+    height: 40,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalClearText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+
+  // Add product bar
+  kitInline: {
+    width: 34,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 4,
+  },
+
+  // Kit picker
+  kitSheetContainer: {
+    paddingBottom: 10,
+  },
+  kitHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  kitCloseBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  kitSearchPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    paddingLeft: 12,
+    paddingRight: 8,
+    minHeight: 38,
+  },
+  kitSearchInput: {
+    flex: 1,
+    fontSize: 14,
+    color: '#111111',
+    paddingVertical: 0,
+    fontWeight: '400',
+  },
+  kitSearchClear: {
+    marginLeft: 6,
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  kitCategoryRow: {
+    flexDirection: 'row',
+    paddingTop: 10,
+    paddingBottom: 2,
+  },
+  kitListScroll: {
+    maxHeight: SHEET_MAX_HEIGHT,
+  },
+  kitRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  kitRowName: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  kitRowMeta: {
+    marginTop: 4,
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  kitEmptyRow: {
+    paddingHorizontal: 12,
+    paddingVertical: 18,
+  },
+  kitEmptyText: {
+    fontSize: 13,
+    color: '#6b7280',
+    fontWeight: '500',
   },
 });
 

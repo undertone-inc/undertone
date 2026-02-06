@@ -883,12 +883,29 @@ const Account: React.FC<AccountScreenProps> = ({
     Alert.alert('Manage subscription', 'Unable to open Apple subscription settings.');
   };
 
+  const openGooglePlaySubscriptions = async () => {
+    // Google Play subscription management page
+    // (Works for any package; opens the user's subscriptions list.)
+    const url = 'https://play.google.com/store/account/subscriptions';
+    try {
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert('Manage subscription', 'Unable to open Google Play subscription settings.');
+    }
+  };
+
+  const openStoreSubscriptions = async () => {
+    if (Platform.OS === 'ios') return await openAppleSubscriptions();
+    if (Platform.OS === 'android') return await openGooglePlaySubscriptions();
+    Alert.alert('Manage subscription', 'Subscription management is not available on this platform.');
+  };
+
   const openCustomerCenterSafe = async () => {
     if (!requireAuthOrAlert()) return;
 
     // If RevenueCat isn't ready, fall back to Apple subscription settings.
     if (!rcReady) {
-      await openAppleSubscriptions();
+      await openStoreSubscriptions();
       return;
     }
 
@@ -905,10 +922,10 @@ const Account: React.FC<AccountScreenProps> = ({
 
       const elapsed = Date.now() - startedAt;
       if (elapsed < 600) {
-        await openAppleSubscriptions();
+        await openStoreSubscriptions();
       }
     } catch {
-      await openAppleSubscriptions();
+      await openStoreSubscriptions();
     } finally {
       setSaving(false);
     }
@@ -1669,7 +1686,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
                       {showRestorePurchases && (
                         <View style={styles.row}>
-                          <Text style={styles.rowLabel}>Restore purchases</Text>
+                          <Text style={styles.rowLabel}>Restore plan</Text>
                           <TouchableOpacity
                             activeOpacity={0.8}
                             onPress={restorePurchases}
@@ -1683,15 +1700,19 @@ const Account: React.FC<AccountScreenProps> = ({
                       )}
 
                       {showBilling && (
-                        <View style={styles.row}>
+                        <TouchableOpacity
+                          style={styles.row}
+                          activeOpacity={0.85}
+                          onPress={openCustomerCenterSafe}
+                          disabled={saving}
+                          accessibilityRole="button"
+                          accessibilityLabel="Billing"
+                        >
                           <Text style={styles.rowLabel}>Billing</Text>
-                          <TouchableOpacity
-                            activeOpacity={0.8}
-                            onPress={() => console.log('Update billing')}
-                          >
-                            <Text style={styles.rowRightAction}>Update</Text>
-                          </TouchableOpacity>
-                        </View>
+                          <View style={styles.rowRightWrap}>
+                            <Text style={[styles.rowRightAction, saving && { opacity: 0.6 }]}>Update</Text>
+                          </View>
+                        </TouchableOpacity>
                       )}
                     </View>
                   )}

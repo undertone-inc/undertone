@@ -11,6 +11,7 @@ import {
   ScrollView,
   Modal,
   Alert,
+  ActivityIndicator,
   StatusBar,
   useWindowDimensions,
 } from 'react-native';
@@ -20,6 +21,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { DOC_KEYS, getString, makeScopedKey, setString } from '../localstore';
 import { PlanTier, PLAN_LIMITS } from '../api';
+import { getToken } from '../auth';
 
 type KitLogScreenProps = {
   navigation: any;
@@ -34,8 +36,11 @@ type ItemStatus = 'inKit' | 'low' | 'empty';
 type KitItem = {
   id: string;
   name: string;
+  subcategory?: string;
+  type?: string;
   brand?: string;
   shade?: string;
+  placement?: string;
   undertone?: string;
   form?: string;
   location?: string;
@@ -70,6 +75,19 @@ const TONE_OPTIONS = [
   { key: 'warm', label: 'Warm' },
 ] as const;
 
+const BASE_SUBSET_OPTIONS = ['Foundation', 'Concealer', 'Corrector', 'Powder'] as const;
+const CHEEKS_SUBSET_OPTIONS = ['Blush', 'Highlighter'] as const;
+const SCULPT_SUBSET_OPTIONS = ['Contour', 'Bronzer'] as const;
+const LIPS_SUBSET_OPTIONS = ['Lipstick', 'Lipliner', 'Lip gloss', 'Lip balm/treatments'] as const;
+const EYES_SUBSET_OPTIONS = ['Eyeshadow', 'Eyeliner', 'Mascara', 'Lashes'] as const;
+const BROWS_SUBSET_OPTIONS = ['Pencil', 'Powder', 'Gel'] as const;
+
+const EYESHADOW_TYPE_OPTIONS = ['Individual', 'Palette'] as const;
+const EYELINER_TYPE_OPTIONS = ['Pencil', 'Liquid', 'Gel'] as const;
+
+const BASE_FORM_OPTIONS = ['Cream', 'Powder', 'Liquid'] as const;
+const EYES_COLOR_ROLE_OPTIONS = ['Base/prime', 'Enhance/crease', 'Smoke', 'Pop (shimmer/glitter)'] as const;
+
 
 const STORAGE_KEY = DOC_KEYS.kitlog;
 
@@ -90,21 +108,32 @@ const FOOTER_BAR_HEIGHT = 62;
 // (Raised to make the lift clearly noticeable)
 const KEYBOARD_GAP = 33;
 
+// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
+// IMPORTANT: Strip trailing slashes so we never generate URLs like "//infer-undertone".
+const RAW_API_BASE =
+  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
+  process.env.EXPO_PUBLIC_API_BASE ??
+  'http://localhost:3000';
+const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
+
 function uid(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const FOUNDATION_CATEGORY_NAME = 'Foundation';
+const BASE_CATEGORY_NAME = 'Base';
+const PREP_FINISH_CATEGORY_NAME = 'Prep & Finish';
+const CHEEKS_CATEGORY_NAME = 'Cheeks';
+const SCULPT_CATEGORY_NAME = 'Sculpt';
 
 // Core/default categories (non-deletable). User-added categories are deletable.
 const CORE_CATEGORY_ORDER = [
-  'Prep & Skin',
-  FOUNDATION_CATEGORY_NAME,
+  PREP_FINISH_CATEGORY_NAME,
+  BASE_CATEGORY_NAME,
+  CHEEKS_CATEGORY_NAME,
+  SCULPT_CATEGORY_NAME,
   'Lips',
-  'Cheeks',
   'Eyes',
   'Brows',
-  'Lashes',
   'Tools',
   'Hygiene & Disposables',
   'Other',
@@ -119,17 +148,38 @@ function isCoreCategoryName(name: string): boolean {
 function normalizeCategoryName(raw: any): string {
   const t = typeof raw === 'string' ? raw.trim() : '';
   if (!t) return '';
-  // Migration: "Base" -> "Foundation".
-  if (t.toLowerCase() === 'base') return FOUNDATION_CATEGORY_NAME;
-  // Migration: "Body / FX / Extras" -> "Other".
   const key = t.toLowerCase();
+
+  // Migration: "Prep & Skin" -> "Prep & Finish".
+  if (key === 'prep & skin' || key === 'prep and skin' || key === 'prep/skin') return PREP_FINISH_CATEGORY_NAME;
+  if (key === 'prep & finish' || key === 'prep and finish') return PREP_FINISH_CATEGORY_NAME;
+
+  // Migration: "Foundation" -> "Base".
+  if (key === 'foundation') return BASE_CATEGORY_NAME;
+  // Canonicalize casing.
+  if (key === 'base') return BASE_CATEGORY_NAME;
+
+  if (key === 'cheeks') return CHEEKS_CATEGORY_NAME;
+  if (key === 'sculpt') return SCULPT_CATEGORY_NAME;
+
+  // Legacy standalone Lashes category is now Eyes → Lashes (Subset).
+  if (key === 'lashes') return 'Eyes';
+
+  // Removed: Body / FX → fold into Other.
   if (
     key === 'body / fx / extras' ||
     key === 'body/fx/extras' ||
-    key === 'body fx extras'
+    key === 'body fx extras' ||
+    key === 'body & fx' ||
+    key === 'body and fx' ||
+    key === 'body / fx' ||
+    key === 'body/fx' ||
+    key === 'body fx' ||
+    key === 'bodyfx'
   ) {
     return 'Other';
   }
+
   return t;
 }
 
@@ -179,6 +229,55 @@ function nextStatus(s: ItemStatus): ItemStatus {
   return 'inKit';
 }
 
+type InferredUndertone = {
+  undertone: 'cool' | 'neutral' | 'warm' | 'unknown';
+  confidence: number; // 0-100
+  reason: string;
+};
+
+function inferProductUndertoneLocal(args: {
+  name?: string;
+  brand?: string;
+  shade?: string;
+  notes?: string;
+}): InferredUndertone {
+  const name = String(args?.name || '').trim();
+  const brand = String(args?.brand || '').trim();
+  const shade = String(args?.shade || '').trim();
+  const notes = String(args?.notes || '').trim();
+
+  const text = `${name} ${brand} ${shade} ${notes}`.toLowerCase();
+
+  const has = (re: RegExp) => re.test(text);
+
+  // Strong explicit signals
+  if (has(/\bneutral\b|\bneut\b/)) {
+    return { undertone: 'neutral', confidence: 84, reason: 'Text includes “neutral”.' };
+  }
+  if (has(/\bwarm\b|\bgolden\b|\byellow\b|\bolive\b/)) {
+    return { undertone: 'warm', confidence: 82, reason: 'Text includes a warm cue (warm/golden/yellow/olive).' };
+  }
+  if (has(/\bcool\b|\bpink\b|\brosy\b|\brose\b/)) {
+    return { undertone: 'cool', confidence: 80, reason: 'Text includes a cool cue (cool/pink/rosy/rose).' };
+  }
+
+  // Common shade-code patterns like 2N / 3W / 1C
+  // (We keep this conservative and only accept a single trailing letter.)
+  const m = text.match(/\b\d+(?:\.\d+)?\s*([ncw])\b/);
+  if (m && m[1]) {
+    const code = String(m[1] || '').toLowerCase();
+    if (code === 'n') return { undertone: 'neutral', confidence: 68, reason: 'Shade code looks like “N” (often neutral).' };
+    if (code === 'w') return { undertone: 'warm', confidence: 66, reason: 'Shade code looks like “W” (often warm).' };
+    if (code === 'c') return { undertone: 'cool', confidence: 66, reason: 'Shade code looks like “C” (often cool).' };
+  }
+
+  return {
+    undertone: 'unknown',
+    confidence: 20,
+    reason: 'Not enough information in the product name/shade text to guess confidently. Try adding the shade code (e.g., 2N / 3W) or the full shade name.',
+  };
+}
+
 function viewLabel(v: ViewMode) {
   if (v === 'all') return 'In kit';
   if (v === 'low') return 'Low';
@@ -203,7 +302,9 @@ function normalizeData(input: any): KitLogData {
       .map((c: any) => {
         if (!c) return null;
         const id = typeof c.id === 'string' ? c.id : uid('cat');
-        const name = normalizeCategoryName(c.name) || 'Untitled';
+        const rawName = typeof c.name === 'string' ? c.name.trim() : '';
+        const rawKey = rawName.toLowerCase();
+        const name = normalizeCategoryName(rawName) || 'Untitled';
         const createdAt = typeof c.createdAt === 'number' ? c.createdAt : Date.now();
         const itemsRaw = Array.isArray(c.items) ? c.items : [];
 
@@ -218,11 +319,89 @@ function normalizeData(input: any): KitLogData {
             const created = typeof it.createdAt === 'number' ? it.createdAt : Date.now();
             const updated = typeof it.updatedAt === 'number' ? it.updatedAt : created;
 
+            const brand = typeof it.brand === 'string' ? it.brand : '';
+
+            let shade = typeof it.shade === 'string' ? it.shade : '';
+            let placement = typeof it.placement === 'string' ? it.placement : '';
+            let type = typeof it.type === 'string' ? it.type : '';
+
+            // Backfill subcategory (Subset) for migrated categories.
+            const subcategoryRaw = typeof it.subcategory === 'string' ? it.subcategory : '';
+            let subcategory = subcategoryRaw;
+
+            // If this came from the old standalone "Lashes" category, treat it as Eyes → Lashes (Subset).
+            if (!subcategory.trim() && rawKey === 'lashes') {
+              subcategory = 'Lashes';
+            }
+
+            // Base defaults: Foundation / Concealer / Corrector / Powder
+            if (!subcategory.trim() && name.trim().toLowerCase() === BASE_CATEGORY_NAME.toLowerCase()) {
+              const blob = `${brand} ${itemName} ${shade} ${String(it?.notes || '')}`.trim().toLowerCase();
+              const has = (s: string) => blob.includes(s);
+              if (has('corrector')) subcategory = 'Corrector';
+              else if (has('concealer')) subcategory = 'Concealer';
+              else if (has('powder')) subcategory = 'Powder';
+              else subcategory = 'Foundation';
+            }
+
+            // Lips: canonicalize legacy subcategory names.
+            if (name.trim().toLowerCase() === 'lips') {
+              const subKey = (subcategory || '').trim().toLowerCase();
+              if (subKey === 'lip liner' || subKey === 'lipliner') subcategory = 'Lipliner';
+            }
+
+            // Eyes: migrate legacy subset + keep role selection in `shade`.
+            if (name.trim().toLowerCase() === 'eyes') {
+              const subKey0 = (subcategory || '').trim().toLowerCase();
+
+              // Legacy: "Eyeshadow palette/singles" -> Subset "Eyeshadow" + Type.
+              if (subKey0 === 'eyeshadow palette' || subKey0 === 'eyeshadow singles') {
+                subcategory = 'Eyeshadow';
+                if (!type.trim()) type = subKey0 === 'eyeshadow palette' ? 'Palette' : 'Individual';
+              }
+
+              const subKey = (subcategory || '').trim().toLowerCase();
+
+              // Sanitize Type based on Subset.
+              if (subKey === 'eyeshadow') {
+                const allowedTypes = EYESHADOW_TYPE_OPTIONS as readonly string[];
+                const current = (type || '').trim();
+                if (current && !allowedTypes.includes(current as any)) type = '';
+              } else if (subKey === 'eyeliner') {
+                const allowedTypes = EYELINER_TYPE_OPTIONS as readonly string[];
+                const current = (type || '').trim();
+                if (current && !allowedTypes.includes(current as any)) type = '';
+              } else {
+                type = '';
+              }
+
+              // Migration: older Eyes items stored the role in `placement`.
+              const shadeTrim = (shade || '').trim();
+              const placeTrim = (placement || '').trim();
+              const allowedRoles = EYES_COLOR_ROLE_OPTIONS as readonly string[];
+              const isAllowedRole = (v: string) => allowedRoles.includes(v as any);
+
+              if (subKey === 'eyeshadow') {
+                if (!shadeTrim && placeTrim && isAllowedRole(placeTrim)) {
+                  shade = placeTrim;
+                }
+                if (shadeTrim && !isAllowedRole(shadeTrim)) {
+                  shade = '';
+                }
+              }
+
+              // Drop the deprecated field.
+              placement = '';
+            }
+
             return {
               id: itemId,
               name: itemName,
-              brand: typeof it.brand === 'string' ? it.brand : '',
-              shade: typeof it.shade === 'string' ? it.shade : '',
+              subcategory,
+              type,
+              brand,
+              shade,
+              placement,
               undertone: typeof it.undertone === 'string' ? it.undertone : '',
               form: typeof it.form === 'string' ? it.form : '',
               location: typeof it.location === 'string' ? it.location : '',
@@ -244,7 +423,7 @@ function normalizeData(input: any): KitLogData {
 
     if (normalizedCats.length === 0) return base;
 
-    // Merge duplicate categories created by migration (e.g., "Base" + "Foundation").
+    // Merge duplicate categories created by migration (e.g., "Base" + "Foundation" / "Cheeks").
     const merged: KitCategory[] = [];
     const byName = new Map<string, number>();
     for (const cat of normalizedCats) {
@@ -263,7 +442,66 @@ function normalizeData(input: any): KitLogData {
       }
     }
 
-    return { version: 1, categories: merged };
+    // Ensure all core categories exist, and keep their ordering stable.
+    const now = Date.now();
+    const byLower = new Map<string, KitCategory>();
+    merged.forEach((c) => byLower.set((c.name || '').trim().toLowerCase(), c));
+
+    const ordered: KitCategory[] = [];
+    for (const n of CORE_CATEGORY_ORDER) {
+      const key = (n || '').trim().toLowerCase();
+      const hit = byLower.get(key);
+      if (hit) {
+        ordered.push(hit);
+        byLower.delete(key);
+      } else {
+        ordered.push({ id: uid('cat'), name: n, createdAt: now, items: [] });
+      }
+    }
+
+    // Append non-core categories (preserve their existing relative order).
+    for (const c of merged) {
+      const key = (c.name || '').trim().toLowerCase();
+      if (!byLower.has(key)) continue;
+      ordered.push(c);
+      byLower.delete(key);
+    }
+
+    // Post-pass migrations for newer category structure.
+    const lower = (s: string) => (s || '').trim().toLowerCase();
+    const nextCats: KitCategory[] = ordered.map((c) => ({
+      ...c,
+      items: Array.isArray(c.items) ? [...c.items] : [],
+    }));
+
+    const baseIdx = nextCats.findIndex((c) => lower(c.name) === lower(BASE_CATEGORY_NAME));
+    const cheeksIdx = nextCats.findIndex((c) => lower(c.name) === lower(CHEEKS_CATEGORY_NAME));
+    const sculptIdx = nextCats.findIndex((c) => lower(c.name) === lower(SCULPT_CATEGORY_NAME));
+
+    if (baseIdx >= 0) {
+      const baseItems = Array.isArray(nextCats[baseIdx]?.items) ? nextCats[baseIdx].items : [];
+      const keep: KitItem[] = [];
+      const toCheeks: KitItem[] = [];
+      const toSculpt: KitItem[] = [];
+
+      baseItems.forEach((it) => {
+        const k = lower((it as any)?.subcategory);
+        if (k === 'blush' || k === 'highlighter') toCheeks.push(it);
+        else if (k === 'bronzer' || k === 'contour') toSculpt.push(it);
+        else keep.push(it);
+      });
+
+      nextCats[baseIdx] = { ...nextCats[baseIdx], items: keep };
+
+      if (cheeksIdx >= 0 && toCheeks.length) {
+        nextCats[cheeksIdx] = { ...nextCats[cheeksIdx], items: [...nextCats[cheeksIdx].items, ...toCheeks] };
+      }
+      if (sculptIdx >= 0 && toSculpt.length) {
+        nextCats[sculptIdx] = { ...nextCats[sculptIdx], items: [...nextCats[sculptIdx].items, ...toSculpt] };
+      }
+    }
+
+    return { version: 1, categories: nextCats };
   } catch {
     return base;
   }
@@ -306,10 +544,19 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
   const [newCategoryText, setNewCategoryText] = useState('');
   const [quickAddText, setQuickAddText] = useState('');
   const [toneMenuOpen, setToneMenuOpen] = useState(false);
+  const [subcategoryMenuOpen, setSubcategoryMenuOpen] = useState(false);
+  const [typeMenuOpen, setTypeMenuOpen] = useState(false);
+  const [formMenuOpen, setFormMenuOpen] = useState(false);
+  const [colorMenuOpen, setColorMenuOpen] = useState(false);
+  const [undertoneGuessBusy, setUndertoneGuessBusy] = useState(false);
 
-  // Close the inline tone dropdown when navigating between screens/items.
+  // Close any inline dropdowns when navigating between screens/items.
   useEffect(() => {
     setToneMenuOpen(false);
+    setSubcategoryMenuOpen(false);
+    setTypeMenuOpen(false);
+    setFormMenuOpen(false);
+    setColorMenuOpen(false);
   }, [mode, activeCategoryId, activeItemId]);
 
   // keyboard spacer
@@ -382,6 +629,61 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
     if (!activeCategory || !activeItemId) return null;
     return activeCategory.items.find((it) => it.id === activeItemId) ?? null;
   }, [activeCategory, activeItemId]);
+  const activeCategoryKey = (activeCategory?.name ?? '').trim().toLowerCase();
+  const showBaseFormSelect = activeCategoryKey === BASE_CATEGORY_NAME.toLowerCase();
+
+  const subsetOptions = useMemo(() => {
+    if (activeCategoryKey === BASE_CATEGORY_NAME.toLowerCase()) return [...BASE_SUBSET_OPTIONS];
+    if (activeCategoryKey === CHEEKS_CATEGORY_NAME.toLowerCase()) return [...CHEEKS_SUBSET_OPTIONS];
+    if (activeCategoryKey === SCULPT_CATEGORY_NAME.toLowerCase()) return [...SCULPT_SUBSET_OPTIONS];
+    if (activeCategoryKey === 'lips') return [...LIPS_SUBSET_OPTIONS];
+    if (activeCategoryKey === 'eyes') return [...EYES_SUBSET_OPTIONS];
+    if (activeCategoryKey === 'brows') return [...BROWS_SUBSET_OPTIONS];
+    return [] as string[];
+  }, [activeCategoryKey]);
+
+  const showSubset = subsetOptions.length > 0;
+  const subsetKey = (activeItem?.subcategory ?? '').trim().toLowerCase();
+  const eyesTypeKey = (activeItem?.type ?? '').trim().toLowerCase();
+
+  const showEyelinerPencilColorInput = activeCategoryKey === 'eyes' && subsetKey === 'eyeliner' && eyesTypeKey === 'pencil';
+
+  const formPlaceholder = useMemo(() => {
+    if (activeCategoryKey === 'lips') {
+      if (subsetKey === 'lipliner') return 'Waterproof';
+      if (subsetKey === 'lipstick') return 'Matte';
+    }
+    return 'Cream';
+  }, [activeCategoryKey, subsetKey]);
+
+  const showEyesColorSelect = activeCategoryKey === 'eyes' && subsetKey === 'eyeshadow';
+  const showEyesTypeSelect = activeCategoryKey === 'eyes' && (subsetKey === 'eyeshadow' || subsetKey === 'eyeliner');
+  const eyesTypeOptions = useMemo(() => {
+    if (activeCategoryKey !== 'eyes') return [] as string[];
+    if (subsetKey === 'eyeshadow') return [...EYESHADOW_TYPE_OPTIONS];
+    if (subsetKey === 'eyeliner') return [...EYELINER_TYPE_OPTIONS];
+    return [] as string[];
+  }, [activeCategoryKey, subsetKey]);
+
+  const categoryHasNoToneFormColor =
+    activeCategoryKey === PREP_FINISH_CATEGORY_NAME.toLowerCase() ||
+    activeCategoryKey === 'tools' ||
+    activeCategoryKey === 'hygiene & disposables' ||
+    activeCategoryKey === 'brows';
+
+  const hideUndertone =
+    categoryHasNoToneFormColor ||
+    (activeCategoryKey === 'eyes' && (subsetKey === 'mascara' || subsetKey === 'lashes')) ||
+    (activeCategoryKey === 'lips' && (subsetKey === 'lip gloss' || subsetKey === 'lip balm/treatments'));
+
+  const hideForm =
+    categoryHasNoToneFormColor ||
+    (activeCategoryKey === BASE_CATEGORY_NAME.toLowerCase() && (subsetKey === 'concealer' || subsetKey === 'powder')) ||
+    (activeCategoryKey === 'eyes' && (subsetKey === 'mascara' || subsetKey === 'lashes')) ||
+    (activeCategoryKey === 'lips' && (subsetKey === 'lip gloss' || subsetKey === 'lip balm/treatments')) ||
+    showEyelinerPencilColorInput;
+
+  const hideColor = categoryHasNoToneFormColor;
 
   const visibleCategories = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -396,8 +698,16 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
           });
         });
 
-    // Keep Prep & Skin first, then the core face areas.
-    const priority = ['prep & skin', 'foundation', 'lips', 'cheeks', 'eyes'] as const;
+    // Keep Prep & Finish first, then the core face areas.
+    const priority = [
+      PREP_FINISH_CATEGORY_NAME.toLowerCase(),
+      BASE_CATEGORY_NAME.toLowerCase(),
+      CHEEKS_CATEGORY_NAME.toLowerCase(),
+      SCULPT_CATEGORY_NAME.toLowerCase(),
+      'lips',
+      'eyes',
+      'brows',
+    ];
     const rank = new Map<string, number>(priority.map((n, i) => [n, i]));
 
     // Stable sort: preserve existing order for non-priority categories.
@@ -551,6 +861,8 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
 
   function isBlankItem(it: KitItem): boolean {
     const nameEmpty = !(it.name || '').trim();
+    const subsetEmpty = !(it.subcategory || '').trim();
+    const typeEmpty = !(it.type || '').trim();
     const brandEmpty = !(it.brand || '').trim();
     const shadeEmpty = !(it.shade || '').trim();
     const undertoneEmpty = !(it.undertone || '').trim();
@@ -565,6 +877,8 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
 
     return (
       nameEmpty &&
+      subsetEmpty &&
+      typeEmpty &&
       brandEmpty &&
       shadeEmpty &&
       undertoneEmpty &&
@@ -735,8 +1049,11 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
     const item: KitItem = {
       id: newId,
       name: text,
+      subcategory: '',
+      type: '',
       brand: '',
       shade: '',
+      placement: '',
       undertone: '',
       form: '',
       location: '',
@@ -783,6 +1100,125 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
         };
       }),
     }));
+  }
+
+  async function guessUndertoneForActiveItem() {
+    const item = activeItem;
+    if (!item) return;
+
+    const name = String(item?.name || '').trim();
+    const brand = String(item?.brand || '').trim();
+    const shade = String(item?.shade || '').trim();
+    const notes = String(item?.notes || '').trim();
+
+    if (!name && !brand && !shade) {
+      Alert.alert('Add a product name', 'Enter at least a product name (or shade) so Undertone can guess the undertone.');
+      return;
+    }
+
+    // Close inline menus + keyboard so the result feels intentional.
+    setToneMenuOpen(false);
+    setSubcategoryMenuOpen(false);
+    setTypeMenuOpen(false);
+    setFormMenuOpen(false);
+    setColorMenuOpen(false);
+    Keyboard.dismiss();
+
+    setUndertoneGuessBusy(true);
+
+    try {
+      let result: InferredUndertone | null = null;
+
+      const token = String((await getToken()) || '').trim();
+
+      // Prefer server-side AI if possible.
+      if (token) {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 9000);
+
+          try {
+            const res = await fetch(`${API_BASE}/infer-undertone`, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${token}`,
+                'content-type': 'application/json',
+                accept: 'application/json',
+              } as any,
+              body: JSON.stringify({
+                name,
+                brand,
+                shade,
+                notes,
+                category: activeCategory?.name ?? '',
+                subcategory: item?.subcategory ?? '',
+                group: item?.type ?? '',
+              }),
+              signal: controller.signal,
+            } as any);
+
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data?.ok === false) {
+              const msg = String(data?.error || `HTTP ${res.status}`);
+              throw new Error(msg);
+            }
+
+            const undertoneRaw = String(data?.undertone ?? data?.tone ?? '').trim().toLowerCase();
+            const confidenceRaw = Number(data?.confidence ?? 0);
+            const reasonRaw = String(data?.reason || data?.rationale || '').trim();
+
+            const undertone: InferredUndertone['undertone'] =
+              undertoneRaw === 'cool' || undertoneRaw === 'neutral' || undertoneRaw === 'warm' || undertoneRaw === 'unknown'
+                ? (undertoneRaw as any)
+                : 'unknown';
+
+            const confidence = Number.isFinite(confidenceRaw)
+              ? Math.max(0, Math.min(100, Math.round(confidenceRaw)))
+              : 0;
+
+            result = {
+              undertone,
+              confidence,
+              reason: reasonRaw || 'AI guess based on the product name/shade.',
+            };
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch {
+          result = null;
+        }
+      }
+
+      // Fallback: local heuristic if server is unreachable or user isn't signed in.
+      if (!result) {
+        result = inferProductUndertoneLocal({ name, brand, shade, notes });
+        const prefix = token ? 'AI guess unavailable.' : 'Sign in to use AI guessing.';
+        result = { ...result, reason: `${prefix} ${result.reason}`.trim() };
+      }
+
+      if (result.undertone === 'unknown') {
+        Alert.alert('Not sure', result.reason || 'I couldn’t infer the undertone from the name. Try adding a shade code (e.g., 2N / 3W).');
+        return;
+      }
+
+      const label = TONE_OPTIONS.find((o) => o.key === result!.undertone)?.label || result.undertone;
+      const confidenceLine = Number.isFinite(result.confidence) ? `Confidence: ${Math.round(result.confidence)}%\n\n` : '';
+      const body = `${confidenceLine}${result.reason || ''}`.trim();
+
+      Alert.alert(`Suggested: ${label}`, body, [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Set',
+          onPress: () => {
+            updateItemField('undertone', result!.undertone);
+          },
+        },
+      ]);
+    } catch (e: any) {
+      Alert.alert('Couldn’t guess undertone', String(e?.message || e));
+    } finally {
+      setUndertoneGuessBusy(false);
+    }
   }
 
   function setItemStatus(next: ItemStatus) {
@@ -1164,7 +1600,9 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                       const isLast = idx === visibleItemsInCategory.length - 1;
 
                       const expLine = expiringLabel(it.expiryDate);
-                      const subBits = [it.brand, it.shade, it.location].filter(Boolean).join(' • ');
+                      const subKey = (it.subcategory ?? '').trim().toLowerCase();
+                      const showShade = activeCategoryKey !== 'eyes' || subKey === 'eyeshadow palette' || subKey === 'eyeshadow singles';
+                      const subBits = [it.subcategory, it.brand, showShade ? it.shade : '', it.location].filter(Boolean).join(' • ');
                       const sub = expLine ? [subBits, expLine].filter(Boolean).join(' • ') : subBits;
 
                       return (
@@ -1302,105 +1740,588 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                   <View style={{ height: 12 }} />
 
                   <View style={styles.editorCard}>
+                    {showSubset ? (
+                      <>
+                        <View style={styles.formRow}>
+                          <Text style={styles.formLabel}>Type</Text>
+                          <TouchableOpacity
+                            style={styles.toneDropdownButton}
+                            activeOpacity={0.9}
+                            onPress={() => {
+                              setToneMenuOpen(false);
+                              setTypeMenuOpen(false);
+                              setFormMenuOpen(false);
+                              setColorMenuOpen(false);
+                              setSubcategoryMenuOpen((v) => !v);
+                            }}
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[
+                                styles.toneDropdownText,
+                                (activeItem?.subcategory ?? '').trim() ? null : styles.toneDropdownPlaceholder,
+                              ]}
+                            >
+                              {(activeItem?.subcategory ?? '').trim() || 'Select'}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+
+                        {subcategoryMenuOpen ? (
+                          <>
+                            <View style={styles.rowDivider} />
+                            <TouchableOpacity
+                              style={styles.toneOptionRow}
+                              activeOpacity={0.9}
+                              onPress={() => {
+                                updateItemField('subcategory', '');
+                                updateItemField('type', '');
+                                if (activeCategoryKey === 'eyes') {
+                                  updateItemField('shade', '');
+                                  updateItemField('placement', '');
+                                }
+                                if (activeCategoryKey === 'lips') {
+                                  // keep Color (shade) but clear dependent fields
+                                  updateItemField('undertone', '');
+                                  updateItemField('form', '');
+                                }
+                                if (activeCategoryKey === BASE_CATEGORY_NAME.toLowerCase()) {
+                                  updateItemField('form', '');
+                                }
+                                if (activeCategoryKey === 'brows') {
+                                  updateItemField('undertone', '');
+                                  updateItemField('shade', '');
+                                  updateItemField('form', '');
+                                  updateItemField('type', '');
+                                }
+                                setToneMenuOpen(false);
+                                setTypeMenuOpen(false);
+                                setFormMenuOpen(false);
+                                setColorMenuOpen(false);
+                                setSubcategoryMenuOpen(false);
+                              }}
+                              accessibilityRole="button"
+                            >
+                              <View style={styles.toneOptionLabelSpacer} />
+                              <View style={styles.toneOptionContent}>
+                                <Text style={styles.toneOptionText}>None</Text>
+                                {!(activeItem?.subcategory ?? '').trim() ? (
+                                  <Ionicons name="checkmark" size={18} color="#111111" />
+                                ) : (
+                                  <View style={{ width: 18 }} />
+                                )}
+                              </View>
+                            </TouchableOpacity>
+                            <View style={styles.rowDivider} />
+
+                            {subsetOptions.map((t, idx) => {
+                              const current = (activeItem?.subcategory ?? '').trim();
+                              const on = current === t;
+                              return (
+                                <React.Fragment key={t}>
+                                  <TouchableOpacity
+                                    style={styles.toneOptionRow}
+                                    activeOpacity={0.9}
+                                    onPress={() => {
+                                      const next = t;
+                                      const k = next.trim().toLowerCase();
+
+                                      updateItemField('subcategory', next);
+
+                                      // Base: hide Form for Concealer/Powder
+                                      if (
+                                        activeCategoryKey === BASE_CATEGORY_NAME.toLowerCase() &&
+                                        (k === 'concealer' || k === 'powder')
+                                      ) {
+                                        updateItemField('form', '');
+                                      }
+
+                                      // Eyes: manage dependent fields
+                                      if (activeCategoryKey === 'eyes') {
+                                        if (k === 'eyeshadow') {
+                                          const allowedTypes = EYESHADOW_TYPE_OPTIONS as readonly string[];
+                                          const curType = (activeItem?.type ?? '').trim();
+                                          if (curType && !allowedTypes.includes(curType as any)) {
+                                            updateItemField('type', '');
+                                          }
+
+                                          const currentShade = (activeItem?.shade ?? '').trim();
+                                          const allowedRoles = EYES_COLOR_ROLE_OPTIONS as readonly string[];
+                                          if (currentShade && !allowedRoles.includes(currentShade as any)) {
+                                            updateItemField('shade', '');
+                                          }
+                                          // drop deprecated
+                                          if ((activeItem?.placement ?? '').trim()) updateItemField('placement', '');
+                                        } else if (k === 'eyeliner') {
+                                          const allowedTypes = EYELINER_TYPE_OPTIONS as readonly string[];
+                                          const curType = (activeItem?.type ?? '').trim();
+                                          if (curType && !allowedTypes.includes(curType as any)) {
+                                            updateItemField('type', '');
+                                          }
+                                          updateItemField('shade', '');
+                                          updateItemField('placement', '');
+                                        } else {
+                                          // Mascara / Lashes
+                                          updateItemField('type', '');
+                                          updateItemField('shade', '');
+                                          updateItemField('placement', '');
+                                          updateItemField('undertone', '');
+                                          updateItemField('form', '');
+                                        }
+                                      }
+
+                                      // Lips: hide Undertone/Form for gloss & balm/treatments
+                                      if (
+                                        activeCategoryKey === 'lips' &&
+                                        (k === 'lip gloss' || k === 'lip balm/treatments')
+                                      ) {
+                                        updateItemField('undertone', '');
+                                        updateItemField('form', '');
+                                      }
+
+                                      // Brows: remove Undertone/Color/Form
+                                      if (activeCategoryKey === 'brows') {
+                                        updateItemField('undertone', '');
+                                        updateItemField('shade', '');
+                                        updateItemField('form', '');
+                                        updateItemField('type', '');
+                                      }
+
+                                      setToneMenuOpen(false);
+                                      setTypeMenuOpen(false);
+                                      setFormMenuOpen(false);
+                                      setColorMenuOpen(false);
+                                      setSubcategoryMenuOpen(false);
+                                    }}
+                                    accessibilityRole="button"
+                                  >
+                                    <View style={styles.toneOptionLabelSpacer} />
+                                    <View style={styles.toneOptionContent}>
+                                      <Text style={styles.toneOptionText}>{t}</Text>
+                                      {on ? (
+                                        <Ionicons name="checkmark" size={18} color="#111111" />
+                                      ) : (
+                                        <View style={{ width: 18 }} />
+                                      )}
+                                    </View>
+                                  </TouchableOpacity>
+                                  {idx < subsetOptions.length - 1 ? <View style={styles.rowDivider} /> : null}
+                                </React.Fragment>
+                              );
+                            })}
+                          </>
+                        ) : null}
+
+                        {showEyesTypeSelect ? (
+                          <>
+                            <View style={styles.rowDivider} />
+                            <View style={styles.formRow}>
+                              <Text style={styles.formLabel}>Group</Text>
+                              <TouchableOpacity
+                                style={styles.toneDropdownButton}
+                                activeOpacity={0.9}
+                                onPress={() => {
+                                  setToneMenuOpen(false);
+                                  setSubcategoryMenuOpen(false);
+                                  setFormMenuOpen(false);
+                                  setColorMenuOpen(false);
+                                  setTypeMenuOpen((v) => !v);
+                                }}
+                                accessibilityRole="button"
+                              >
+                                <Text
+                                  style={[
+                                    styles.toneDropdownText,
+                                    (activeItem?.type ?? '').trim() ? null : styles.toneDropdownPlaceholder,
+                                  ]}
+                                >
+                                  {(activeItem?.type ?? '').trim() || 'Select'}
+                                </Text>
+                              </TouchableOpacity>
+                            </View>
+
+                            {typeMenuOpen ? (
+                              <>
+                                <View style={styles.rowDivider} />
+                                <TouchableOpacity
+                                  style={styles.toneOptionRow}
+                                  activeOpacity={0.9}
+                                  onPress={() => {
+                                    updateItemField('type', '');
+                                    setTypeMenuOpen(false);
+                                  }}
+                                  accessibilityRole="button"
+                                >
+                                  <View style={styles.toneOptionLabelSpacer} />
+                                  <View style={styles.toneOptionContent}>
+                                    <Text style={styles.toneOptionText}>None</Text>
+                                    {!(activeItem?.type ?? '').trim() ? (
+                                      <Ionicons name="checkmark" size={18} color="#111111" />
+                                    ) : (
+                                      <View style={{ width: 18 }} />
+                                    )}
+                                  </View>
+                                </TouchableOpacity>
+                                <View style={styles.rowDivider} />
+
+                                {eyesTypeOptions.map((t, idx) => {
+                                  const current = (activeItem?.type ?? '').trim();
+                                  const on = current === t;
+                                  return (
+                                    <React.Fragment key={t}>
+                                      <TouchableOpacity
+                                        style={styles.toneOptionRow}
+                                        activeOpacity={0.9}
+                                        onPress={() => {
+                                          updateItemField('type', t);
+                                          if (subsetKey === 'eyeliner' && t.trim().toLowerCase() === 'pencil') {
+                                            updateItemField('form', '');
+                                          }
+                                          setTypeMenuOpen(false);
+                                        }}
+                                        accessibilityRole="button"
+                                      >
+                                        <View style={styles.toneOptionLabelSpacer} />
+                                        <View style={styles.toneOptionContent}>
+                                          <Text style={styles.toneOptionText}>{t}</Text>
+                                          {on ? (
+                                            <Ionicons name="checkmark" size={18} color="#111111" />
+                                          ) : (
+                                            <View style={{ width: 18 }} />
+                                          )}
+                                        </View>
+                                      </TouchableOpacity>
+                                      {idx < eyesTypeOptions.length - 1 ? <View style={styles.rowDivider} /> : null}
+                                    </React.Fragment>
+                                  );
+                                })}
+                              </>
+                            ) : null}
+                          </>
+                        ) : null}
+
+                        <View style={styles.rowDivider} />
+                      </>
+                    ) : null}
+
                     <FormRow
                       label="Brand"
                       value={activeItem?.brand ?? ''}
                       placeholder="Dior"
                       onChangeText={(v) => updateItemField('brand', v)}
                     />
-                    <View style={styles.rowDivider} />
-                    <FormRow
-                      label="Color"
-                      value={activeItem?.shade ?? ''}
-                      placeholder="0N - Neutral"
-                      onChangeText={(v) => updateItemField('shade', v)}
-                    />
-                    <View style={styles.rowDivider} />
-                    <View style={styles.formRow}>
-                      <Text style={styles.formLabel}>Tone</Text>
 
-                      <TouchableOpacity
-                        style={styles.toneDropdownButton}
-                        activeOpacity={0.9}
-                        onPress={() => setToneMenuOpen((v) => !v)}
-                        accessibilityRole="button"
-                      >
-                        <Text
-                          style={[
-                            styles.toneDropdownText,
-                            (activeItem?.undertone ?? '').trim() ? null : styles.toneDropdownPlaceholder,
-                          ]}
-                        >
-                          {(() => {
-                            const v = (activeItem?.undertone ?? '').trim().toLowerCase();
-                            const opt = TONE_OPTIONS.find((o) => o.key === v);
-                            return opt ? opt.label : 'Select';
-                          })()}
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-
-                    {toneMenuOpen ? (
-                      <>
-                        <View style={styles.rowDivider} />
-                        <TouchableOpacity
-                          style={styles.toneOptionRow}
-                          activeOpacity={0.9}
-                          onPress={() => {
-                            updateItemField('undertone', '');
-                            setToneMenuOpen(false);
-                          }}
-                          accessibilityRole="button"
-                        >
-                          <View style={styles.toneOptionLabelSpacer} />
-                          <View style={styles.toneOptionContent}>
-                            <Text style={styles.toneOptionText}>None</Text>
-                            {!(activeItem?.undertone ?? '').trim() ? (
-                              <Ionicons name="checkmark" size={18} color="#111111" />
-                            ) : (
-                              <View style={{ width: 18 }} />
-                            )}
+                    {activeCategoryKey === 'eyes' ? (
+                      showEyesColorSelect ? (
+                        <>
+                          <View style={styles.rowDivider} />
+                          <View style={styles.formRow}>
+                            <Text style={styles.formLabel}>Color</Text>
+                            <TouchableOpacity
+                              style={styles.toneDropdownButton}
+                              activeOpacity={0.9}
+                              onPress={() => {
+                                setToneMenuOpen(false);
+                                setSubcategoryMenuOpen(false);
+                                setTypeMenuOpen(false);
+                                setFormMenuOpen(false);
+                                setColorMenuOpen((v) => !v);
+                              }}
+                              accessibilityRole="button"
+                            >
+                              <Text
+                                style={[
+                                  styles.toneDropdownText,
+                                  (activeItem?.shade ?? '').trim() ? null : styles.toneDropdownPlaceholder,
+                                ]}
+                              >
+                                {(activeItem?.shade ?? '').trim() || 'Select'}
+                              </Text>
+                            </TouchableOpacity>
                           </View>
-                        </TouchableOpacity>
-                        <View style={styles.rowDivider} />
 
-                        {TONE_OPTIONS.map((t, idx) => {
-                          const current = (activeItem?.undertone ?? '').trim().toLowerCase();
-                          const on = current === t.key;
-                          return (
-                            <React.Fragment key={t.key}>
+                          {colorMenuOpen ? (
+                            <>
+                              <View style={styles.rowDivider} />
                               <TouchableOpacity
                                 style={styles.toneOptionRow}
                                 activeOpacity={0.9}
                                 onPress={() => {
-                                  updateItemField('undertone', t.key);
-                                  setToneMenuOpen(false);
+                                  updateItemField('shade', '');
+                                  updateItemField('placement', '');
+                                  setColorMenuOpen(false);
                                 }}
                                 accessibilityRole="button"
                               >
                                 <View style={styles.toneOptionLabelSpacer} />
                                 <View style={styles.toneOptionContent}>
-                                  <Text style={styles.toneOptionText}>{t.label}</Text>
-                                  {on ? (
+                                  <Text style={styles.toneOptionText}>None</Text>
+                                  {!(activeItem?.shade ?? '').trim() ? (
                                     <Ionicons name="checkmark" size={18} color="#111111" />
                                   ) : (
                                     <View style={{ width: 18 }} />
                                   )}
                                 </View>
                               </TouchableOpacity>
-                              {idx < TONE_OPTIONS.length - 1 ? <View style={styles.rowDivider} /> : null}
-                            </React.Fragment>
-                          );
-                        })}
+                              <View style={styles.rowDivider} />
+
+                              {EYES_COLOR_ROLE_OPTIONS.map((t, idx) => {
+                                const current = (activeItem?.shade ?? '').trim();
+                                const on = current === t;
+                                return (
+                                  <React.Fragment key={t}>
+                                    <TouchableOpacity
+                                      style={styles.toneOptionRow}
+                                      activeOpacity={0.9}
+                                      onPress={() => {
+                                        updateItemField('shade', t);
+                                        updateItemField('placement', '');
+                                        setColorMenuOpen(false);
+                                      }}
+                                      accessibilityRole="button"
+                                    >
+                                      <View style={styles.toneOptionLabelSpacer} />
+                                      <View style={styles.toneOptionContent}>
+                                        <Text style={styles.toneOptionText}>{t}</Text>
+                                        {on ? (
+                                          <Ionicons name="checkmark" size={18} color="#111111" />
+                                        ) : (
+                                          <View style={{ width: 18 }} />
+                                        )}
+                                      </View>
+                                    </TouchableOpacity>
+                                    {idx < EYES_COLOR_ROLE_OPTIONS.length - 1 ? (
+                                      <View style={styles.rowDivider} />
+                                    ) : null}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </>
+                          ) : null}
+                        </>
+                      ) : showEyelinerPencilColorInput ? (
+                      <>
+                        <View style={styles.rowDivider} />
+                        <FormRow
+                          label="Color"
+                          value={activeItem?.shade ?? ''}
+                          placeholder="Black"
+                          onChangeText={(v) => updateItemField('shade', v)}
+                        />
+                      </>
+                    ) : null
+                    ) : !hideColor ? (
+                      <>
+                        <View style={styles.rowDivider} />
+                        <FormRow
+                          label="Color"
+                          value={activeItem?.shade ?? ''}
+                          placeholder="0N - Neutral"
+                          onChangeText={(v) => updateItemField('shade', v)}
+                        />
                       </>
                     ) : null}
-                    <View style={styles.rowDivider} />
-                    <FormRow
-                      label="Form"
-                      value={activeItem?.form ?? ''}
-                      placeholder="Cream"
-                      onChangeText={(v) => updateItemField('form', v)}
-                    />
+
+                    {!hideUndertone ? (
+                      <>
+                        <View style={styles.rowDivider} />
+                        <View style={styles.formRow}>
+                          <Text style={styles.formLabel}>Undertone</Text>
+
+                          <TouchableOpacity
+                            style={styles.toneDropdownButton}
+                            activeOpacity={0.9}
+                            onPress={() => {
+                              setSubcategoryMenuOpen(false);
+                              setTypeMenuOpen(false);
+                              setFormMenuOpen(false);
+                              setColorMenuOpen(false);
+                              setToneMenuOpen((v) => !v);
+                            }}
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[
+                                styles.toneDropdownText,
+                                (activeItem?.undertone ?? '').trim() ? null : styles.toneDropdownPlaceholder,
+                              ]}
+                            >
+                              {(() => {
+                                const v = (activeItem?.undertone ?? '').trim().toLowerCase();
+                                const opt = TONE_OPTIONS.find((o) => o.key === v);
+                                return opt ? opt.label : 'Select';
+                              })()}
+                            </Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={styles.toneAssistButton}
+                            activeOpacity={0.85}
+                            onPress={guessUndertoneForActiveItem}
+                            disabled={undertoneGuessBusy}
+                            accessibilityRole="button"
+                            accessibilityLabel="Guess undertone"
+                          >
+                            {undertoneGuessBusy ? (
+                              <ActivityIndicator size="small" color="#111111" />
+                            ) : (
+                              <Ionicons name="sparkles-outline" size={18} color="#111111" />
+                            )}
+                          </TouchableOpacity>
+                        </View>
+
+                        {toneMenuOpen ? (
+                          <>
+                            <View style={styles.rowDivider} />
+                            <TouchableOpacity
+                              style={styles.toneOptionRow}
+                              activeOpacity={0.9}
+                              onPress={() => {
+                                updateItemField('undertone', '');
+                                setToneMenuOpen(false);
+                              }}
+                              accessibilityRole="button"
+                            >
+                              <View style={styles.toneOptionLabelSpacer} />
+                              <View style={styles.toneOptionContent}>
+                                <Text style={styles.toneOptionText}>None</Text>
+                                {!(activeItem?.undertone ?? '').trim() ? (
+                                  <Ionicons name="checkmark" size={18} color="#111111" />
+                                ) : (
+                                  <View style={{ width: 18 }} />
+                                )}
+                              </View>
+                            </TouchableOpacity>
+                            <View style={styles.rowDivider} />
+
+                            {TONE_OPTIONS.map((t, idx) => {
+                              const current = (activeItem?.undertone ?? '').trim().toLowerCase();
+                              const on = current === t.key;
+                              return (
+                                <React.Fragment key={t.key}>
+                                  <TouchableOpacity
+                                    style={styles.toneOptionRow}
+                                    activeOpacity={0.9}
+                                    onPress={() => {
+                                      updateItemField('undertone', t.key);
+                                      setToneMenuOpen(false);
+                                    }}
+                                    accessibilityRole="button"
+                                  >
+                                    <View style={styles.toneOptionLabelSpacer} />
+                                    <View style={styles.toneOptionContent}>
+                                      <Text style={styles.toneOptionText}>{t.label}</Text>
+                                      {on ? (
+                                        <Ionicons name="checkmark" size={18} color="#111111" />
+                                      ) : (
+                                        <View style={{ width: 18 }} />
+                                      )}
+                                    </View>
+                                  </TouchableOpacity>
+                                  {idx < TONE_OPTIONS.length - 1 ? <View style={styles.rowDivider} /> : null}
+                                </React.Fragment>
+                              );
+                            })}
+                          </>
+                        ) : null}
+                      </>
+                    ) : null}
+
+                    {!hideForm ? (
+                      <>
+                        <View style={styles.rowDivider} />
+                        {showBaseFormSelect ? (
+                          <>
+                            <View style={styles.formRow}>
+                              <Text style={styles.formLabel}>Form</Text>
+                              <TouchableOpacity
+                                style={styles.toneDropdownButton}
+                                activeOpacity={0.9}
+                                onPress={() => {
+                                  setToneMenuOpen(false);
+                                  setSubcategoryMenuOpen(false);
+                                  setTypeMenuOpen(false);
+                                  setColorMenuOpen(false);
+                                  setFormMenuOpen((v) => !v);
+                                }}
+                                accessibilityRole="button"
+                              >
+                                <Text
+                                  style={[
+                                    styles.toneDropdownText,
+                                    (activeItem?.form ?? '').trim() ? null : styles.toneDropdownPlaceholder,
+                                  ]}
+                                >
+                                  {(activeItem?.form ?? '').trim() || 'Select'}
+                                </Text>
+                              </TouchableOpacity>
+                            </View>
+
+                            {formMenuOpen ? (
+                              <>
+                                <View style={styles.rowDivider} />
+                                <TouchableOpacity
+                                  style={styles.toneOptionRow}
+                                  activeOpacity={0.9}
+                                  onPress={() => {
+                                    updateItemField('form', '');
+                                    setFormMenuOpen(false);
+                                  }}
+                                  accessibilityRole="button"
+                                >
+                                  <View style={styles.toneOptionLabelSpacer} />
+                                  <View style={styles.toneOptionContent}>
+                                    <Text style={styles.toneOptionText}>None</Text>
+                                    {!(activeItem?.form ?? '').trim() ? (
+                                      <Ionicons name="checkmark" size={18} color="#111111" />
+                                    ) : (
+                                      <View style={{ width: 18 }} />
+                                    )}
+                                  </View>
+                                </TouchableOpacity>
+                                <View style={styles.rowDivider} />
+
+                                {BASE_FORM_OPTIONS.map((t, idx) => {
+                                  const current = (activeItem?.form ?? '').trim();
+                                  const on = current === t;
+                                  return (
+                                    <React.Fragment key={t}>
+                                      <TouchableOpacity
+                                        style={styles.toneOptionRow}
+                                        activeOpacity={0.9}
+                                        onPress={() => {
+                                          updateItemField('form', t);
+                                          setFormMenuOpen(false);
+                                        }}
+                                        accessibilityRole="button"
+                                      >
+                                        <View style={styles.toneOptionLabelSpacer} />
+                                        <View style={styles.toneOptionContent}>
+                                          <Text style={styles.toneOptionText}>{t}</Text>
+                                          {on ? (
+                                            <Ionicons name="checkmark" size={18} color="#111111" />
+                                          ) : (
+                                            <View style={{ width: 18 }} />
+                                          )}
+                                        </View>
+                                      </TouchableOpacity>
+                                      {idx < BASE_FORM_OPTIONS.length - 1 ? <View style={styles.rowDivider} /> : null}
+                                    </React.Fragment>
+                                  );
+                                })}
+                              </>
+                            ) : null}
+                          </>
+                        ) : (
+                          <FormRow
+                            label="Form"
+                            value={activeItem?.form ?? ''}
+                            placeholder={formPlaceholder}
+                            onChangeText={(v) => updateItemField('form', v)}
+                          />
+                        )}
+                      </>
+                    ) : null}
                   </View>
 
                   <View style={{ height: 12 }} />
@@ -2348,6 +3269,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'flex-start',
+  },
+  toneAssistButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    marginLeft: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f3f4f6',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
   },
   toneDropdownText: {
     flex: 1,

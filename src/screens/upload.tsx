@@ -305,17 +305,20 @@ function safeParseKitLog(raw: string | null): KitLogLite {
 
 function categoryItems(kit: KitLogLite, nameWant: string): KitItemLite[] {
   const cats = Array.isArray(kit?.categories) ? kit.categories : [];
-  let want = String(nameWant || '').trim().toLowerCase();
-  // Migration/alias: "Base" is now "Foundation" in Your Kit.
-  if (want === 'base') want = 'foundation';
-  if (!want) return [];
+  const want0 = String(nameWant || '').trim().toLowerCase();
+  if (!want0) return [];
 
-  const exact = cats.find((c) => String(c?.name || '').trim().toLowerCase() === want);
+  // Migrations/aliases:
+  // - legacy kits used "Foundation"; canonical category is now "Base"
+  const wantAliases = want0 === 'base' || want0 === 'foundation' ? ['base', 'foundation'] : [want0];
+
+  // Prefer exact match by category name, then fall back to a simple substring match.
+  const exact = cats.find((c) => wantAliases.includes(String(c?.name || '').trim().toLowerCase()));
   const fuzzy =
     exact ||
     cats.find((c) => {
       const n = String(c?.name || '').trim().toLowerCase();
-      return n === want || n.includes(want);
+      return wantAliases.some((w) => n === w || n.includes(w) || w.includes(n));
     });
 
   const items = Array.isArray((fuzzy as any)?.items) ? (fuzzy as any).items : [];
@@ -465,13 +468,13 @@ function buildKitRecommendationsPayload(opts: {
 
   const kit = safeParseKitLog(opts.kitRaw);
 
-  // "Base" migrated to "Foundation" in Your Kit.
-  const foundationItems = categoryItems(kit, 'foundation');
+  // Legacy kits used "Foundation"; canonical category is now "Base".
+  const baseItems = categoryItems(kit, 'base');
   const cheekItems = categoryItems(kit, 'cheeks');
   const eyeItems = categoryItems(kit, 'eyes');
   const lipItems = categoryItems(kit, 'lips');
 
-  const foundationPicks = pickBestKitItems(foundationItems, u, 2);
+  const basePicks = pickBestKitItems(baseItems, u, 2);
   const cheekPicks = pickBestKitItems(cheekItems, u, 2);
   const eyePicks = pickBestKitItems(eyeItems, u, 2);
   const lipPicks = pickBestKitItems(lipItems, u, 2);
@@ -501,7 +504,7 @@ function buildKitRecommendationsPayload(opts: {
     addProducts(category, picks);
   };
 
-  block('Foundation', 'Foundation', foundationPicks, true);
+  block('Base', 'Base', basePicks, true);
   block('Cheeks', 'Cheeks', cheekPicks);
   block('Eyes', 'Eyes', eyePicks);
   block('Lips', 'Lips', lipPicks);
@@ -640,7 +643,7 @@ function buildBuyRecommendationsText(opts: {
   };
 
   addBlock(
-    'Foundation',
+    'Base',
     buy.base,
     `Suggested color: ${foundationColorLabel({ undertone: u, toneNumberRaw: opts.toneNumberRaw, toneDepthRaw: opts.toneDepthRaw })}`
   );
@@ -888,20 +891,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       hideListener.remove();
     };
   }, []);
-
-  // Bottom tab UX: tapping the active "scan" icon should open the photo sheet.
-  useEffect(() => {
-    const unsubscribe = navigation?.addListener?.('tabPress', () => {
-      const focused = typeof navigation?.isFocused === 'function' ? navigation.isFocused() : false;
-      if (!focused) return;
-      Keyboard.dismiss();
-      void choosePhoto('camera');
-    });
-
-    return () => {
-      if (typeof unsubscribe === 'function') unsubscribe();
-    };
-  }, [navigation, choosePhoto]);
 
   // Load counts + history + chat store when screen focuses.
   useEffect(() => {
@@ -1664,7 +1653,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     const clientId = uid('client');
     const clientProducts = products.map((p) => ({
       id: uid('prod'),
-      category: String(p?.category || 'Foundation'),
+      category: String(p?.category || 'Base'),
       name: String(p?.name || '').trim(),
       shade: String(p?.shade || '').trim(),
       notes: 'Recommended from kit',

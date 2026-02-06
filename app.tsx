@@ -248,7 +248,7 @@ function AppTabsShell({
       <Tabs.Screen
         name="Upload"
         options={{
-          tabBarLabel: 'scan',
+          tabBarLabel: 'home',
           tabBarIcon: ({ color, size }) => {
             const iconSize = Math.max(18, (size ?? 24) - 2);
             return <Ionicons name="scan-outline" size={iconSize} color={color} />;

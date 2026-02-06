@@ -3845,6 +3845,111 @@ async function fillMissingCategoriesWithCategoryRepair(recs, { undertone, season
 
 
 
+// --- Infer product undertone from kit item text ---
+// Used by the Inventory screen for a small "guess" button next to the Undertone selector.
+// This is intentionally conservative: if the text doesn't clearly imply warm/cool/neutral,
+// we return undertone="unknown".
+app.post("/infer-undertone", authRequired, async (req, res) => {
+  try {
+    if (!requireDb(res)) return;
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "Server is missing OPENAI_API_KEY" });
+    }
+
+    const clip = (v, n) => String(v || "").trim().slice(0, n);
+
+    const name = clip(req?.body?.name, 220);
+    const brand = clip(req?.body?.brand, 140);
+    const shade = clip(req?.body?.shade, 140);
+    const notes = clip(req?.body?.notes, 380);
+    const category = clip(req?.body?.category, 80);
+    const subcategory = clip(req?.body?.subcategory, 80);
+    const group = clip(req?.body?.group, 80);
+
+    const anyText = `${name} ${brand} ${shade} ${notes}`.trim();
+    if (!anyText) {
+      return res.status(400).json({ ok: false, error: "Missing product text (name/brand/shade)" });
+    }
+
+    const schema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        undertone: { type: "string", enum: ["cool", "neutral", "warm", "unknown"] },
+        confidence: { type: "integer", minimum: 0, maximum: 100 },
+        reason: { type: "string" },
+      },
+      required: ["undertone", "confidence", "reason"],
+    };
+
+    const systemPrompt =
+      "You are a professional makeup artist assistant. " +
+      "Determine the UNDERTONE of the PRODUCT SHADE described (cool, neutral, warm). " +
+      "Use only the provided text (product name/brand/shade/notes). " +
+      "Be conservative: if you cannot clearly infer it, return undertone=unknown and low confidence. " +
+      "If you infer undertone from a shade code (e.g., 2N/3W/1C) or words like warm/cool/neutral, mention that briefly. " +
+      "Return JSON only.";
+
+    const lines = [];
+    lines.push("Product:");
+    if (name) lines.push(`- name: ${name}`);
+    if (brand) lines.push(`- brand: ${brand}`);
+    if (shade) lines.push(`- shade: ${shade}`);
+    if (category) lines.push(`- category: ${category}`);
+    if (subcategory) lines.push(`- type: ${subcategory}`);
+    if (group) lines.push(`- group: ${group}`);
+    if (notes) lines.push(`- notes: ${notes}`);
+
+    const payload = {
+      model: OPENAI_CHAT_MODEL,
+      reasoning: { effort: "low" },
+      max_output_tokens: 120,
+      instructions: systemPrompt,
+      input: lines.join("\n"),
+      text: {
+        format: {
+          type: "json_schema",
+          name: "product_undertone_guess",
+          strict: true,
+          schema,
+        },
+      },
+    };
+
+    const { data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: "infer_undertone" });
+    const { text: outText, refusal } = extractOutputText(data);
+    if (refusal) throw new Error(refusal);
+    if (!outText) throw new Error("Empty response");
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(outText);
+    } catch {
+      parsed = null;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Could not parse model response");
+    }
+
+    const undertoneRaw = String(parsed?.undertone || "").trim().toLowerCase();
+    const undertone =
+      undertoneRaw === "cool" || undertoneRaw === "neutral" || undertoneRaw === "warm" || undertoneRaw === "unknown"
+        ? undertoneRaw
+        : "unknown";
+
+    const confidence = clampInt(parsed?.confidence, 0, 100, 0);
+    const reason = String(parsed?.reason || "").trim();
+
+    return res.json({ ok: true, undertone, confidence, reason });
+  } catch (e) {
+    console.error("infer-undertone error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || "Server error") });
+  }
+});
+
+
 // --- Chat about a face analysis ---
 // The client uses this for the in-scan Q&A chat. It is intentionally lightweight:
 // we only provide general guidance based on the saved analysis. For retailer picks
