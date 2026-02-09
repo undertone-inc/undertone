@@ -197,6 +197,23 @@ type ChatMessage = {
 
 type ChatStore = Record<string, ChatMessage[]>;
 
+type DiscoverTone = 'cool' | 'neutral' | 'warm';
+type DiscoverCategory = 'Base' | 'Sculpt' | 'Cheeks' | 'Eyes' | 'Lips';
+
+const DISCOVER_TYPES_BY_CATEGORY: Record<DiscoverCategory, string[]> = {
+  Base: ['Foundation', 'Concealer', 'Corrector', 'Powder'],
+  Sculpt: ['Contour', 'Bronzer'],
+  Cheeks: ['Blush', 'Highlighter'],
+  Eyes: ['Eyeshadow', 'Eyeliner', 'Mascara', 'Lashes'],
+  Lips: ['Lipstick', 'Lipliner', 'Lip gloss', 'Lip balm/treatments'],
+};
+
+function getDiscoverTypes(category: DiscoverCategory | null): string[] {
+  if (!category) return [];
+  const arr = (DISCOVER_TYPES_BY_CATEGORY as any)?.[category];
+  return Array.isArray(arr) ? arr : [];
+}
+
 function makeId() {
   return `io_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -470,11 +487,13 @@ function buildKitRecommendationsPayload(opts: {
 
   // Legacy kits used "Foundation"; canonical category is now "Base".
   const baseItems = categoryItems(kit, 'base');
+  const sculptItems = categoryItems(kit, 'sculpt');
   const cheekItems = categoryItems(kit, 'cheeks');
   const eyeItems = categoryItems(kit, 'eyes');
   const lipItems = categoryItems(kit, 'lips');
 
   const basePicks = pickBestKitItems(baseItems, u, 2);
+  const sculptPicks = pickBestKitItems(sculptItems, u, 2);
   const cheekPicks = pickBestKitItems(cheekItems, u, 2);
   const eyePicks = pickBestKitItems(eyeItems, u, 2);
   const lipPicks = pickBestKitItems(lipItems, u, 2);
@@ -505,6 +524,7 @@ function buildKitRecommendationsPayload(opts: {
   };
 
   block('Base', 'Base', basePicks, true);
+  block('Sculpt', 'Sculpt', sculptPicks);
   block('Cheeks', 'Cheeks', cheekPicks);
   block('Eyes', 'Eyes', eyePicks);
   block('Lips', 'Lips', lipPicks);
@@ -842,6 +862,16 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const [photoPicking, setPhotoPicking] = useState(false);
 
+  // Discover flow (manual undertone/season -> category -> type -> 1-2 product recs)
+  const [discoverOpen, setDiscoverOpen] = useState(false);
+  const [discoverStep, setDiscoverStep] = useState<'tone' | 'category' | 'type' | 'results'>('tone');
+  const [discoverTone, setDiscoverTone] = useState<DiscoverTone | null>(null);
+  const [discoverSeason, setDiscoverSeason] = useState<SeasonKey | null>(null);
+  const [discoverCategory, setDiscoverCategory] = useState<DiscoverCategory | null>(null);
+  const [discoverType, setDiscoverType] = useState<string | null>(null);
+  const [discoverLoading, setDiscoverLoading] = useState(false);
+  const [discoverResults, setDiscoverResults] = useState<Array<{ name: string; why?: string }>>([]);
+
   // When returning from the Camera screen, it passes a `capturedPhoto` param.
   // Consume it once and immediately trigger analysis.
   const lastCapturedUriRef = useRef<string | null>(null);
@@ -967,6 +997,15 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     return () => clearTimeout(t);
   }, [analysisId, chatStore]);
 
+  useEffect(() => {
+    // Auto-scroll when Discover UI changes (so steps/results stay in view).
+    if (!discoverOpen) return;
+    const t = setTimeout(() => {
+      scrollRef.current?.scrollToEnd({ animated: true });
+    }, 0);
+    return () => clearTimeout(t);
+  }, [discoverOpen, discoverStep, discoverLoading, discoverResults.length]);
+
   const saveHistory = async (items: HistoryItem[]) => {
     setHistory(items);
     try {
@@ -1089,6 +1128,164 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         },
       },
     ]);
+  };
+
+  // --- Discover helpers ---
+  const openDiscover = () => {
+    Keyboard.dismiss();
+    setDiscoverStep('tone');
+    setDiscoverTone(null);
+    setDiscoverSeason(null);
+    setDiscoverCategory(null);
+    setDiscoverType(null);
+    setDiscoverResults([]);
+    setDiscoverLoading(false);
+    setDiscoverOpen(true);
+  };
+
+  const closeDiscover = () => {
+    Keyboard.dismiss();
+    setDiscoverOpen(false);
+  };
+
+  const fetchDiscoverRecommendations = async (selectedType: string) => {
+    const type = String(selectedType || '').trim();
+    if (!type) return;
+
+    if (!tokenTrimmed) {
+      Alert.alert('Not logged in', 'Please log in again.');
+      return;
+    }
+    if (!discoverTone || !discoverCategory) return;
+    if (discoverLoading) return;
+
+    setDiscoverLoading(true);
+    setDiscoverResults([]);
+
+    const endpoints = ['/discover-recommend', '/api/discover-recommend', '/api/v1/discover-recommend'];
+
+    try {
+      let lastErr: any = null;
+
+      for (const ep of endpoints) {
+        const resp = await fetch(`${API_BASE}${ep}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${tokenTrimmed}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            undertone: discoverTone,
+            season: discoverSeason,
+            category: discoverCategory,
+            productType: type,
+          }),
+        });
+
+        const txt = await resp.text().catch(() => '');
+        let json: any = null;
+        try {
+          json = txt ? JSON.parse(txt) : null;
+        } catch {
+          json = null;
+        }
+
+        // If this path doesn't exist on the server, try the next alias.
+        if (resp.status === 404) {
+          lastErr = new Error(`HTTP 404`);
+          continue;
+        }
+
+        if (!resp.ok || !json?.ok) {
+          throw new Error(String(json?.error || json?.message || `HTTP ${resp.status}`));
+        }
+
+        const list = Array.isArray(json?.products) ? json.products : [];
+        const normalized = list
+          .map((p: any) => ({
+            name: String(p?.name || p?.product_name || '').trim(),
+            why: String(p?.why || p?.reason || '').trim() || undefined,
+          }))
+          .filter((p: any) => !!p.name)
+          .slice(0, 2);
+
+        setDiscoverResults(normalized);
+        setDiscoverStep('results');
+        return;
+      }
+
+      // If all aliases 404, surface a clearer error.
+      throw lastErr || new Error('HTTP 404');
+    } catch (e: any) {
+      Alert.alert('Discover failed', String(e?.message || e));
+    } finally {
+      setDiscoverLoading(false);
+    }
+  };
+
+  const addDiscoverItemToKit = async (productName: string) => {
+    const name = String(productName || '').trim();
+    if (!name) return;
+    const category = discoverCategory;
+    const subcategory = String(discoverType || '').trim();
+    if (!category || !subcategory) return;
+
+    const now = Date.now();
+    const uid = (prefix: string) => `${prefix}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const DEFAULT_KIT_CATS = [
+      'Prep & Finish',
+      'Base',
+      'Cheeks',
+      'Sculpt',
+      'Lips',
+      'Eyes',
+      'Brows',
+      'Tools',
+      'Hygiene & Disposables',
+      'Other',
+    ];
+
+    let kit: any = null;
+    try {
+      kit = await getJson<any>(kitlogKey);
+    } catch {
+      kit = null;
+    }
+
+    let categories = Array.isArray(kit?.categories)
+      ? kit.categories
+      : DEFAULT_KIT_CATS.map((n) => ({ id: uid('cat'), name: n, createdAt: now, items: [] }));
+
+    const idx = categories.findIndex(
+      (c: any) => String(c?.name || '').trim().toLowerCase() === String(category).trim().toLowerCase()
+    );
+
+    if (idx < 0) {
+      categories = [{ id: uid('cat'), name: category, createdAt: now, items: [] }, ...categories];
+    }
+
+    const catObj = idx >= 0 ? categories[idx] : categories[0];
+    const items = Array.isArray(catObj?.items) ? catObj.items : [];
+
+    const nextItem = {
+      id: uid('item'),
+      name,
+      subcategory,
+      status: 'inKit',
+      notes: 'Added from Discover',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    catObj.items = [nextItem, ...items];
+
+    try {
+      await setJson(kitlogKey, { version: 1, categories });
+      Alert.alert('Added', 'Added to your kit.');
+    } catch (e: any) {
+      Alert.alert('Add failed', String(e?.message || e));
+    }
   };
 
   const requestLibrary = async (): Promise<boolean> => {
@@ -1548,6 +1745,110 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     await upsertChatFor(analysisId, [...current, assistantMsg]);
   };
 
+  const saveScanToList = async () => {
+    if (!analysis) return;
+
+    // Grab the most recent kit recommendations (if any) so Save can persist them.
+    const latestKitMsg = [...activeChat].reverse().find((m) => m?.kind === 'kit_recs');
+    const kitProducts = Array.isArray((latestKitMsg as any)?.kitProducts) ? (latestKitMsg as any).kitProducts : [];
+
+    // Read existing catalog
+    let catalog: any = null;
+    try {
+      catalog = await getJson<any>(catalogKey);
+    } catch {
+      catalog = null;
+    }
+
+    const existingClients = Array.isArray(catalog?.clients) ? catalog.clients : [];
+
+    const scanKey = String(analysisId || '').trim();
+    const existingIdx = scanKey
+      ? existingClients.findIndex((c: any) => String(c?.scanAnalysisId || '').trim() === scanKey)
+      : -1;
+
+    // Next "Scan N" label
+    let max = 0;
+    existingClients.forEach((c: any) => {
+      const name = String(c?.displayName || '').trim();
+      const m = /^scan\s+(\d+)$/i.exec(name);
+      if (!m) return;
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > max) max = n;
+    });
+    const scanLabel = existingIdx >= 0 ? String(existingClients[existingIdx]?.displayName || '').trim() || `Scan ${max + 1}` : `Scan ${max + 1}`;
+
+    const now = Date.now();
+    const uid = (prefix: string) => `${prefix}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const undertoneKey = normalizeUndertoneKey(analysis?.undertone);
+    const seasonKey = normalizeSeasonKey(analysis?.season);
+
+    const makeClientProducts = (arr: any[]) =>
+      arr
+        .map((p: any) => ({
+          id: uid('prod'),
+          category: String(p?.category || 'Base'),
+          name: String(p?.name || '').trim(),
+          shade: String(p?.shade || '').trim(),
+          notes: 'Recommended from kit',
+          createdAt: now,
+          updatedAt: now,
+        }))
+        .filter((p: any) => !!p.name);
+
+    const nextProducts = makeClientProducts(kitProducts);
+
+    const mergeProducts = (baseArr: any[], addArr: any[]) => {
+      const base = Array.isArray(baseArr) ? baseArr : [];
+      if (!addArr.length) return base;
+      const seen = new Set(base.map((p: any) => `${String(p?.category || '')}|${String(p?.name || '')}`.toLowerCase()));
+      const merged = [...base];
+      addArr.forEach((p: any) => {
+        const k = `${String(p?.category || '')}|${String(p?.name || '')}`.toLowerCase();
+        if (seen.has(k)) return;
+        seen.add(k);
+        merged.push(p);
+      });
+      return merged;
+    };
+
+    const baseClient = existingIdx >= 0 ? existingClients[existingIdx] : null;
+    const clientId = String(baseClient?.id || '') || uid('client');
+
+    const nextClient: any = {
+      ...(baseClient || {}),
+      id: clientId,
+      displayName: String(baseClient?.displayName || scanLabel),
+      undertone: (undertoneKey || 'unknown') as any,
+      season: seasonKey || null,
+      trialDate: String(baseClient?.trialDate || ''),
+      finalDate: String(baseClient?.finalDate || ''),
+      eventType: String(baseClient?.eventType || ''),
+      notes: String(baseClient?.notes || ''),
+      products: mergeProducts(baseClient?.products, nextProducts),
+      createdAt: typeof baseClient?.createdAt === 'number' ? baseClient.createdAt : now,
+      updatedAt: now,
+      scanAnalysisId: scanKey || undefined,
+    };
+
+    const nextClients = existingIdx >= 0
+      ? existingClients.map((c: any, i: number) => (i === existingIdx ? nextClient : c))
+      : [nextClient, ...existingClients];
+
+    const nextCatalog = {
+      version: 1,
+      clients: nextClients,
+    };
+
+    try {
+      await setJson(catalogKey, nextCatalog);
+      Alert.alert('Saved', `${nextClient.displayName} was added to Clients.`);
+    } catch (e: any) {
+      Alert.alert('Save failed', String(e?.message || e));
+    }
+  };
+
   const recommendToBuy = async () => {
     if (!analysisId) return;
     if (!tokenTrimmed) {
@@ -1782,7 +2083,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
       <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
         <View style={[styles.container, { paddingBottom: bottomPadding }]}>
-          {/* Top bar: Your scans + scan */}
+          {/* Top bar: Your scans */}
           <View style={styles.topBar}>
             <TouchableOpacity
               style={styles.chatSearchPill}
@@ -1797,12 +2098,16 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
               <Ionicons name="chevron-down" size={16} color="#9ca3af" style={styles.chatSearchChevron} />
             </TouchableOpacity>
 
+            {/* Top-right: open a fresh blank chat */}
             <TouchableOpacity
               style={styles.uploadChip}
-              onPress={startNewChat}
+              activeOpacity={0.85}
+              onPress={() => {
+                void startNewChat();
+              }}
               accessibilityRole="button"
             >
-              <Text style={styles.uploadChipText}>Scan</Text>
+              <Text style={styles.uploadChipText}>Open</Text>
             </TouchableOpacity>
           </View>
 
@@ -1828,27 +2133,196 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                         {m.text}
                       </Text>
                     </View>
-
-                    {m.id === lastUnsavedKitRecId ? (
-                      <View style={styles.kitSaveRow}>
-                        <TouchableOpacity
-                          style={[styles.kitSaveBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
-                          disabled={analysisLoading || chatLoading}
-                          onPress={() => {
-                            Keyboard.dismiss();
-                            void saveKitRecsToClients(m.id);
-                          }}
-                          accessibilityRole="button"
-                        >
-                          <Text style={styles.kitSaveBtnText}>Save</Text>
-                        </TouchableOpacity>
-                      </View>
-                    ) : null}
                   </View>
                 ))
               ) : null}
 
-              {!analysisLoading && analysisId && analysis && (!hasKitRecs || !hasBuyRecs) ? (
+              {discoverOpen ? (
+                <View style={[styles.chatBubble, styles.chatBubbleAssistant, styles.discoverChatBubble]}>
+                  {discoverStep === 'tone' ? (
+                    <View>
+                      <Text style={styles.discoverSectionTitle}>Choose undertone</Text>
+                      <View style={styles.discoverChipRow}>
+                        {(['cool', 'neutral', 'warm'] as DiscoverTone[]).map((t) => {
+                          const selected = discoverTone === t;
+                          return (
+                            <TouchableOpacity
+                              key={t}
+                              style={[styles.discoverChip, selected && styles.discoverChipSelected]}
+                              onPress={() => setDiscoverTone(t)}
+                              accessibilityRole="button"
+                            >
+                              <Text style={[styles.discoverChipText, selected && styles.discoverChipTextSelected]}>
+                                {t.charAt(0).toUpperCase() + t.slice(1)}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+
+                      <Text style={[styles.discoverSectionTitle, { marginTop: 14 }]}>Color season (optional)</Text>
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={styles.discoverSeasonRow}
+                        keyboardShouldPersistTaps="handled"
+                      >
+                        {(['spring', 'summer', 'autumn', 'winter'] as SeasonKey[]).map((s) => {
+                          const selected = discoverSeason === s;
+                          return (
+                            <TouchableOpacity
+                              key={s}
+                              style={[styles.discoverChip, selected && styles.discoverChipSelected]}
+                              onPress={() => setDiscoverSeason(selected ? null : s)}
+                              accessibilityRole="button"
+                            >
+                              <Text style={[styles.discoverChipText, selected && styles.discoverChipTextSelected]}>
+                                {s.charAt(0).toUpperCase() + s.slice(1)}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </ScrollView>
+
+                      <TouchableOpacity
+                        style={[styles.discoverPrimaryBtn, !discoverTone && { opacity: 0.5 }]}
+                        disabled={!discoverTone}
+                        onPress={() => setDiscoverStep('category')}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.discoverPrimaryBtnText}>Continue</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
+
+                  {discoverStep === 'category' ? (
+                    <View>
+                      <Text style={styles.discoverSectionTitle}>Choose a category</Text>
+                      <View style={styles.discoverChipRow}>
+                        {(['Base', 'Sculpt', 'Cheeks', 'Eyes', 'Lips'] as DiscoverCategory[]).map((c) => {
+                          const selected = discoverCategory === c;
+                          return (
+                            <TouchableOpacity
+                              key={c}
+                              style={[styles.discoverChip, selected && styles.discoverChipSelected]}
+                              onPress={() => {
+                                setDiscoverCategory(c);
+                                setDiscoverType(null);
+                                setDiscoverResults([]);
+                                setDiscoverStep('type');
+                              }}
+                              accessibilityRole="button"
+                            >
+                              <Text style={[styles.discoverChipText, selected && styles.discoverChipTextSelected]}>
+                                {c}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+
+                      <TouchableOpacity
+                        style={styles.discoverSecondaryBtn}
+                        onPress={() => setDiscoverStep('tone')}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.discoverSecondaryBtnText}>Back</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
+
+                  {discoverStep === 'type' ? (
+                    <View>
+                      <Text style={styles.discoverSectionTitle}>
+                        {discoverCategory ? `Choose a type (${discoverCategory})` : 'Choose a type'}
+                      </Text>
+
+                      <View style={styles.discoverChipRow}>
+                        {getDiscoverTypes(discoverCategory).map((t) => {
+                          const selected = discoverType === t;
+                          return (
+                            <TouchableOpacity
+                              key={t}
+                              style={[styles.discoverChip, selected && styles.discoverChipSelected]}
+                              onPress={() => {
+                                setDiscoverType(t);
+                                void fetchDiscoverRecommendations(String(t));
+                              }}
+                              accessibilityRole="button"
+                            >
+                              <Text style={[styles.discoverChipText, selected && styles.discoverChipTextSelected]}>
+                                {t}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+
+                      {discoverLoading ? (
+                        <View style={styles.discoverLoadingRow}>
+                          <ActivityIndicator />
+                          <Text style={styles.discoverLoadingText}>Finding matches…</Text>
+                        </View>
+                      ) : null}
+
+                      <TouchableOpacity
+                        style={styles.discoverSecondaryBtn}
+                        onPress={() => setDiscoverStep('category')}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.discoverSecondaryBtnText}>Back</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
+
+                  {discoverStep === 'results' ? (
+                    <View>
+                      <Text style={styles.discoverSectionTitle}>Recommended for you</Text>
+
+                      {discoverResults.length ? (
+                        <View style={{ marginTop: 8 }}>
+                          {discoverResults.map((p) => (
+                            <View key={p.name} style={styles.discoverResultCard}>
+                              <Text style={styles.discoverResultName}>{p.name}</Text>
+                              {p.why ? <Text style={styles.discoverResultWhy}>{p.why}</Text> : null}
+
+                              <TouchableOpacity
+                                style={styles.discoverAddBtn}
+                                onPress={() => {
+                                  void addDiscoverItemToKit(p.name);
+                                }}
+                                accessibilityRole="button"
+                              >
+                                <Text style={styles.discoverAddBtnText}>Add to kit</Text>
+                              </TouchableOpacity>
+                            </View>
+                          ))}
+                        </View>
+                      ) : (
+                        <Text style={styles.discoverEmptyText}>No recommendations yet.</Text>
+                      )}
+
+                      <TouchableOpacity
+                        style={styles.discoverSecondaryBtn}
+                        onPress={() => setDiscoverStep('type')}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.discoverSecondaryBtnText}>Back</Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        style={[styles.discoverPrimaryBtn, { marginTop: 10 }]}
+                        onPress={closeDiscover}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.discoverPrimaryBtnText}>Done</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
+                </View>
+              ) : null}
+
+              {!analysisLoading && analysisId && analysis ? (
                 <View style={styles.recommendRow}>
                   {!hasKitRecs ? (
                     <TouchableOpacity
@@ -1860,23 +2334,21 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       }}
                       accessibilityRole="button"
                     >
-                      <Text style={styles.recommendBtnText}>Recommend items from kit</Text>
+                      <Text style={styles.recommendBtnText}>Recommend from kit</Text>
                     </TouchableOpacity>
                   ) : null}
 
-                  {!hasBuyRecs ? (
-                    <TouchableOpacity
-                      style={[styles.recommendBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
-                      disabled={analysisLoading || chatLoading}
-                      onPress={() => {
-                        Keyboard.dismiss();
-                        void recommendToBuy();
-                      }}
-                      accessibilityRole="button"
-                    >
-                      <Text style={styles.recommendBtnText}>Recommend products</Text>
-                    </TouchableOpacity>
-                  ) : null}
+                  <TouchableOpacity
+                    style={[styles.recommendBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
+                    disabled={analysisLoading || chatLoading}
+                    onPress={() => {
+                      Keyboard.dismiss();
+                      void saveScanToList();
+                    }}
+                    accessibilityRole="button"
+                  >
+                    <Text style={styles.recommendBtnText}>Save to list</Text>
+                  </TouchableOpacity>
                 </View>
               ) : null}
 
@@ -1889,37 +2361,32 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
             </ScrollView>
           </View>
 
-          {/* Bottom input bar */}
-          <View style={styles.inputBar}>
-            <View style={styles.inputContainer}>
-              <TextInput
-                style={styles.textInput}
-                value={composer}
-                onChangeText={setComposer}
-                placeholder="Take a photo..."
-                placeholderTextColor="#999999"
-                returnKeyType="send"
-                onSubmitEditing={handleSubmit}
-                blurOnSubmit={false}
-                editable={!chatLoading && !analysisLoading}
-              />
+          {/* Bottom actions */}
+          <View style={styles.actionsBar}>
+            <TouchableOpacity
+              style={[styles.actionBtn, (analysisLoading || chatLoading) && { opacity: 0.6 }]}
+              disabled={analysisLoading || chatLoading}
+              onPress={() => {
+                Keyboard.dismiss();
+                if (discoverOpen) closeDiscover();
+                else openDiscover();
+              }}
+              accessibilityRole="button"
+            >
+              <Text style={styles.actionBtnText}>Discover</Text>
+            </TouchableOpacity>
 
-              {/* Camera icon: opens the face scan camera */}
-              <TouchableOpacity
-                style={[styles.iconButton, (analysisLoading || chatLoading || photoPicking) && { opacity: 0.6 }]}
-                disabled={analysisLoading || chatLoading || photoPicking}
-                onPress={() => {
-                  Keyboard.dismiss();
-                  void choosePhoto('camera');
-                }}
-                onLongPress={() => {
-                  Keyboard.dismiss();
-                  void choosePhoto('library');
-                }}
-              >
-                <Ionicons name="camera-outline" size={18} color="#ffffff" />
-              </TouchableOpacity>
-            </View>
+            <TouchableOpacity
+              style={[styles.actionBtn, (analysisLoading || chatLoading || photoPicking) && { opacity: 0.6 }]}
+              disabled={analysisLoading || chatLoading || photoPicking}
+              onPress={() => {
+                Keyboard.dismiss();
+                void choosePhoto('camera');
+              }}
+              accessibilityRole="button"
+            >
+              <Text style={styles.actionBtnText}>Scan</Text>
+            </TouchableOpacity>
           </View>
           {/* Your scans list */}
           <Modal
@@ -2154,37 +2621,236 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
 
-  // Bottom input
-  inputBar: {
-    paddingTop: 8,
-  },
-  inputContainer: {
+  // Bottom actions
+  actionsBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-    borderRadius: 22,
-    paddingLeft: 18,
-    paddingRight: 6,
-    backgroundColor: '#ffffff',
-    minHeight: 44,
+    gap: 10,
+    paddingTop: 10,
   },
-  textInput: {
+  actionBtn: {
     flex: 1,
-    fontSize: 14,
-    paddingVertical: 8,
-    paddingRight: 8,
-    color: '#111827',
-  },
-  iconButton: {
-    marginLeft: 4,
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#111111',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
-  },// Photo sheet
+  },
+  actionBtnText: {
+    color: '#111827',
+    fontWeight: '400',
+    fontSize: 13,
+  },
+
+  // Discover
+  discoverChatBubble: {
+    width: '92%',
+    maxWidth: '92%',
+    backgroundColor: '#ffffff',
+  },
+  discoverChatHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  discoverChatHeaderText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#111827',
+  },
+  discoverChatClose: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+  },
+  discoverOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+    justifyContent: 'flex-end',
+  },
+  discoverBackdrop: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  discoverSheet: {
+    backgroundColor: '#ffffff',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    paddingHorizontal: 16,
+    paddingTop: 14,
+  },
+  discoverHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 10,
+  },
+  discoverTitle: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#111827',
+  },
+  discoverClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  discoverSectionTitle: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111827',
+    marginBottom: 8,
+  },
+  discoverChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  discoverSeasonRow: {
+    flexDirection: 'row',
+    gap: 10,
+    paddingBottom: 2,
+  },
+  discoverChip: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#ffffff',
+  },
+  discoverChipSelected: {
+    borderColor: '#111111',
+  },
+  discoverChipText: {
+    fontSize: 13,
+    color: '#111827',
+    fontWeight: '400',
+  },
+  discoverChipTextSelected: {
+    color: '#111827',
+  },
+  discoverPrimaryBtn: {
+    marginTop: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#111111',
+    backgroundColor: '#111111',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  discoverPrimaryBtnText: {
+    color: '#ffffff',
+    fontWeight: '600',
+    fontSize: 13,
+  },
+  discoverSecondaryBtn: {
+    marginTop: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  discoverSecondaryBtnText: {
+    color: '#111827',
+    fontWeight: '400',
+    fontSize: 13,
+  },
+  discoverGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  discoverGridBtn: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    backgroundColor: '#ffffff',
+    minWidth: '47%',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  discoverGridBtnText: {
+    fontSize: 13,
+    color: '#111827',
+    fontWeight: '400',
+  },
+  discoverLoadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  discoverLoadingText: {
+    marginLeft: 10,
+    color: '#111827',
+    fontSize: 13,
+  },
+  discoverResultCard: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    marginBottom: 10,
+    backgroundColor: '#ffffff',
+  },
+  discoverResultName: {
+    color: '#111827',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  discoverResultWhy: {
+    color: '#6b7280',
+    fontSize: 12,
+    marginTop: 6,
+    lineHeight: 16,
+  },
+  discoverAddBtn: {
+    marginTop: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#111111',
+    backgroundColor: '#111111',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'flex-start',
+  },
+  discoverAddBtnText: {
+    color: '#ffffff',
+    fontWeight: '600',
+    fontSize: 13,
+  },
+  discoverEmptyText: {
+    color: '#6b7280',
+    fontSize: 13,
+    marginTop: 8,
+  },
 
   // Chat list
   chatListOverlay: {

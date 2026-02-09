@@ -1192,8 +1192,6 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
       // Fallback: local heuristic if server is unreachable or user isn't signed in.
       if (!result) {
         result = inferProductUndertoneLocal({ name, brand, shade, notes });
-        const prefix = token ? 'AI guess unavailable.' : 'Sign in to use AI guessing.';
-        result = { ...result, reason: `${prefix} ${result.reason}`.trim() };
       }
 
       if (result.undertone === 'unknown') {
@@ -1202,8 +1200,8 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
       }
 
       const label = TONE_OPTIONS.find((o) => o.key === result!.undertone)?.label || result.undertone;
-      const confidenceLine = Number.isFinite(result.confidence) ? `Confidence: ${Math.round(result.confidence)}%\n\n` : '';
-      const body = `${confidenceLine}${result.reason || ''}`.trim();
+      const pct = Number.isFinite(result.confidence) ? Math.round(result.confidence) : 0;
+      const body = `Confidence: ${pct}%`;
 
       Alert.alert(`Suggested: ${label}`, body, [
         { text: 'Cancel', style: 'cancel' },
@@ -2160,12 +2158,12 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                             onPress={guessUndertoneForActiveItem}
                             disabled={undertoneGuessBusy}
                             accessibilityRole="button"
-                            accessibilityLabel="Guess undertone"
+                            accessibilityLabel="Search undertone"
                           >
                             {undertoneGuessBusy ? (
                               <ActivityIndicator size="small" color="#111111" />
                             ) : (
-                              <Ionicons name="sparkles-outline" size={18} color="#111111" />
+                              <Ionicons name="search-outline" size={16} color="#111111" />
                             )}
                           </TouchableOpacity>
                         </View>
@@ -3271,15 +3269,19 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-start',
   },
   toneAssistButton: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
+    height: 28,
+    width: 28,
+    paddingHorizontal: 0,
+    borderRadius: 14,
     marginLeft: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#f3f4f6',
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+  },
+  toneAssistText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#111111',
   },
   toneDropdownText: {
     flex: 1,

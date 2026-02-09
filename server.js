@@ -2798,6 +2798,133 @@ const BUY_RECS_SERVER = {
   warm: { foundation: FOUNDATION_POOL, cheeks: CHEEKS_POOL, eyes: EYES_POOL, lips: LIPS_POOL },
 };
 
+// --- Discover pools (manual undertone/season flow) ---
+// These are lightweight, curated candidate sets. The /discover-recommend endpoint
+// uses them to return 1-2 picks for the selected category/type.
+const CONCEALER_POOL = [
+  "NARS Radiant Creamy Concealer",
+  "Tarte Shape Tape Concealer",
+  "Dior Forever Skin Correct Concealer",
+  "Rare Beauty Liquid Touch Brightening Concealer",
+  "Kosas Revealer Concealer",
+];
+
+const CORRECTOR_POOL = [
+  "Bobbi Brown Corrector",
+  "Smashbox x BECCA Under Eye Brightening Corrector",
+  "Charlotte Tilbury Magic Vanish Color Corrector",
+  "HUDA BEAUTY FauxFilter Color Corrector",
+];
+
+const POWDER_POOL = [
+  "Laura Mercier Translucent Loose Setting Powder",
+  "Charlotte Tilbury Airbrush Flawless Finish Setting Powder",
+  "Fenty Beauty Pro Filt'r Instant Retouch Setting Powder",
+  "Hourglass Veil Translucent Setting Powder",
+];
+
+const CONTOUR_POOL = [
+  "MAKEUP BY MARIO SoftSculpt Shaping Stick",
+  "Fenty Beauty Match Stix Contour Skinstick",
+  "Rare Beauty Warm Wishes Effortless Bronzer Stick",
+];
+
+const BRONZER_POOL = [
+  "NARS Laguna Bronzing Powder",
+  "Benefit Hoola Matte Bronzer",
+  "Fenty Beauty Sun Stalk'r Instant Warmth Bronzer",
+  "Saie Sun Melt Natural Cream Bronzer",
+];
+
+const HIGHLIGHTER_POOL = [
+  "Rare Beauty Positive Light Liquid Luminizer",
+  "Charlotte Tilbury Beauty Light Wand",
+  "Fenty Beauty Killawatt Freestyle Highlighter",
+  "Hourglass Ambient Lighting Powder",
+];
+
+const EYESHADOW_POOL = [
+  "Natasha Denona Glam Palette",
+  "Natasha Denona Bronze Palette",
+  "Urban Decay Naked3 Palette",
+  "Huda Beauty Nude Obsessions Palette",
+  "Dior Backstage Eye Palette",
+];
+
+const EYELINER_POOL = [
+  "Urban Decay 24/7 Glide-On Waterproof Eyeliner Pencil",
+  "Charlotte Tilbury Rock 'N' Kohl Long-Lasting Eyeliner Pencil",
+  "Stila Stay All Day Waterproof Liquid Eye Liner",
+  "MAKE UP FOR EVER Artist Color Pencil Longwear Eyeliner",
+];
+
+const MASCARA_POOL = [
+  "Lancôme Lash Idôle Mascara",
+  "Too Faced Better Than Sex Mascara",
+  "Benefit They're Real! Lengthening Mascara",
+  "Rare Beauty Perfect Strokes Universal Volumizing Mascara",
+];
+
+const LASHES_POOL = [
+  "Sephora Collection False Eyelashes",
+  "Velour Effortless Lashes",
+  "Kiss Lash Couture False Lashes",
+];
+
+const LIPSTICK_POOL = [
+  "MAC Cosmetics MACximal Silky Matte Lipstick",
+  "Charlotte Tilbury Matte Revolution Lipstick",
+  "Rare Beauty by Selena Gomez Kind Words Matte Lipstick",
+  "NARS Powermatte Lipstick",
+];
+
+const LIPLINER_POOL = [
+  "Charlotte Tilbury Lip Cheat Lip Liner",
+  "MAC Cosmetics Lip Pencil",
+  "MAKE UP FOR EVER Artist Color Pencil",
+];
+
+const LIP_GLOSS_POOL = [
+  "Fenty Beauty Gloss Bomb Universal Lip Luminizer",
+  "Dior Addict Lip Maximizer Plumping Gloss",
+  "Rare Beauty Stay Vulnerable Glossy Lip Balm",
+];
+
+const LIP_BALM_POOL = [
+  "LANEIGE Lip Sleeping Mask",
+  "Summer Fridays Lip Butter Balm",
+  "Fresh Sugar Lip Treatment",
+];
+
+const DISCOVER_POOLS = {
+  base: {
+    Foundation: FOUNDATION_POOL,
+    Concealer: CONCEALER_POOL,
+    Corrector: CORRECTOR_POOL,
+    Powder: POWDER_POOL,
+  },
+  sculpt: {
+    Contour: CONTOUR_POOL,
+    Bronzer: BRONZER_POOL,
+  },
+  cheeks: {
+    Blush: CHEEKS_POOL,
+    Highlighter: HIGHLIGHTER_POOL,
+  },
+  eyes: {
+    Eyeshadow: EYESHADOW_POOL,
+    Eyeliner: EYELINER_POOL,
+    Mascara: MASCARA_POOL,
+    Lashes: LASHES_POOL,
+  },
+  lips: {
+    Lipstick: LIPSTICK_POOL,
+    Lipliner: LIPLINER_POOL,
+    "Lip gloss": LIP_GLOSS_POOL,
+    "Lip balm/treatments": LIP_BALM_POOL,
+  },
+};
+
 // Sephora product URLs (preferred when known). If missing, we resolve via Sephora keyword search.
 // NOTE: Some products may resolve to US pages; those still provide real shade names.
 const PRODUCT_URLS = {
@@ -4078,6 +4205,128 @@ ${analysisSummaryLines.join("\n")}` });
     return res.status(500).json({ ok: false, error: String(e?.message || "Server error") });
   }
 });
+
+// --- Discover recommendations (manual undertone/season flow) ---
+// Returns 1-2 product picks for a chosen category + type.
+async function handleDiscoverRecommend(req, res) {
+  try {
+    const undertone = normalizeUndertoneKeyServer(req?.body?.undertone);
+
+    const seasonRaw = String(req?.body?.season || "").trim().toLowerCase();
+    const season = seasonRaw === "spring" || seasonRaw === "summer" || seasonRaw === "autumn" || seasonRaw === "winter" ? seasonRaw : null;
+
+    const categoryRaw = String(req?.body?.category || "").trim();
+    const typeRaw = String(req?.body?.productType || req?.body?.type || "").trim();
+
+    if (!categoryRaw) return res.status(400).json({ ok: false, error: "Missing category" });
+    if (!typeRaw) return res.status(400).json({ ok: false, error: "Missing productType" });
+
+    const categoryKey = categoryRaw.toLowerCase();
+    const pools = DISCOVER_POOLS?.[categoryKey] || null;
+    if (!pools) {
+      return res.status(400).json({ ok: false, error: "Unknown category" });
+    }
+
+    // Types are case-sensitive in our mapping (because some include spaces).
+    // Match by lowercased key for robustness.
+    let candidates = null;
+    for (const [k, arr] of Object.entries(pools)) {
+      if (String(k).trim().toLowerCase() === typeRaw.toLowerCase()) {
+        candidates = Array.isArray(arr) ? arr : null;
+        break;
+      }
+    }
+
+    if (!candidates || !candidates.length) {
+      return res.status(400).json({ ok: false, error: "Unknown productType" });
+    }
+
+    const candidateNames = uniqStringsLower(candidates).slice(0, 30);
+
+    // Default fallback: first 2 in the pool.
+    const fallbackPicks = candidateNames.slice(0, 2).map((name) => ({ name, why: "" }));
+
+    if (!OPENAI_API_KEY) {
+      return res.json({ ok: true, products: fallbackPicks, source: "fallback" });
+    }
+
+    const systemPrompt =
+      "You are Undertone's product recommender. " +
+      "Given a user's undertone (cool/neutral/warm) and optional color season (spring/summer/autumn/winter), " +
+      "choose 1-2 products from the provided candidate list that are most likely to suit them. " +
+      "Return ONLY strict JSON in this schema: {\"products\":[{\"name\":string,\"why\":string}]}. " +
+      "The name must exactly match one of the candidate strings. Keep why to one short sentence.";
+
+    const userPromptLines = [];
+    userPromptLines.push(`undertone: ${undertone}`);
+    if (season) userPromptLines.push(`season: ${season}`);
+    userPromptLines.push(`category: ${categoryRaw}`);
+    userPromptLines.push(`type: ${typeRaw}`);
+    userPromptLines.push("candidates:");
+    candidateNames.forEach((n) => userPromptLines.push(`- ${n}`));
+
+    const payload = {
+      model: OPENAI_CHAT_MODEL,
+      temperature: 0.4,
+      max_output_tokens: 220,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPromptLines.join("\n") },
+      ],
+    };
+
+    let outText = "";
+    try {
+      const { data } = await openaiResponsesCreateRaw(payload, { retries: 2, label: "discover_recommend" });
+      const extracted = extractOutputText(data);
+      if (extracted.refusal) throw new Error(extracted.refusal);
+      outText = String(extracted.text || "").trim();
+    } catch (e) {
+      // If the model call fails, fall back.
+      return res.json({ ok: true, products: fallbackPicks, source: "fallback" });
+    }
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(outText);
+    } catch {
+      // Attempt to salvage JSON substring.
+      const m = outText.match(/\{[\s\S]*\}/);
+      if (m) {
+        try {
+          parsed = JSON.parse(m[0]);
+        } catch {
+          parsed = null;
+        }
+      }
+    }
+
+    const rawProducts = Array.isArray(parsed?.products) ? parsed.products : [];
+    const allow = new Set(candidateNames.map((x) => String(x).toLowerCase()));
+
+    const picks = rawProducts
+      .map((p) => ({
+        name: String(p?.name || "").trim(),
+        why: String(p?.why || "").trim(),
+      }))
+      .filter((p) => p.name && allow.has(p.name.toLowerCase()))
+      .slice(0, 2);
+
+    if (!picks.length) {
+      return res.json({ ok: true, products: fallbackPicks, source: "fallback" });
+    }
+
+    return res.json({ ok: true, products: picks, source: "openai" });
+  } catch (e) {
+    console.error("discover-recommend error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+}
+
+// Route aliases (some deployments proxy API under /api or /api/v1).
+app.post("/discover-recommend", authRequired, handleDiscoverRecommend);
+app.post("/api/discover-recommend", authRequired, handleDiscoverRecommend);
+app.post("/api/v1/discover-recommend", authRequired, handleDiscoverRecommend);
 
 app.post("/recommend-products", authRequired, async (req, res) => {
   try {

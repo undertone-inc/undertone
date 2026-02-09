@@ -34,6 +34,12 @@ const SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.8);
 const FILTER_SHEET_MAX_HEIGHT = Math.round(Dimensions.get('window').height * 0.9);
 const FILTER_SHEET_MIN_HEIGHT = Math.round(Dimensions.get('window').height * 0.62);
 
+// Time wheel picker sizing.
+const WHEEL_ROW_HEIGHT = 40;
+const WHEEL_VISIBLE_ROWS = 5;
+const WHEEL_SPACER_HEIGHT = ((WHEEL_VISIBLE_ROWS - 1) / 2) * WHEEL_ROW_HEIGHT;
+const AMPM_COL_WIDTH = 56;
+
 // Default KitLog categories (used only if KitLog hasn't been opened yet)
 const DEFAULT_KITLOG_CATEGORIES = [
   // Match KitLog category ordering
@@ -53,6 +59,23 @@ const FALLBACK_CATEGORY_NAME = 'Base';
 
 // Kit picker uses this sentinel category to show all items.
 const KIT_PICKER_ALL = '__all__';
+
+const MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+const DOW_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function normalizeKitlogCategoryName(raw: any): string {
   const n = typeof raw === 'string' ? raw.trim() : '';
@@ -264,6 +287,57 @@ function formatTimeInput(raw: string): string {
   // Common shorthand: 930 => 09:30
   if (digits.length === 3) return `0${digits.slice(0, 1)}:${digits.slice(1)}`;
   return `${digits.slice(0, 2)}:${digits.slice(2)}`;
+}
+
+
+function formatTimeDisplay(hhmm: string): string {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((hhmm || '').trim());
+  if (!m) return '';
+  const h24 = Math.max(0, Math.min(23, Number(m[1])));
+  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  const isPM = h24 >= 12;
+  let h12 = h24 % 12;
+  if (h12 === 0) h12 = 12;
+  return `${h12}:${pad2(mm)} ${isPM ? 'PM' : 'AM'}`;
+}
+
+function pad2(n: number): string {
+  const v = Math.floor(Math.abs(n));
+  return v < 10 ? `0${v}` : `${v}`;
+}
+
+function ymdFromParts(year: number, month0: number, day: number): string {
+  return `${year}-${pad2(month0 + 1)}-${pad2(day)}`;
+}
+
+function parseYmdParts(ymd: string): { year: number; month0: number; day: number } | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((ymd || '').trim());
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month0 = Number(m[2]) - 1;
+  const day = Number(m[3]);
+  if (!Number.isFinite(year) || !Number.isFinite(month0) || !Number.isFinite(day)) return null;
+  if (month0 < 0 || month0 > 11) return null;
+  if (day < 1 || day > 31) return null;
+  return { year, month0, day };
+}
+
+function buildMonthMatrix(year: number, month0: number): (number | null)[][] {
+  const firstDow = new Date(year, month0, 1).getDay();
+  const daysInMonth = new Date(year, month0 + 1, 0).getDate();
+  const cells: (number | null)[] = [];
+  for (let i = 0; i < firstDow; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
+  const weeks: (number | null)[][] = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  return weeks;
+}
+
+function monthYearLabel(year: number, month0: number): string {
+  const names = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const m = names[month0] || '';
+  return m ? `${m} ${year}` : `${year}`;
 }
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UPCOMING_WINDOW_DAYS = 10;
@@ -525,18 +599,27 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   // Client editor modal state
   const [draft, setDraft] = useState<ClientRecord | null>(null);
   const [isDraftNew, setIsDraftNew] = useState(false);
-  const [newProductText, setNewProductText] = useState('');
   const [kitlogItems, setKitlogItems] = useState<KitPickItem[]>([]);
   const [kitPickerOpen, setKitPickerOpen] = useState(false);
   const [kitPickerSearch, setKitPickerSearch] = useState('');
   const [kitPickerCategory, setKitPickerCategory] = useState<string>(KIT_PICKER_ALL);
   const [kitlogCategories, setKitlogCategories] = useState<string[]>(DEFAULT_KITLOG_CATEGORIES);
-  const [newProductCategory, setNewProductCategory] = useState<PlanCategory>(FALLBACK_CATEGORY_NAME);
-  const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
   const [eventTypeMenuOpen, setEventTypeMenuOpen] = useState(false);
   const [customEventTypeOpen, setCustomEventTypeOpen] = useState(false);
-  const [draftTrialDateText, setDraftTrialDateText] = useState('');
-  const [draftFinalDateText, setDraftFinalDateText] = useState('');
+
+  // Date/time pickers (calendar + wheel)
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [timePickerOpen, setTimePickerOpen] = useState(false);
+  const [activeDateField, setActiveDateField] = useState<'trialDate' | 'finalDate' | null>(null);
+  const [activeTimeField, setActiveTimeField] = useState<'trialTime' | 'finalTime' | null>(null);
+  const [calendarYear, setCalendarYear] = useState<number>(new Date().getFullYear());
+  const [calendarMonth, setCalendarMonth] = useState<number>(new Date().getMonth()); // 0-based
+  const [timeHour12, setTimeHour12] = useState<number>(9);
+  const [timeAmPm, setTimeAmPm] = useState<'AM' | 'PM'>('AM');
+  const [timeMinute, setTimeMinute] = useState<number>(0);
+  const hourWheelRef = useRef<ScrollView | null>(null);
+  const minuteWheelRef = useRef<ScrollView | null>(null);
+
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const tabBarHeight = useBottomTabBarHeight();
 
@@ -553,17 +636,6 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
 
 
-
-  // Keep DD-MM-YYYY text inputs in sync when switching between clients.
-  useEffect(() => {
-    if (!draft) {
-      setDraftTrialDateText('');
-      setDraftFinalDateText('');
-      return;
-    }
-    setDraftTrialDateText(ymdToDmy((draft.trialDate || '').trim()));
-    setDraftFinalDateText(ymdToDmy((draft.finalDate || '').trim()));
-  }, [draft ? draft.id : null]);
 
   // keyboard spacer (modal)
   useEffect(() => {
@@ -587,11 +659,6 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       if (!parsed) {
         setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
         setKitlogItems([]);
-        setNewProductCategory((prev) => {
-          if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
-          if (DEFAULT_KITLOG_CATEGORIES.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
-          return DEFAULT_KITLOG_CATEGORIES[0] || FALLBACK_CATEGORY_NAME;
-        });
         setKitPickerCategory(KIT_PICKER_ALL);
         return;
       }
@@ -639,12 +706,6 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       setKitlogCategories(finalList);
       setKitlogItems(items);
 
-      setNewProductCategory((prev) => {
-        if (finalList.includes(prev)) return prev;
-        if (finalList.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
-        return finalList[0] || FALLBACK_CATEGORY_NAME;
-      });
-
       setKitPickerCategory((prev) => {
         if (prev === KIT_PICKER_ALL) return prev;
         if (finalList.includes(prev)) return prev;
@@ -653,11 +714,6 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     } catch {
       setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
       setKitlogItems([]);
-      setNewProductCategory((prev) => {
-        if (DEFAULT_KITLOG_CATEGORIES.includes(prev)) return prev;
-        if (DEFAULT_KITLOG_CATEGORIES.includes(FALLBACK_CATEGORY_NAME)) return FALLBACK_CATEGORY_NAME;
-        return DEFAULT_KITLOG_CATEGORIES[0] || FALLBACK_CATEGORY_NAME;
-      });
       setKitPickerCategory(KIT_PICKER_ALL);
     }
   }
@@ -866,6 +922,24 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const filterBackdropPadBottom =
     keyboardHeight > 0 ? keyboardHeight + 12 : Math.max(insets.bottom, 16) + 12;
 
+  const calendarWeeks = useMemo(() => buildMonthMatrix(calendarYear, calendarMonth), [calendarYear, calendarMonth]);
+  const hours12 = useMemo(() => Array.from({ length: 12 }, (_, i) => i + 1), []);
+  const minutes = useMemo(() => Array.from({ length: 60 }, (_, i) => i), []);
+
+  useEffect(() => {
+    if (!timePickerOpen) return;
+    const t = setTimeout(() => {
+      try {
+        const hourIdx = Math.max(0, Math.min(11, (timeHour12 || 1) - 1));
+        hourWheelRef.current?.scrollTo({ y: hourIdx * WHEEL_ROW_HEIGHT, animated: false });
+        minuteWheelRef.current?.scrollTo({ y: timeMinute * WHEEL_ROW_HEIGHT, animated: false });
+      } catch {
+        // ignore
+      }
+    }, 30);
+    return () => clearTimeout(t);
+  }, [timePickerOpen, activeTimeField]);
+
   function addClientFromBar() {
     const name = newClientText.trim();
     Keyboard.dismiss();
@@ -909,11 +983,14 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
     setDraft(c);
     setIsDraftNew(true);
-    setNewProductText('');
     setCustomEventTypeOpen(false);
-    setNewProductCategory(
-      kitlogCategories.includes(FALLBACK_CATEGORY_NAME) ? FALLBACK_CATEGORY_NAME : kitlogCategories[0] || FALLBACK_CATEGORY_NAME
-    );
+    setEventTypeMenuOpen(false);
+    setKitPickerOpen(false);
+    setDatePickerOpen(false);
+    setTimePickerOpen(false);
+    setKitPickerOpen(false);
+    setActiveDateField(null);
+    setActiveTimeField(null);
     setNewClientText('');
   }
 
@@ -928,11 +1005,14 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     };
     setDraft(copy);
     setIsDraftNew(false);
-    setNewProductText('');
     setCustomEventTypeOpen(false);
-    setNewProductCategory(
-      kitlogCategories.includes(FALLBACK_CATEGORY_NAME) ? FALLBACK_CATEGORY_NAME : kitlogCategories[0] || FALLBACK_CATEGORY_NAME
-    );
+    setEventTypeMenuOpen(false);
+    setKitPickerOpen(false);
+    setDatePickerOpen(false);
+    setTimePickerOpen(false);
+    setKitPickerOpen(false);
+    setActiveDateField(null);
+    setActiveTimeField(null);
   }
 
   function upsertClient(next: ClientRecord) {
@@ -947,8 +1027,12 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
   function closeClient() {
     setEventTypeMenuOpen(false);
-    setCategoryPickerOpen(false);
     setCustomEventTypeOpen(false);
+    setDatePickerOpen(false);
+    setTimePickerOpen(false);
+    setKitPickerOpen(false);
+    setActiveDateField(null);
+    setActiveTimeField(null);
     if (!draft) return;
     const cleaned: ClientRecord = {
       ...draft,
@@ -1013,35 +1097,130 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     });
   }
 
-  function addProduct() {
+  function closeDatePicker() {
+    setDatePickerOpen(false);
+    setActiveDateField(null);
+  }
+
+  function closeTimePicker() {
+    setTimePickerOpen(false);
+    setActiveTimeField(null);
+  }
+
+  function openDatePickerSheet(field: 'trialDate' | 'finalDate') {
     if (!draft) return;
-    const trimmed = newProductText.trim();
-    // If the user taps + with no text, open Kit picker.
-    if (!trimmed) {
-      void openKitPicker();
+    Keyboard.dismiss();
+    setEventTypeMenuOpen(false);
+    setCustomEventTypeOpen(false);
+    setTimePickerOpen(false);
+    setActiveTimeField(null);
+    setKitPickerOpen(false);
+
+    // Toggle closed if tapping the same field again.
+    if (datePickerOpen && activeDateField === field) {
+      setDatePickerOpen(false);
+      setActiveDateField(null);
       return;
     }
-    const now = Date.now();
 
-    const prod: ClientProduct = {
-      id: uid('prod'),
-      category: newProductCategory,
-      name: trimmed,
-      shade: '',
-      notes: '',
-      createdAt: now,
-      updatedAt: now,
-    };
+    setActiveDateField(field);
 
+    const cur = (field === 'trialDate' ? draft.trialDate : draft.finalDate) || '';
+    const parts = parseYmdParts(cur);
+    const base = parts ? new Date(parts.year, parts.month0, 1) : new Date();
+    setCalendarYear(base.getFullYear());
+    setCalendarMonth(base.getMonth());
+    setDatePickerOpen(true);
+  }
+
+  function openTimePickerSheet(field: 'trialTime' | 'finalTime') {
+    if (!draft) return;
+    Keyboard.dismiss();
+    setEventTypeMenuOpen(false);
+    setCustomEventTypeOpen(false);
+    setDatePickerOpen(false);
+    setActiveDateField(null);
+    setKitPickerOpen(false);
+
+    // Toggle closed if tapping the same field again.
+    if (timePickerOpen && activeTimeField === field) {
+      setTimePickerOpen(false);
+      setActiveTimeField(null);
+      return;
+    }
+
+    setActiveTimeField(field);
+
+    const cur = (field === 'trialTime' ? draft.trialTime : draft.finalTime) || '';
+    const m = /^(\d{1,2}):(\d{2})$/.exec(cur.trim());
+    const h24 = m ? Math.min(23, Math.max(0, Number(m[1]))) : 9;
+    const min = m ? Math.min(59, Math.max(0, Number(m[2]))) : 0;
+    const safeH24 = Number.isFinite(h24) ? h24 : 9;
+    const isPM = safeH24 >= 12;
+    let h12 = safeH24 % 12;
+    if (h12 === 0) h12 = 12;
+
+    setTimeHour12(h12);
+    setTimeMinute(Number.isFinite(min) ? min : 0);
+    setTimeAmPm(isPM ? 'PM' : 'AM');
+    setTimePickerOpen(true);
+  }
+
+  function shiftCalendarMonth(delta: number) {
+    const next = new Date(calendarYear, calendarMonth + delta, 1);
+    setCalendarYear(next.getFullYear());
+    setCalendarMonth(next.getMonth());
+  }
+
+  function pickCalendarDay(day: number) {
+    if (!draft || !activeDateField) return;
+    const ymd = ymdFromParts(calendarYear, calendarMonth, day);
     setDraft((prev) => {
       if (!prev) return prev;
-      return {
-        ...prev,
-        products: [...(prev.products || []), prod],
-        updatedAt: now,
-      };
+      return { ...prev, [activeDateField]: ymd, updatedAt: Date.now() } as ClientRecord;
     });
-    setNewProductText('');
+    closeDatePicker();
+  }
+
+  function clearActiveDate() {
+    if (!draft || !activeDateField) {
+      closeDatePicker();
+      return;
+    }
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return { ...prev, [activeDateField]: '', updatedAt: Date.now() } as ClientRecord;
+    });
+    closeDatePicker();
+  }
+
+  function commitTime() {
+    if (!draft || !activeTimeField) {
+      closeTimePicker();
+      return;
+    }
+    const base = Math.max(1, Math.min(12, timeHour12 || 12)) % 12;
+    const hour24 = base + (timeAmPm === 'PM' ? 12 : 0);
+    const hh = pad2(hour24);
+    const mm = pad2(timeMinute);
+    const value = `${hh}:${mm}`;
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return { ...prev, [activeTimeField]: value, updatedAt: Date.now() } as ClientRecord;
+    });
+    closeTimePicker();
+  }
+
+  function clearActiveTime() {
+    if (!draft || !activeTimeField) {
+      closeTimePicker();
+      return;
+    }
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return { ...prev, [activeTimeField]: '', updatedAt: Date.now() } as ClientRecord;
+    });
+    closeTimePicker();
   }
 
   function removeProduct(id: string) {
@@ -1054,15 +1233,6 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       };
     });
   }
-
-  async function openCategoryPicker() {
-    Keyboard.dismiss();
-    setEventTypeMenuOpen(false);
-    await refreshKitlogCategories();
-    setCategoryPickerOpen(true);
-  }
-
-
 
   function closeFilter() {
     setFilterEventMenuOpen(false);
@@ -1079,7 +1249,17 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     if (!draft) return;
     Keyboard.dismiss();
     setEventTypeMenuOpen(false);
-    setCategoryPickerOpen(false);
+    setDatePickerOpen(false);
+    setActiveDateField(null);
+    setTimePickerOpen(false);
+    setActiveTimeField(null);
+
+    // Toggle closed if already open.
+    if (kitPickerOpen) {
+      setKitPickerOpen(false);
+      return;
+    }
+
     await refreshKitlogCategories();
     setKitPickerSearch('');
     setKitPickerCategory(KIT_PICKER_ALL);
@@ -1124,6 +1304,11 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
   const draftEventTypeIsCustom =
     !!draftEventTypeValue && !EVENT_TYPE_OPTIONS.some((opt) => opt.toLowerCase() === draftEventTypeValue.toLowerCase());
   const draftEventTypeDisplay = draftEventTypeValue ? draftEventTypeValue : customEventTypeOpen ? 'Custom' : 'Select';
+
+  const todayLocal = new Date();
+  const todayYmd = ymdFromParts(todayLocal.getFullYear(), todayLocal.getMonth(), todayLocal.getDate());
+  const activeDateValue =
+    draft && activeDateField ? String((draft as any)[activeDateField] || '').trim() : '';
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
@@ -1236,20 +1421,22 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
               const trialDate = (c.trialDate || '').trim();
               const trialTime = (c.trialTime || '').trim();
               const trialDisplay = trialDate ? (ymdToDmy(trialDate) || trialDate) : '';
+              const trialTimeDisplay = trialTime ? (formatTimeDisplay(trialTime) || trialTime) : '';
               if (trialDate) {
                 chips.push({
                   key: `trial_${trialDate}_${trialTime}`,
-                  text: `Trial ${trialDisplay}${trialTime ? ' ' + trialTime : ''}`,
+                  text: `Trial ${trialDisplay}${trialTimeDisplay ? ' ' + trialTimeDisplay : ''}`,
                 });
               }
 
               const finalDate = (c.finalDate || '').trim();
               const finalTime = (c.finalTime || '').trim();
               const finalDisplay = finalDate ? (ymdToDmy(finalDate) || finalDate) : '';
+              const finalTimeDisplay = finalTime ? (formatTimeDisplay(finalTime) || finalTime) : '';
               if (finalDate) {
                 chips.push({
                   key: `event_${finalDate}_${finalTime}`,
-                  text: `Event ${finalDisplay}${finalTime ? ' ' + finalTime : ''}`,
+                  text: `Event ${finalDisplay}${finalTimeDisplay ? ' ' + finalTimeDisplay : ''}`,
                 });
               }
 
@@ -1333,6 +1520,9 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                   <View style={styles.editorCard}>
                     <Text style={styles.sectionTitle}>Filter</Text>
 
+
+
+
                     <TouchableOpacity
                       style={styles.menuRow}
                       activeOpacity={0.9}
@@ -1410,7 +1600,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
           presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
           onRequestClose={closeClient}
         >
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+
             <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
               <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
                 <View style={styles.modalHeader}>
@@ -1426,6 +1616,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
                 <ScrollView
                   style={{ flex: 1 }}
+                  scrollEnabled={!timePickerOpen}
                   contentContainerStyle={{
                     paddingTop: 12,
                     paddingBottom: 24,
@@ -1444,90 +1635,292 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                       returnKeyType="done"
                     />
 
-                    {/* Trial + Event (date + time) in one row */}
+                    {/* Trial + Event (date + time) in one row (tap to pick) */}
                     <View style={styles.dateRowCombined}>
-                      <View style={[styles.dateTimeGroup, { marginRight: 12 }]}>
-                        <View style={[styles.dateField, { marginRight: 8 }]}>
-                          <Text style={styles.dateLabel}>Trial date</Text>
-                          <TextInput
-                            value={draftTrialDateText}
-                            onChangeText={(v) => {
-                              const formatted = formatDateInputDMY(v);
-                              setDraftTrialDateText(formatted);
-                              const ymd = dmyToYmd(formatted);
-                              setDraft((prev) => (prev ? { ...prev, trialDate: ymd, updatedAt: Date.now() } : prev));
-                            }}
-                            placeholder="DD-MM-YYYY"
-                            placeholderTextColor="#9ca3af"
-                            style={styles.dateInput}
-                            autoCorrect={false}
-                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
-                            maxLength={10}
-                            returnKeyType="done"
-                          />
-                        </View>
-
-                        <View style={styles.timeFieldCompact}>
-                          <Text style={styles.dateLabel}>Time</Text>
-                          <TextInput
-                            value={draft?.trialTime ?? ''}
-                            onChangeText={(v) =>
-                              setDraft((prev) =>
-                                prev ? { ...prev, trialTime: formatTimeInput(v), updatedAt: Date.now() } : prev
-                              )
-                            }
-                            placeholder="HH:MM"
-                            placeholderTextColor="#9ca3af"
-                            style={styles.timeInputCompact}
-                            autoCorrect={false}
-                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
-                            maxLength={5}
-                            returnKeyType="done"
-                          />
+                      <View style={[styles.dateTimeBoxWrap, { marginRight: 12 }]}>
+                        <Text style={styles.dateLabel}>Trial</Text>
+                        <View style={styles.dateTimeBox}>
+                          <TouchableOpacity
+                            style={styles.dateTimePart}
+                            activeOpacity={0.9}
+                            onPress={() => openDatePickerSheet('trialDate')}
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[styles.dateTimeValue, !(draft?.trialDate || '').trim() ? styles.dateTimeValueMuted : null]}
+                              numberOfLines={1}
+                            >
+                              {(draft?.trialDate || '').trim()
+                                ? (ymdToDmy((draft?.trialDate || '').trim()) || (draft?.trialDate || '').trim())
+                                : 'DD-MM-YYYY'}
+                            </Text>
+                          </TouchableOpacity>
+                          <View style={styles.dateTimeDivider} />
+                          <TouchableOpacity
+                            style={styles.dateTimePartTime}
+                            activeOpacity={0.9}
+                            onPress={() => openTimePickerSheet('trialTime')}
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[styles.dateTimeValue, !(draft?.trialTime || '').trim() ? styles.dateTimeValueMuted : null]}
+                              numberOfLines={1}
+                            >
+                              {(draft?.trialTime || '').trim() ? (formatTimeDisplay((draft?.trialTime || '').trim()) || (draft?.trialTime || '').trim()) : 'HH:MM AM'}
+                            </Text>
+                          </TouchableOpacity>
                         </View>
                       </View>
 
-                      <View style={styles.dateTimeGroup}>
-                        <View style={[styles.dateField, { marginRight: 8 }]}>
-                          <Text style={styles.dateLabel}>Event date</Text>
-                          <TextInput
-                            value={draftFinalDateText}
-                            onChangeText={(v) => {
-                              const formatted = formatDateInputDMY(v);
-                              setDraftFinalDateText(formatted);
-                              const ymd = dmyToYmd(formatted);
-                              setDraft((prev) => (prev ? { ...prev, finalDate: ymd, updatedAt: Date.now() } : prev));
-                            }}
-                            placeholder="DD-MM-YYYY"
-                            placeholderTextColor="#9ca3af"
-                            style={styles.dateInput}
-                            autoCorrect={false}
-                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
-                            maxLength={10}
-                            returnKeyType="done"
-                          />
-                        </View>
-
-                        <View style={styles.timeFieldCompact}>
-                          <Text style={styles.dateLabel}>Time</Text>
-                          <TextInput
-                            value={draft?.finalTime ?? ''}
-                            onChangeText={(v) =>
-                              setDraft((prev) =>
-                                prev ? { ...prev, finalTime: formatTimeInput(v), updatedAt: Date.now() } : prev
-                              )
-                            }
-                            placeholder="HH:MM"
-                            placeholderTextColor="#9ca3af"
-                            style={styles.timeInputCompact}
-                            autoCorrect={false}
-                            keyboardType={Platform.OS === 'ios' ? 'number-pad' : 'numeric'}
-                            maxLength={5}
-                            returnKeyType="done"
-                          />
+                      <View style={styles.dateTimeBoxWrap}>
+                        <Text style={styles.dateLabel}>Event</Text>
+                        <View style={styles.dateTimeBox}>
+                          <TouchableOpacity
+                            style={styles.dateTimePart}
+                            activeOpacity={0.9}
+                            onPress={() => openDatePickerSheet('finalDate')}
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[styles.dateTimeValue, !(draft?.finalDate || '').trim() ? styles.dateTimeValueMuted : null]}
+                              numberOfLines={1}
+                            >
+                              {(draft?.finalDate || '').trim()
+                                ? (ymdToDmy((draft?.finalDate || '').trim()) || (draft?.finalDate || '').trim())
+                                : 'DD-MM-YYYY'}
+                            </Text>
+                          </TouchableOpacity>
+                          <View style={styles.dateTimeDivider} />
+                          <TouchableOpacity
+                            style={styles.dateTimePartTime}
+                            activeOpacity={0.9}
+                            onPress={() => openTimePickerSheet('finalTime')}
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[styles.dateTimeValue, !(draft?.finalTime || '').trim() ? styles.dateTimeValueMuted : null]}
+                              numberOfLines={1}
+                            >
+                              {(draft?.finalTime || '').trim() ? (formatTimeDisplay((draft?.finalTime || '').trim()) || (draft?.finalTime || '').trim()) : 'HH:MM AM'}
+                            </Text>
+                          </TouchableOpacity>
                         </View>
                       </View>
                     </View>
+
+
+
+                    {/* Inline date picker (calendar) */}
+                    {datePickerOpen ? (
+                      <View style={[styles.inlinePickerCard, { marginTop: 12 }]}>
+                        <View style={styles.inlinePickerHeaderRow}>
+                          <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>
+                            {activeDateField === 'finalDate' ? 'Event date' : 'Trial date'}
+                          </Text>
+                          <View style={styles.inlinePickerHeaderActions}>
+                            <TouchableOpacity
+                              style={styles.inlinePickerActionBtn}
+                              activeOpacity={0.9}
+                              onPress={clearActiveDate}
+                              accessibilityRole="button"
+                            >
+                              <Text style={styles.inlinePickerActionText}>Clear</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={styles.inlinePickerCloseBtn}
+                              activeOpacity={0.9}
+                              onPress={closeDatePicker}
+                              accessibilityRole="button"
+                            >
+                              <Ionicons name="close" size={18} color="#111111" />
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+
+                        <View style={styles.calendarHeaderRow}>
+                          <TouchableOpacity
+                            style={styles.calendarNavBtn}
+                            onPress={() => shiftCalendarMonth(-1)}
+                            accessibilityRole="button"
+                          >
+                            <Ionicons name="chevron-back" size={18} color="#111111" />
+                          </TouchableOpacity>
+
+                          <Text style={styles.calendarMonthText}>
+                            {MONTH_NAMES[calendarMonth]} {calendarYear}
+                          </Text>
+
+                          <TouchableOpacity
+                            style={styles.calendarNavBtn}
+                            onPress={() => shiftCalendarMonth(1)}
+                            accessibilityRole="button"
+                          >
+                            <Ionicons name="chevron-forward" size={18} color="#111111" />
+                          </TouchableOpacity>
+                        </View>
+
+                        <View style={styles.calendarDowRow}>
+                          {DOW_SHORT.map((d) => (
+                            <Text key={d} style={styles.calendarDowText}>
+                              {d}
+                            </Text>
+                          ))}
+                        </View>
+
+                        <View style={styles.calendarGrid}>
+                          {calendarWeeks.map((week, wi) => (
+                            <View key={`w_${wi}`} style={styles.calendarWeekRow}>
+                              {week.map((day, di) => {
+                                if (!day) return <View key={`c_${wi}_${di}`} style={styles.calendarDayCell} />;
+                                const ymd = ymdFromParts(calendarYear, calendarMonth, day);
+                                const selected = !!activeDateValue && ymd === activeDateValue;
+                                const isToday = ymd === todayYmd;
+                                return (
+                                  <TouchableOpacity
+                                    key={`d_${wi}_${di}`}
+                                    style={[
+                                      styles.calendarDayBtn,
+                                      selected ? styles.calendarDayBtnOn : null,
+                                      isToday && !selected ? styles.calendarDayBtnToday : null,
+                                    ]}
+                                    activeOpacity={0.9}
+                                    onPress={() => pickCalendarDay(day)}
+                                    accessibilityRole="button"
+                                  >
+                                    <Text style={[styles.calendarDayText, selected ? styles.calendarDayTextOn : null]}>
+                                      {day}
+                                    </Text>
+                                  </TouchableOpacity>
+                                );
+                              })}
+                            </View>
+                          ))}
+                        </View>
+
+                        <Text style={styles.calendarHint}>Tap a day to set the date.</Text>
+                      </View>
+                    ) : null}
+
+                    {/* Inline time picker (wheel) */}
+                    {timePickerOpen ? (
+                      <View style={[styles.inlinePickerCard, { marginTop: 12 }]}>
+                        <View style={styles.inlinePickerHeaderRow}>
+                          <View style={styles.inlinePickerHeaderLeft}>
+                            <Text style={[styles.sectionTitle, { marginBottom: 0, fontSize: 13 }]}>
+                              {activeTimeField === 'finalTime' ? 'Event time' : 'Trial time'}
+                            </Text>
+
+                            <View style={styles.ampmHeaderRow}>
+                              {(['AM', 'PM'] as const).map((v) => {
+                                const on = timeAmPm === v;
+                                return (
+                                  <TouchableOpacity
+                                    key={v}
+                                    style={[styles.ampmBtn, styles.ampmBtnHeader, on ? styles.ampmBtnOn : null]}
+                                    activeOpacity={0.9}
+                                    onPress={() => setTimeAmPm(v)}
+                                    accessibilityRole="button"
+                                  >
+                                    <Text style={[styles.ampmText, on ? styles.ampmTextOn : null]}>{v}</Text>
+                                  </TouchableOpacity>
+                                );
+                              })}
+                            </View>
+                          </View>
+
+                          <View style={styles.inlinePickerHeaderActions}>
+                            <TouchableOpacity
+                              style={styles.inlinePickerActionBtn}
+                              activeOpacity={0.9}
+                              onPress={clearActiveTime}
+                              accessibilityRole="button"
+                            >
+                              <Text style={styles.inlinePickerActionText}>Clear</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={styles.inlinePickerActionBtn}
+                              activeOpacity={0.9}
+                              onPress={commitTime}
+                              accessibilityRole="button"
+                            >
+                              <Text style={styles.inlinePickerActionText}>Set</Text>
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+
+                        <View style={styles.timeWheelWrap}>
+                          <ScrollView
+                            ref={hourWheelRef as any}
+                            showsVerticalScrollIndicator={false}
+                            snapToInterval={WHEEL_ROW_HEIGHT}
+                            decelerationRate="fast"
+                            bounces={false}
+                            nestedScrollEnabled
+                            onStartShouldSetResponderCapture={() => true}
+                            onMoveShouldSetResponderCapture={() => true}
+                            contentContainerStyle={{ paddingVertical: WHEEL_SPACER_HEIGHT }}
+                            onMomentumScrollEnd={(e) => {
+                              const y = e.nativeEvent.contentOffset.y;
+                              const idx = Math.max(0, Math.min(11, Math.round(y / WHEEL_ROW_HEIGHT)));
+                              setTimeHour12(hours12[idx] ?? 1);
+                            }}
+                            onScrollEndDrag={(e) => {
+                              const y = e.nativeEvent.contentOffset.y;
+                              const idx = Math.max(0, Math.min(11, Math.round(y / WHEEL_ROW_HEIGHT)));
+                              setTimeHour12(hours12[idx] ?? 1);
+                            }}
+                            style={styles.timeWheelCol}
+                          >
+                            {hours12.map((h) => {
+                              const on = h === timeHour12;
+                              return (
+                                <View key={`h_${h}`} style={styles.wheelRow}>
+                                  <Text style={[styles.wheelText, on ? styles.wheelTextOn : null]}>{pad2(h)}</Text>
+                                </View>
+                              );
+                            })}
+                          </ScrollView>
+
+                          <Text style={styles.timeWheelColon}>:</Text>
+
+                          <ScrollView
+                            ref={minuteWheelRef as any}
+                            showsVerticalScrollIndicator={false}
+                            snapToInterval={WHEEL_ROW_HEIGHT}
+                            decelerationRate="fast"
+                            bounces={false}
+                            nestedScrollEnabled
+                            onStartShouldSetResponderCapture={() => true}
+                            onMoveShouldSetResponderCapture={() => true}
+                            contentContainerStyle={{ paddingVertical: WHEEL_SPACER_HEIGHT }}
+                            onMomentumScrollEnd={(e) => {
+                              const y = e.nativeEvent.contentOffset.y;
+                              const idx = Math.max(0, Math.min(59, Math.round(y / WHEEL_ROW_HEIGHT)));
+                              setTimeMinute(idx);
+                            }}
+                            onScrollEndDrag={(e) => {
+                              const y = e.nativeEvent.contentOffset.y;
+                              const idx = Math.max(0, Math.min(59, Math.round(y / WHEEL_ROW_HEIGHT)));
+                              setTimeMinute(idx);
+                            }}
+                            style={styles.timeWheelCol}
+                          >
+                            {minutes.map((m) => {
+                              const on = m === timeMinute;
+                              return (
+                                <View key={`m_${m}`} style={styles.wheelRow}>
+                                  <Text style={[styles.wheelText, on ? styles.wheelTextOn : null]}>{pad2(m)}</Text>
+                                </View>
+                              );
+                            })}
+                          </ScrollView>
+
+                          <View pointerEvents="none" style={styles.wheelOverlay} />
+                        </View>
+
+                        {/* Removed hint text to reduce visual noise */}
+                      </View>
+                    ) : null}
 
                     <TouchableOpacity
                       style={styles.menuRow}
@@ -1686,8 +2079,16 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
                   <View style={styles.editorCard}>
                     <View style={styles.productsHeader}>
-                      <Text style={styles.sectionTitle}>Products</Text>
-                      <Text style={styles.productsMeta}>{(draft?.products || []).length}</Text>
+                      <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>Products</Text>
+                      <TouchableOpacity
+                        style={styles.productsAddBtn}
+                        activeOpacity={0.9}
+                        onPress={() => openKitPicker()}
+                        accessibilityRole="button"
+                        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                      >
+                        <Ionicons name="add" size={18} color="#111111" />
+                      </TouchableOpacity>
                     </View>
 
                     {(draft?.products || []).length === 0 ? (
@@ -1721,238 +2122,123 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                         })}
                       </View>
                     )}
-                  </View>
-                </ScrollView>
 
-                {/* Bottom bar (add product) */}
-                <View style={styles.inputBar}>
-                  <View style={styles.inputContainer}>
-                    <TextInput
-                      style={styles.textInput}
-                      value={newProductText}
-                      onChangeText={setNewProductText}
-                      placeholder="Add product…"
-                      placeholderTextColor="#999999"
-                      returnKeyType="done"
-                      onSubmitEditing={addProduct}
-                      blurOnSubmit={false}
-                    />
+                    {kitPickerOpen ? (
+                      <View style={styles.inlinePickerCard}>
+                        <View style={styles.kitHeaderRow}>
+                          <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>Add from kit</Text>
+                        </View>
 
-                    <TouchableOpacity
-                      style={styles.categoryInline}
-                      onPress={openCategoryPicker}
-                      accessibilityRole="button"
-                    >
-                      <Text style={styles.categoryInlineText}>{categoryLabel(newProductCategory)}</Text>
-                      <Ionicons name="chevron-down" size={14} color="#6b7280" style={{ marginLeft: 6 }} />
-                    </TouchableOpacity>
-
-                    <TouchableOpacity style={styles.iconButton} onPress={addProduct} accessibilityRole="button">
-                      <Ionicons name="add" size={20} color="#ffffff" />
-                    </TouchableOpacity>
-                  </View>
-                </View>
-
-                {/* Category picker (cross-platform) */}
-                <Modal
-                  visible={categoryPickerOpen}
-                  transparent
-                  animationType="fade"
-                  onRequestClose={() => setCategoryPickerOpen(false)}
-                >
-                  <TouchableWithoutFeedback onPress={() => setCategoryPickerOpen(false)}>
-                    <View style={styles.sheetBackdrop}>
-                      <TouchableWithoutFeedback onPress={() => {}}>
-                        <View style={styles.sheetContainer}>
-                          <Text style={styles.sheetTitle}>Category</Text>
-
-                          <View style={styles.sheetList}>
-                            <ScrollView
-                              style={styles.sheetScroll}
-                              showsVerticalScrollIndicator
-                              bounces={false}
-                              keyboardShouldPersistTaps="handled"
+                        <View style={styles.kitSearchPill}>
+                          <Ionicons name="search-outline" size={16} color="#6b7280" style={{ marginRight: 8 }} />
+                          <TextInput
+                            value={kitPickerSearch}
+                            onChangeText={setKitPickerSearch}
+                            placeholder="Search kit…"
+                            placeholderTextColor="#9ca3af"
+                            style={styles.kitSearchInput}
+                            autoCorrect={false}
+                            returnKeyType="search"
+                          />
+                          {kitPickerSearch.trim() ? (
+                            <TouchableOpacity
+                              style={styles.kitSearchClear}
+                              onPress={() => setKitPickerSearch('')}
+                              accessibilityRole="button"
                             >
-                              {kitlogCategories.map((name, idx) => {
-                                const on = newProductCategory === name;
-                                const isLast = idx === kitlogCategories.length - 1;
+                              <Ionicons name="close-circle" size={18} color="#9ca3af" />
+                            </TouchableOpacity>
+                          ) : null}
+                        </View>
+
+                        <ScrollView
+                          horizontal
+                          showsHorizontalScrollIndicator={false}
+                          contentContainerStyle={styles.kitCategoryRow}
+                          keyboardShouldPersistTaps="handled"
+                        >
+                          {[KIT_PICKER_ALL, ...kitlogCategories].map((cat) => {
+                            const label = cat === KIT_PICKER_ALL ? 'All' : cat;
+                            const on = kitPickerCategory === cat;
+                            return (
+                              <TouchableOpacity
+                                key={cat}
+                                style={[styles.pillBtn, on ? styles.pillBtnOn : null]}
+                                onPress={() => setKitPickerCategory(cat)}
+                                activeOpacity={0.9}
+                                accessibilityRole="button"
+                              >
+                                <Text style={[styles.pillBtnText, on ? styles.pillBtnTextOn : null]}>{label}</Text>
+                              </TouchableOpacity>
+                            );
+                          })}
+                        </ScrollView>
+
+                        <View style={[styles.sheetList, { marginTop: 12, borderWidth: 0 }]}>
+                          <ScrollView
+                            style={styles.kitListScroll}
+                            showsVerticalScrollIndicator
+                            bounces={false}
+                            keyboardShouldPersistTaps="handled"
+                            nestedScrollEnabled
+                          >
+                            {kitPickerVisibleItems.length === 0 ? (
+                              <View style={styles.kitEmptyRow}>
+                                <Text style={styles.kitEmptyText}>No items found.</Text>
+                              </View>
+                            ) : (
+                              kitPickerVisibleItems.map((it, idx) => {
+                                const isLast = idx === kitPickerVisibleItems.length - 1;
+                                const brand = (it.brand || '').trim();
+                                const nm = (it.name || '').trim();
+                                const title =
+                                  brand && nm && !nm.toLowerCase().includes(brand.toLowerCase()) ? `${brand} ${nm}` : nm;
+                                const metaParts: string[] = [];
+                                if (it.category) metaParts.push(it.category);
+                                if (it.shade) metaParts.push(it.shade);
+                                const meta = metaParts.join(' • ');
+                                const added = addedKitIds.has(it.id);
+
                                 return (
-                                  <View key={name}>
+                                  <View key={it.id}>
                                     <TouchableOpacity
-                                      style={styles.sheetRow}
+                                      style={styles.kitRow}
                                       activeOpacity={0.9}
-                                      onPress={() => {
-                                        setNewProductCategory(name);
-                                        setCategoryPickerOpen(false);
-                                      }}
+                                      onPress={() => addKitItemToDraft(it)}
                                       accessibilityRole="button"
                                     >
-                                      <Text style={styles.sheetRowText}>{name}</Text>
-                                      {on ? <Ionicons name="checkmark" size={18} color="#111111" /> : null}
+                                      <View style={{ flex: 1, paddingRight: 10 }}>
+                                        <Text style={styles.kitRowName} numberOfLines={2}>
+                                          {title || it.name}
+                                        </Text>
+                                        {meta ? (
+                                          <Text style={styles.kitRowMeta} numberOfLines={1}>
+                                            {meta}
+                                          </Text>
+                                        ) : null}
+                                      </View>
+                                      {added ? (
+                                        <Ionicons name="checkmark" size={18} color="#111111" />
+                                      ) : (
+                                        <Ionicons name="add" size={18} color="#111111" />
+                                      )}
                                     </TouchableOpacity>
                                     {!isLast ? <View style={styles.sheetDivider} /> : null}
                                   </View>
                                 );
-                              })}
-                            </ScrollView>
-                          </View>
-
-                          <TouchableOpacity
-                            style={styles.sheetCancel}
-                            activeOpacity={0.9}
-                            onPress={() => setCategoryPickerOpen(false)}
-                            accessibilityRole="button"
-                          >
-                            <Text style={styles.sheetCancelText}>Cancel</Text>
-                          </TouchableOpacity>
+                              })
+                            )}
+                          </ScrollView>
                         </View>
-                      </TouchableWithoutFeedback>
-                    </View>
-                  </TouchableWithoutFeedback>
-                </Modal>
+                      </View>
+                    ) : null}
 
-                {/* Kit picker (add from inventory) */}
-<Modal
-  visible={kitPickerOpen}
-  animationType="slide"
-  presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
-  onRequestClose={() => setKitPickerOpen(false)}
->
-  <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-    <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
-      <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
-        <View style={styles.modalHeader}>
-          <TouchableOpacity
-            style={styles.modalBack}
-            onPress={() => setKitPickerOpen(false)}
-            accessibilityRole="button"
-          >
-            <Ionicons name="chevron-back" size={20} color="#111111" />
-            <Text style={styles.modalBackText}>Client</Text>
-          </TouchableOpacity>
+                  </View>
+                </ScrollView>
 
-          <TouchableOpacity
-            style={styles.modalClear}
-            onPress={() => setKitPickerOpen(false)}
-            accessibilityRole="button"
-          >
-            <Text style={styles.modalClearText}>Done</Text>
-          </TouchableOpacity>
-        </View>
-
-        <ScrollView
-          style={{ flex: 1 }}
-          contentContainerStyle={{ paddingTop: 12, paddingBottom: 24 }}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-        >
-          <View style={styles.editorCard}>
-            <Text style={styles.sectionTitle}>Add from kit</Text>
-
-            <View style={styles.kitSearchPill}>
-              <Ionicons name="search-outline" size={16} color="#6b7280" style={{ marginRight: 8 }} />
-              <TextInput
-                value={kitPickerSearch}
-                onChangeText={setKitPickerSearch}
-                placeholder="Search kit…"
-                placeholderTextColor="#9ca3af"
-                style={styles.kitSearchInput}
-                autoCorrect={false}
-                returnKeyType="search"
-              />
-              {kitPickerSearch.trim() ? (
-                <TouchableOpacity
-                  style={styles.kitSearchClear}
-                  onPress={() => setKitPickerSearch('')}
-                  accessibilityRole="button"
-                >
-                  <Ionicons name="close-circle" size={18} color="#9ca3af" />
-                </TouchableOpacity>
-              ) : null}
-            </View>
-
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.kitCategoryRow}
-              keyboardShouldPersistTaps="handled"
-            >
-              {[KIT_PICKER_ALL, ...kitlogCategories].map((cat) => {
-                const label = cat === KIT_PICKER_ALL ? 'All' : cat;
-                const on = kitPickerCategory === cat;
-                return (
-                  <TouchableOpacity
-                    key={cat}
-                    style={[styles.pillBtn, on ? styles.pillBtnOn : null]}
-                    onPress={() => setKitPickerCategory(cat)}
-                    activeOpacity={0.9}
-                    accessibilityRole="button"
-                  >
-                    <Text style={[styles.pillBtnText, on ? styles.pillBtnTextOn : null]}>{label}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-
-            <View style={[styles.sheetList, { marginTop: 12 }]}>
-              {kitPickerVisibleItems.length === 0 ? (
-                <View style={styles.kitEmptyRow}>
-                  <Text style={styles.kitEmptyText}>No items found.</Text>
-                </View>
-              ) : (
-                kitPickerVisibleItems.map((it, idx) => {
-                  const isLast = idx === kitPickerVisibleItems.length - 1;
-                  const brand = (it.brand || '').trim();
-                  const nm = (it.name || '').trim();
-                  const title =
-                    brand && nm && !nm.toLowerCase().includes(brand.toLowerCase())
-                      ? `${brand} ${nm}`
-                      : nm;
-                  const metaParts: string[] = [];
-                  if (it.category) metaParts.push(it.category);
-                  if (it.shade) metaParts.push(it.shade);
-                  const meta = metaParts.join(' • ');
-                  const added = addedKitIds.has(it.id);
-
-                  return (
-                    <View key={it.id}>
-                      <TouchableOpacity
-                        style={styles.kitRow}
-                        activeOpacity={0.9}
-                        onPress={() => addKitItemToDraft(it)}
-                        accessibilityRole="button"
-                      >
-                        <View style={{ flex: 1, paddingRight: 10 }}>
-                          <Text style={styles.kitRowName} numberOfLines={2}>
-                            {title || it.name}
-                          </Text>
-                          {meta ? (
-                            <Text style={styles.kitRowMeta} numberOfLines={1}>
-                              {meta}
-                            </Text>
-                          ) : null}
-                        </View>
-                        {added ? (
-                          <Ionicons name="checkmark" size={18} color="#111111" />
-                        ) : (
-                          <Ionicons name="add" size={18} color="#111111" />
-                        )}
-                      </TouchableOpacity>
-                      {!isLast ? <View style={styles.sheetDivider} /> : null}
-                    </View>
-                  );
-                })
-              )}
-            </View>
-          </View>
-        </ScrollView>
-      </View>
-    </SafeAreaView>
-  </TouchableWithoutFeedback>
-</Modal>
               </View>
             </SafeAreaView>
-          </TouchableWithoutFeedback>
+
         </Modal>
 
       </SafeAreaView>
@@ -2032,7 +2318,7 @@ const styles = StyleSheet.create({
     alignItems: 'baseline',
     justifyContent: 'space-between',
     marginBottom: 10,
-    paddingRight: 10,
+    paddingRight: 4,
   },
   listHeaderTitle: {
     fontSize: 13,
@@ -2058,7 +2344,7 @@ const styles = StyleSheet.create({
   listHeaderDivider: {
     marginTop: 13,
     marginBottom: 26,
-    marginRight: 10,
+    marginRight: 4,
     backgroundColor: '#d1d5db',
   },
 
@@ -2203,6 +2489,46 @@ const styles = StyleSheet.create({
     marginTop: 12,
     alignItems: 'flex-end',
   },
+  dateTimeBoxWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  dateTimeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    overflow: 'hidden',
+  },
+  dateTimePart: {
+    flex: 1,
+    minWidth: 0,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  dateTimePartTime: {
+    width: 76,
+    minWidth: 68,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dateTimeDivider: {
+    width: StyleSheet.hairlineWidth,
+    height: '100%',
+    backgroundColor: '#e5e7eb',
+  },
+  dateTimeValue: {
+    fontSize: 13,
+    color: '#111111',
+    fontWeight: '400',
+  },
+  dateTimeValueMuted: {
+    color: '#9ca3af',
+  },
   dateTimeGroup: {
     flex: 1,
     minWidth: 0,
@@ -2270,6 +2596,223 @@ const styles = StyleSheet.create({
     borderColor: '#e5e7eb',
     borderRadius: 14,
     backgroundColor: '#ffffff',
+  },
+
+  // Inline picker panels (inside the client editor)
+  inlinePickerCard: {
+    marginTop: 12,
+    borderWidth: 0,
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 0,
+    paddingVertical: 12,
+  },
+  inlinePickerHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  inlinePickerHeaderLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexShrink: 1,
+  },
+  ampmHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 10,
+  },
+  ampmBtnHeader: {
+    marginVertical: 0,
+    marginHorizontal: 4,
+    width: 44,
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+  },
+  inlinePickerHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  inlinePickerActionBtn: {
+    paddingHorizontal: 10,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  inlinePickerActionText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  inlinePickerCloseBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // Calendar picker
+  calendarHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  calendarNavBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+  },
+  calendarMonthText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111111',
+  },
+  calendarDowRow: {
+    flexDirection: 'row',
+    marginBottom: 6,
+  },
+  calendarDowText: {
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '500',
+    color: '#6b7280',
+    textAlign: 'center',
+  },
+  calendarGrid: {
+    borderWidth: 0,
+    borderRadius: 16,
+    overflow: 'hidden',
+    backgroundColor: '#ffffff',
+  },
+  calendarWeekRow: {
+    flexDirection: 'row',
+  },
+  calendarDayCell: {
+    flex: 1,
+    height: 44,
+  },
+  calendarDayBtn: {
+    flex: 1,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  calendarDayBtnOn: {
+    backgroundColor: '#111111',
+  },
+  calendarDayBtnToday: {
+    borderWidth: 1,
+    borderColor: '#111111',
+  },
+  calendarDayText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#111111',
+  },
+  calendarDayTextOn: {
+    color: '#ffffff',
+  },
+  calendarHint: {
+    marginTop: 10,
+    fontSize: 12,
+    color: '#6b7280',
+  },
+
+  // Time wheel picker
+  modalHeaderRightRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  timeWheelWrap: {
+    position: 'relative',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 0,
+    borderRadius: 18,
+    overflow: 'hidden',
+    backgroundColor: '#ffffff',
+    height: WHEEL_ROW_HEIGHT * WHEEL_VISIBLE_ROWS,
+  },
+  timeWheelCol: {
+    width: 96,
+    height: WHEEL_ROW_HEIGHT * WHEEL_VISIBLE_ROWS,
+  },
+  timeWheelColon: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#111111',
+    paddingHorizontal: 6,
+  },
+  wheelRow: {
+    height: WHEEL_ROW_HEIGHT,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  wheelText: {
+    fontSize: 18,
+    color: '#6b7280',
+    fontWeight: '500',
+  },
+  wheelTextOn: {
+    color: '#111111',
+    fontWeight: '600',
+  },
+  wheelOverlay: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: WHEEL_SPACER_HEIGHT,
+    height: WHEEL_ROW_HEIGHT,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: 'rgba(0,0,0,0.02)',
+  },
+
+  ampmCol: {
+    width: AMPM_COL_WIDTH,
+    height: WHEEL_ROW_HEIGHT * WHEEL_VISIBLE_ROWS,
+    borderLeftWidth: 1,
+    borderLeftColor: '#e5e7eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 6,
+    backgroundColor: '#ffffff',
+  },
+  ampmBtn: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    marginVertical: 4,
+    backgroundColor: '#ffffff',
+    width: AMPM_COL_WIDTH - 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ampmBtnOn: {
+    borderColor: '#111111',
+    backgroundColor: 'rgba(0,0,0,0.03)',
+  },
+  ampmText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#6b7280',
+    letterSpacing: 0.4,
+  },
+  ampmTextOn: {
+    color: '#111111',
   },
 
   menuRow: {
@@ -2377,9 +2920,16 @@ const styles = StyleSheet.create({
   // Products
   productsHeader: {
     flexDirection: 'row',
-    alignItems: 'baseline',
+    alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 8,
+  },
+  productsAddBtn: {
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: -4,
   },
   productsMeta: {
     fontSize: 13,
