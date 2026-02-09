@@ -255,7 +255,15 @@ function AppTabsShell({
           },
         }}
       >
-        {(props: any) => <Upload {...props} email={userEmail} userId={userId} token={token} />}
+        {(props: any) => (
+          <Upload
+            {...props}
+            email={userEmail}
+            userId={userId}
+            token={token}
+            onLogout={onLogout}
+          />
+        )}
       </Tabs.Screen>
 
       <Tabs.Screen

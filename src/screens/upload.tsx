@@ -162,6 +162,7 @@ type UploadScreenProps = {
   email?: string | null;
   userId?: string | number | null;
   token?: string | null;
+  onLogout?: () => void;
 };
 
 type PickedPhoto = {
@@ -801,7 +802,7 @@ function formatChatDate(iso: string): string {
 }
 
 
-const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId, token }) => {
+const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId, token, onLogout }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = useMemo(() => {
     const stable = String(userId ?? '').trim();
@@ -816,6 +817,37 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const chatKey = useMemo(() => makeScopedKey(CHAT_HISTORY_KEY, scope), [scope]);
 
   const tokenTrimmed = String(token ?? '').trim();
+
+  const sessionExpiredRef = useRef(false);
+
+  const maybeHandleUnauthorized = (status: number, msg: string): boolean => {
+    const m = String(msg || '').trim();
+    const looksUnauthorized =
+      status === 401 ||
+      status === 403 ||
+      /invalid or expired session/i.test(m) ||
+      /missing authorization token/i.test(m) ||
+      /unauthor/i.test(m);
+
+    if (!looksUnauthorized) return false;
+    if (sessionExpiredRef.current) return true;
+    sessionExpiredRef.current = true;
+
+    Alert.alert('Session expired', 'Please log in again.', [
+      {
+        text: 'OK',
+        onPress: () => {
+          try {
+            onLogout?.();
+          } catch {
+            // ignore
+          }
+        },
+      },
+    ]);
+
+    return true;
+  };
 
   // Safe-area insets can report 0 the first time a RN <Modal> is mounted.
   // Use Constants.statusBarHeight as an immediate fallback so the “Your scans” sheet
@@ -862,7 +894,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
   const [photoPicking, setPhotoPicking] = useState(false);
 
-  // Discover flow (manual undertone/season -> category -> type -> 1-2 product recs)
+  // Discover flow (manual undertone/season -> category -> type -> product rec)
   const [discoverOpen, setDiscoverOpen] = useState(false);
   const [discoverStep, setDiscoverStep] = useState<'tone' | 'category' | 'type' | 'results'>('tone');
   const [discoverTone, setDiscoverTone] = useState<DiscoverTone | null>(null);
@@ -870,7 +902,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [discoverCategory, setDiscoverCategory] = useState<DiscoverCategory | null>(null);
   const [discoverType, setDiscoverType] = useState<string | null>(null);
   const [discoverLoading, setDiscoverLoading] = useState(false);
-  const [discoverResults, setDiscoverResults] = useState<Array<{ name: string; why?: string }>>([]);
+  const [discoverResults, setDiscoverResults] = useState<Array<{ name: string; shade?: string }>>([]);
 
   // When returning from the Camera screen, it passes a `capturedPhoto` param.
   // Consume it once and immediately trigger analysis.
@@ -1179,6 +1211,8 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
             season: discoverSeason,
             category: discoverCategory,
             productType: type,
+            tone_number: typeof (analysis as any)?.tone_number === 'number' ? (analysis as any).tone_number : undefined,
+            tone_depth: String((analysis as any)?.tone_depth || '').trim() || undefined,
           }),
         });
 
@@ -1190,6 +1224,13 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
           json = null;
         }
 
+        const errMsg = String(json?.error || json?.message || `HTTP ${resp.status}`);
+
+        // Token expired / invalid: force re-login.
+        if (maybeHandleUnauthorized(resp.status, errMsg)) {
+          return;
+        }
+
         // If this path doesn't exist on the server, try the next alias.
         if (resp.status === 404) {
           lastErr = new Error(`HTTP 404`);
@@ -1197,17 +1238,18 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         }
 
         if (!resp.ok || !json?.ok) {
-          throw new Error(String(json?.error || json?.message || `HTTP ${resp.status}`));
+          throw new Error(errMsg);
         }
 
         const list = Array.isArray(json?.products) ? json.products : [];
         const normalized = list
           .map((p: any) => ({
             name: String(p?.name || p?.product_name || '').trim(),
-            why: String(p?.why || p?.reason || '').trim() || undefined,
+            // Always prefer an explicit shade/variant label; we never show "why" text in Discover results.
+            shade: String(p?.shade || p?.color_name || p?.color || p?.variant || '').trim() || undefined,
           }))
           .filter((p: any) => !!p.name)
-          .slice(0, 2);
+          .slice(0, 1);
 
         setDiscoverResults(normalized);
         setDiscoverStep('results');
@@ -1223,7 +1265,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     }
   };
 
-  const addDiscoverItemToKit = async (productName: string) => {
+  const addDiscoverItemToKit = async (productName: string, shade?: string) => {
     const name = String(productName || '').trim();
     if (!name) return;
     const category = discoverCategory;
@@ -1271,6 +1313,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     const nextItem = {
       id: uid('item'),
       name,
+      shade: String(shade || '').trim() || undefined,
       subcategory,
       status: 'inKit',
       notes: 'Added from Discover',
@@ -1553,6 +1596,10 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       if (!res.ok || data?.ok === false) {
         const code = String(data?.code || '').trim();
         const msg = String(data?.error || `HTTP ${res.status}`);
+
+        if (maybeHandleUnauthorized(res.status, msg)) {
+          return;
+        }
 
         if (res.status === 422 && code === 'NO_HUMAN_FACE') {
           Alert.alert('No human face detected', msg);
@@ -1878,6 +1925,10 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         });
 
         const json = await resp.json().catch(() => null);
+        const errMsg = String(json?.error || json?.message || `HTTP ${resp.status}`);
+        if (maybeHandleUnauthorized(resp.status, errMsg)) {
+          return;
+        }
         if (resp.ok && json?.ok && typeof json?.text === 'string') {
           serverText = String(json.text || '').trim();
         }
@@ -2044,7 +2095,11 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data?.ok === false) {
-        throw new Error(data?.error || `HTTP ${res.status}`);
+        const errMsg = String(data?.error || data?.message || `HTTP ${res.status}`);
+        if (maybeHandleUnauthorized(res.status, errMsg)) {
+          return;
+        }
+        throw new Error(errMsg);
       }
 
       const replyText = String(data?.reply || '').trim();
@@ -2284,12 +2339,12 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                           {discoverResults.map((p) => (
                             <View key={p.name} style={styles.discoverResultCard}>
                               <Text style={styles.discoverResultName}>{p.name}</Text>
-                              {p.why ? <Text style={styles.discoverResultWhy}>{p.why}</Text> : null}
+                              {p.shade ? <Text style={styles.discoverResultWhy}>{p.shade}</Text> : null}
 
                               <TouchableOpacity
                                 style={styles.discoverAddBtn}
                                 onPress={() => {
-                                  void addDiscoverItemToKit(p.name);
+                                  void addDiscoverItemToKit(p.name, p.shade);
                                 }}
                                 accessibilityRole="button"
                               >
@@ -2301,14 +2356,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                       ) : (
                         <Text style={styles.discoverEmptyText}>No recommendations yet.</Text>
                       )}
-
-                      <TouchableOpacity
-                        style={styles.discoverSecondaryBtn}
-                        onPress={() => setDiscoverStep('type')}
-                        accessibilityRole="button"
-                      >
-                        <Text style={styles.discoverSecondaryBtnText}>Back</Text>
-                      </TouchableOpacity>
 
                       <TouchableOpacity
                         style={[styles.discoverPrimaryBtn, { marginTop: 10 }]}

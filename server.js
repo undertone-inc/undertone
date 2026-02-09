@@ -1345,6 +1345,9 @@ const APIFY_MIN_SHADES_THRESHOLD = Math.max(1, Math.min(50, Number(process.env.A
 const SHADE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const shadeCache = new Map(); // url -> { fetchedAt: number, shades: Array<{ value: string, desc?: string }> }
 
+const PRODUCT_TITLE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const productTitleCache = new Map(); // url -> { fetchedAt: number, title: string }
+
 function normalizeUndertoneKeyServer(raw) {
   const s = String(raw || "").trim().toLowerCase();
   if (s === "cool" || s === "neutral-cool" || s === "neutral" || s === "neutral-warm" || s === "warm") return s;
@@ -1414,6 +1417,72 @@ function normalizeRetailerUrl(urlStr) {
     return String(urlStr || "").trim();
   }
 }
+
+function decodeHtmlEntities(str) {
+  const s = String(str || "");
+  if (!s) return "";
+  return s
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => {
+      const code = parseInt(h, 16);
+      return Number.isFinite(code) ? String.fromCharCode(code) : _;
+    })
+    .replace(/&#(\d+);/g, (_, n) => {
+      const code = parseInt(n, 10);
+      return Number.isFinite(code) ? String.fromCharCode(code) : _;
+    })
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function extractSephoraProductTitleFromHtml(html) {
+  const s = String(html || "");
+  if (!s) return "";
+
+  const og =
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i.exec(s) ||
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["'][^>]*>/i.exec(s);
+
+  let title = og?.[1] ? decodeHtmlEntities(og[1]) : "";
+
+  if (!title) {
+    const t = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(s);
+    title = t?.[1] ? decodeHtmlEntities(String(t[1]).replace(/<[^>]*>/g, " ")) : "";
+  }
+
+  title = compactSpaces(title);
+  title = title.replace(/\s*\|\s*Sephora.*$/i, "").trim();
+  return title;
+}
+
+async function getSephoraProductTitle(url) {
+  const uRaw = String(url || "").trim();
+  if (!uRaw) return "";
+  const u = normalizeRetailerUrl(uRaw);
+
+  const cached = productTitleCache.get(u);
+  const now = Date.now();
+  if (cached && cached.title && now - (cached.fetchedAt || 0) < PRODUCT_TITLE_CACHE_TTL_MS) {
+    return String(cached.title || "");
+  }
+
+  try {
+    const html = await fetchHtml(u);
+    const title = extractSephoraProductTitleFromHtml(html);
+    if (title) {
+      productTitleCache.set(u, { fetchedAt: now, title });
+      return title;
+    }
+  } catch {
+    // ignore
+  }
+
+  return "";
+}
+
 
 
 async function fetchJsonPost(url, bodyObj, extraHeaders = {}) {
@@ -3088,16 +3157,55 @@ async function resolveSephoraProductUrlByName(name) {
     for (const m of html.matchAll(reAny)) push(m?.[1]);
   }
 
-  // Pick the first unique candidate.
+  // Rank candidates by how well they match the query and prefer CA-EN.
+  const uniq = [];
   const seen = new Set();
-  const first = candidates.find((p) => {
-    const u = normalizeRetailerUrl(new URL(p, "https://www.sephora.com").toString());
-    if (seen.has(u)) return false;
-    seen.add(u);
-    return true;
-  });
+  for (const p of candidates) {
+    try {
+      const u = normalizeRetailerUrl(new URL(String(p || ""), "https://www.sephora.com").toString());
+      if (seen.has(u)) continue;
+      seen.add(u);
+      uniq.push(u);
+    } catch {
+      // ignore bad URLs
+    }
+  }
 
-  const resolved = first ? normalizeRetailerUrl(new URL(first, "https://www.sephora.com").toString()) : "";
+  const tokenize = (txt) => {
+    const stop = new Set(["the", "and", "with", "for", "by", "of", "a", "an", "to", "in", "on", "at", "from"]);
+    return String(txt || "")
+      .toLowerCase()
+      .replace(/&/g, " ")
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(" ")
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3 && !stop.has(t));
+  };
+
+  const tokens = tokenize(key);
+
+  const scoreUrl = (u) => {
+    const low = String(u || "").toLowerCase();
+    let score = 0;
+
+    if (low.includes("/ca/en/product/")) score += 5;
+    if (low.includes("/product/")) score += 1;
+    if (/\b-p\d+\b/i.test(low)) score += 2;
+
+    for (const t of tokens) {
+      if (t && low.includes(t)) score += 1;
+    }
+
+    // Prefer shorter urls when scores tie.
+    score -= Math.min(3, Math.floor(low.length / 160));
+    return score;
+  };
+
+  const best = uniq
+    .map((u) => ({ u, score: scoreUrl(u) }))
+    .sort((a, b) => (b.score - a.score) || (a.u.length - b.u.length))[0];
+
+  const resolved = best?.u ? String(best.u) : "";
   if (resolved) productUrlCache.set(kLow, { url: resolved, fetchedAt: now });
   return resolved;
 }
@@ -3646,6 +3754,138 @@ user_location: { type: "approximate", country: "CA", timezone: "America/Vancouve
 
   // If everything fails, treat as unavailable.
   return "(unavailable)";
+}
+
+
+async function callOpenAIChooseSephoraShadeForProduct({
+  productUrl,
+  categoryTitle,
+  undertone,
+  season,
+  toneDepth,
+  toneNumber,
+}) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY on server");
+  }
+
+  const url = String(productUrl || "").trim();
+  if (!url) return null;
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      product_name: { type: "string" },
+      shade: { type: "string" },
+    },
+    required: ["shade"],
+  };
+
+  const undertoneTxt = String(undertone || "neutral").trim();
+  const seasonTxt = String(season || "summer").trim();
+  const depthTxt = String(toneDepth || "").trim();
+  const numberTxt =
+    typeof toneNumber === "number" && Number.isFinite(toneNumber)
+      ? String(toneNumber)
+      : String(toneNumber || "").trim();
+  const categoryTxt = String(categoryTitle || "").trim() || "makeup";
+
+  const systemPrompt =
+    "You are a professional makeup artist assistant." +
+    " Use ONLY Sephora (sephora.com) via web search." +
+    " Open the provided Sephora product URL." +
+    " Find the available Color/Shade options on that page (from the selector/swatches or the visible 'Color:'/'Shade:' line)." +
+    " Choose the SINGLE best shade option for the person." +
+    " You MUST return an exact shade name that appears on the Sephora page for that product. Do NOT guess or invent shade names." +
+    " If you cannot see the full swatch list, you may use the visible currently-selected 'Color:'/'Shade:' value (it is still a valid option)." +
+    " Output JSON only.";
+
+  const userPrompt =
+    `Product URL: ${url}
+` +
+    `Category: ${categoryTxt}
+` +
+    `Person attributes:
+` +
+    `- undertone: ${undertoneTxt}
+` +
+    `- season: ${seasonTxt}
+` +
+    (depthTxt ? `- depth: ${depthTxt}
+` : "") +
+    (numberTxt ? `- tone_number (approx 1-10): ${numberTxt}
+` : "");
+
+  const models = recsModelCandidates();
+  let lastErr = null;
+
+  for (const model of models) {
+    const payload = {
+      model,
+      reasoning: { effort: "low" },
+      tools: [
+        {
+          type: "web_search",
+          filters: { allowed_domains: ["sephora.com"] },
+          user_location: { type: "approximate", country: "CA", timezone: "America/Vancouver" },
+        },
+      ],
+      tool_choice: "auto",
+      max_tool_calls: Math.max(4, Math.min(10, OPENAI_RECS_REPAIR_MAX_TOOL_CALLS || 8)),
+      max_output_tokens: 160,
+      parallel_tool_calls: false,
+      instructions: systemPrompt,
+      input: userPrompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "undertone_sephora_shade_picker",
+          strict: true,
+          schema,
+        },
+      },
+    };
+
+    try {
+      let data;
+      try {
+        ({ data } = await openaiResponsesCreateRaw(payload, { retries: 3, label: `recs:shade:${model}` }));
+      } catch (e) {
+        const status = Number(e?.status || 0);
+        const msg = String(e?.message || e);
+        const isTransient =
+          status === 429 ||
+          (status >= 500 && status <= 599) ||
+          /processing your request/i.test(msg);
+
+        if (isTransient) {
+          ({ data } = await openaiResponsesCreateRaw(payload, { retries: 1, label: `recs:shade:${model}:live` }));
+        } else {
+          throw e;
+        }
+      }
+
+      const { text: outText, refusal } = extractOutputText(data);
+      if (refusal) throw new Error(refusal);
+      if (!outText) return null;
+
+      const parsed = JSON.parse(outText);
+      const shade = String(parsed?.shade || "").trim();
+      const product_name = String(parsed?.product_name || "").trim();
+      return { shade, product_name };
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[recs:shade] failed model=${model}:`, String(e?.message || e).slice(0, 240));
+      continue;
+    }
+  }
+
+  if (OPENAI_RECS_DEBUG) {
+    console.warn("callOpenAIChooseSephoraShadeForProduct failed:", String(lastErr?.message || lastErr).slice(0, 500));
+  }
+
+  return null;
 }
 
 
@@ -4207,10 +4447,14 @@ ${analysisSummaryLines.join("\n")}` });
 });
 
 // --- Discover recommendations (manual undertone/season flow) ---
-// Returns 1-2 product picks for a chosen category + type.
+// Returns 1 product pick for a chosen category + type.
 async function handleDiscoverRecommend(req, res) {
   try {
     const undertone = normalizeUndertoneKeyServer(req?.body?.undertone);
+
+    // Optional depth hints (improves foundation/concealer shade picking when a scan exists)
+    const toneNumber = req?.body?.tone_number;
+    const toneDepth = req?.body?.tone_depth;
 
     const seasonRaw = String(req?.body?.season || "").trim().toLowerCase();
     const season = seasonRaw === "spring" || seasonRaw === "summer" || seasonRaw === "autumn" || seasonRaw === "winter" ? seasonRaw : null;
@@ -4243,18 +4487,179 @@ async function handleDiscoverRecommend(req, res) {
 
     const candidateNames = uniqStringsLower(candidates).slice(0, 30);
 
-    // Default fallback: first 2 in the pool.
-    const fallbackPicks = candidateNames.slice(0, 2).map((name) => ({ name, why: "" }));
+    // Default fallback: first 1 in the pool.
+    const fallbackPicks = candidateNames.slice(0, 1).map((name) => ({ name, why: "" }));
+
+    // Enrich Discover picks with a Sephora shade/variant label.
+    // We do this on the server so the client can reliably render the exact shade name.
+    const discoverCategoryKey = String(categoryKey || "").trim().toLowerCase();
+    const discoverTypeKey = String(typeRaw || "").trim().toLowerCase();
+
+    const shadeGroupKey = (() => {
+      if (discoverCategoryKey === "base") return "foundation";
+      if (discoverCategoryKey === "cheeks") return "cheeks";
+      if (discoverCategoryKey === "eyes") return "eyes";
+      if (discoverCategoryKey === "lips") return "lips";
+      if (discoverCategoryKey === "sculpt") return "sculpt";
+      return "lips";
+    })();
+
+    const enrichWithShade = async (items, { fallbacks = [] } = {}) => {
+      const preferred = Array.isArray(items) ? items : [];
+
+      // Discover UI should show ONLY the Sephora shade/color name (no extra descriptive text).
+      // For example: "Fenty Glow" (not "Fenty Glow - shimmering rose nude").
+      const shadeNameOnly = (sh) => {
+        let v = compactSpaces(String(sh?.value || ""));
+        if (!v) return "";
+
+        // Sephora sometimes formats the displayed label like: "Whiskey - rich brown matte".
+        // Keep just the shade name.
+        const parts = v.split(" - ");
+        if (parts.length > 1 && parts[0] && parts[0].length <= 80) {
+          v = parts[0].trim();
+        }
+
+        return v;
+      };
+
+      // For shade ranking we reuse existing category logic where possible.
+      const shadePickCategory = shadeGroupKey === "sculpt" ? "cheeks" : shadeGroupKey;
+
+      // Build a priority list: preferred pick first, then fallbacks from the pool.
+      const priority = [];
+      const seen = new Set();
+      const push = (p) => {
+        const n = String(p?.name || p?.product_name || "").trim();
+        if (!n) return;
+        const k = n.toLowerCase();
+        if (seen.has(k)) return;
+        seen.add(k);
+        priority.push({ name: n, why: String(p?.why || "").trim() });
+      };
+
+      preferred.forEach(push);
+      (Array.isArray(fallbacks) ? fallbacks : []).forEach((n) => push({ name: n, why: "" }));
+
+      const pickShadeFromList = (shades) => {
+        const list = Array.isArray(shades) ? shades : [];
+        if (!list.length) return "";
+
+        const best = pickBestShadeForCategory({
+          shades: list,
+          category: shadePickCategory,
+          undertone,
+          season,
+          toneNumber,
+          toneDepth,
+        });
+
+        const chosen = best ? shadeNameOnly(best) : shadeNameOnly(list[0]);
+        return chosen;
+      };
+
+      for (const p of priority) {
+        const name = String(p?.name || "").trim();
+        if (!name) continue;
+
+        let url = String(PRODUCT_URLS?.[name] || "").trim();
+        if (!url) {
+          try {
+            url = await resolveSephoraProductUrlByName(name);
+          } catch {
+            url = "";
+          }
+        }
+
+        if (!url || !isAllowedRetailerUrl(url)) continue;
+        url = normalizeRetailerUrl(url);
+
+        // (1) Fast path: server-side extraction of real Sephora shades.
+        try {
+          const shades = await getSephoraShadesForUrl(url);
+          const shade = pickShadeFromList(shades);
+          if (shade) {
+            let title = "";
+            try {
+              title = await getSephoraProductTitle(url);
+            } catch {
+              title = "";
+            }
+
+            return [{ name: title || name, why: p.why, shade, product_url: url }];
+          }
+        } catch {
+          // fall through
+        }
+
+        // (2) OpenAI web_search fallback: choose a verifiable Sephora shade for this exact product.
+        if (OPENAI_API_KEY && OPENAI_RECS_REPAIR_ENABLED) {
+          try {
+            const picked = await callOpenAIChooseSephoraShadeForProduct({
+              productUrl: url,
+              categoryTitle: shadePickCategory,
+              undertone,
+              season,
+              toneDepth,
+              toneNumber,
+            });
+
+            const shadeRaw = String(picked?.shade || "").trim();
+            const productNameFromWeb = String(picked?.product_name || "").trim();
+
+            if (shadeRaw && !isUnavailableColorName(shadeRaw)) {
+              const shade = shadeNameOnly({ value: shadeRaw });
+              let title = productNameFromWeb;
+              if (!title) {
+                try {
+                  title = await getSephoraProductTitle(url);
+                } catch {
+                  title = "";
+                }
+              }
+              if (shade) {
+                return [{ name: title || name, why: p.why, shade, product_url: url }];
+              }
+            }
+          } catch {
+            // ignore
+          }
+
+          // (3) Last resort: extract the currently selected Color/Shade line (still real on Sephora).
+          try {
+            const displayed = await callOpenAIExtractSephoraDisplayedColor({ productUrl: url });
+            const d = String(displayed || "").trim();
+            if (d && !isUnavailableColorName(d)) {
+              const shade = shadeNameOnly({ value: d });
+              let title = "";
+              try {
+                title = await getSephoraProductTitle(url);
+              } catch {
+                title = "";
+              }
+              if (shade) {
+                return [{ name: title || name, why: p.why, shade, product_url: url }];
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      return [];
+    };
 
     if (!OPENAI_API_KEY) {
-      return res.json({ ok: true, products: fallbackPicks, source: "fallback" });
+      const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
+      return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
     const systemPrompt =
       "You are Undertone's product recommender. " +
       "Given a user's undertone (cool/neutral/warm) and optional color season (spring/summer/autumn/winter), " +
-      "choose 1-2 products from the provided candidate list that are most likely to suit them. " +
-      "Return ONLY strict JSON in this schema: {\"products\":[{\"name\":string,\"why\":string}]}. " +
+      "choose exactly 1 product from the provided candidate list that is most likely to suit them. " +
+      "Return ONLY strict JSON in this schema: {\"products\":[{\"name\":string,\"why\":string}]}. Always return exactly 1 product in the products array. " +
       "The name must exactly match one of the candidate strings. Keep why to one short sentence.";
 
     const userPromptLines = [];
@@ -4283,7 +4688,8 @@ async function handleDiscoverRecommend(req, res) {
       outText = String(extracted.text || "").trim();
     } catch (e) {
       // If the model call fails, fall back.
-      return res.json({ ok: true, products: fallbackPicks, source: "fallback" });
+      const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
+      return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
     let parsed = null;
@@ -4310,13 +4716,15 @@ async function handleDiscoverRecommend(req, res) {
         why: String(p?.why || "").trim(),
       }))
       .filter((p) => p.name && allow.has(p.name.toLowerCase()))
-      .slice(0, 2);
+      .slice(0, 1);
 
     if (!picks.length) {
-      return res.json({ ok: true, products: fallbackPicks, source: "fallback" });
+      const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
+      return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
-    return res.json({ ok: true, products: picks, source: "openai" });
+    const enriched = await enrichWithShade(picks, { fallbacks: candidateNames });
+    return res.json({ ok: true, products: enriched, source: "openai" });
   } catch (e) {
     console.error("discover-recommend error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });

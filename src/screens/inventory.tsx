@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   StyleSheet,
@@ -18,6 +18,7 @@ import {
 import Constants from 'expo-constants';
 import { SafeAreaView, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import { useFocusEffect } from '@react-navigation/native';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { DOC_KEYS, getString, makeScopedKey, setString } from '../localstore';
 import { PlanTier, PLAN_LIMITS } from '../api';
@@ -515,6 +516,7 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
   const [data, setData] = useState<KitLogData>({ version: 1, categories: defaultCategories() });
   const [hydrated, setHydrated] = useState(false);
   const persistTimer = useRef<any>(null);
+  const lastHydratedRawRef = useRef<string | null>(null);
   const editorScrollRef = useRef<any>(null);
 
   const [keyboardHeight, setKeyboardHeight] = useState(0);
@@ -583,6 +585,7 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
         const raw = await getString(storageKey);
         if (!alive) return;
         if (raw) {
+          lastHydratedRawRef.current = raw;
           const parsed = JSON.parse(raw);
           setData(normalizeData(parsed));
         }
@@ -596,7 +599,33 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
     return () => {
       alive = false;
     };
-  }, []);
+  }, [storageKey]);
+
+  // Rehydrate when returning to this tab so newly-added items (e.g. from Discover)
+  // appear immediately without needing an app restart.
+  useFocusEffect(
+    useCallback(() => {
+      let alive = true;
+      (async () => {
+        if (!hydrated) return;
+        try {
+          const raw = await getString(storageKey);
+          if (!alive) return;
+          if (!raw) return;
+          if (raw === lastHydratedRawRef.current) return;
+          lastHydratedRawRef.current = raw;
+          const parsed = JSON.parse(raw);
+          setData(normalizeData(parsed));
+        } catch {
+          // ignore
+        }
+      })();
+
+      return () => {
+        alive = false;
+      };
+    }, [hydrated, storageKey])
+  );
 
   // persist (debounced)
   useEffect(() => {
