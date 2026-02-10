@@ -4659,7 +4659,66 @@ async function handleDiscoverRecommend(req, res) {
       return [];
     };
 
-    
+    const enrichNameOnly = async (items, { fallbacks = [] } = {}) => {
+      const preferred = Array.isArray(items) ? items : [];
+
+      const priority = [];
+      const seen = new Set();
+      const push = (p) => {
+        const n = String(p?.name || p?.product_name || "").trim();
+        if (!n) return;
+        const k = n.toLowerCase();
+        if (seen.has(k)) return;
+        seen.add(k);
+        priority.push({ name: n, why: String(p?.why || "").trim() });
+      };
+
+      preferred.forEach(push);
+      (Array.isArray(fallbacks) ? fallbacks : []).forEach((n) => push({ name: n, why: "" }));
+
+      const first = priority[0] ? { ...priority[0] } : null;
+
+      // Prefer returning a resolvable Sephora URL when possible.
+      for (const p of priority) {
+        const name = String(p?.name || "").trim();
+        if (!name) continue;
+
+        let url = String(PRODUCT_URLS?.[name] || "").trim();
+        if (!url) {
+          try {
+            url = await resolveSephoraProductUrlByName(name);
+          } catch {
+            url = "";
+          }
+        }
+
+        if (url && isAllowedRetailerUrl(url)) {
+          url = normalizeRetailerUrl(url);
+          let title = "";
+          try {
+            title = await getSephoraProductTitle(url);
+          } catch {
+            title = "";
+          }
+          return [{ name: title || name, why: p.why, shade: undefined, product_url: url }];
+        }
+      }
+
+      // If we can’t resolve a Sephora URL (blocked search / no mapping), still return a real product name.
+      if (first?.name) {
+        return [{ name: first.name, why: first.why, shade: undefined, product_url: "" }];
+      }
+
+      return [];
+    };
+
+    const ensureAtLeastName = async (items, { fallbacks = [] } = {}) => {
+      const withShade = await enrichWithShade(items, { fallbacks });
+      if (Array.isArray(withShade) && withShade.length) return withShade;
+      const nameOnly = await enrichNameOnly(items, { fallbacks });
+      return Array.isArray(nameOnly) ? nameOnly : [];
+    };
+
 
     // Special case: Eyeshadow should return TWO picks:
     // 1) an eyeshadow PALETTE (name only)
@@ -4725,7 +4784,7 @@ async function handleDiscoverRecommend(req, res) {
       return res.json({ ok: true, products: productsOut, source: "eyes_two" });
     }
     if (!OPENAI_API_KEY) {
-      const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
+      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames });
       return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
@@ -4762,7 +4821,7 @@ async function handleDiscoverRecommend(req, res) {
       outText = String(extracted.text || "").trim();
     } catch (e) {
       // If the model call fails, fall back.
-      const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
+      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames });
       return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
@@ -4793,11 +4852,11 @@ async function handleDiscoverRecommend(req, res) {
       .slice(0, 1);
 
     if (!picks.length) {
-      const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
+      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames });
       return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
-    const enriched = await enrichWithShade(picks, { fallbacks: candidateNames });
+    const enriched = await ensureAtLeastName(picks, { fallbacks: candidateNames });
     return res.json({ ok: true, products: enriched, source: "openai" });
   } catch (e) {
     console.error("discover-recommend error:", e);
