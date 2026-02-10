@@ -675,7 +675,12 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
         if (!uniq.includes(n)) uniq.push(n);
       }
 
-      const finalList = uniq.length > 0 ? uniq : DEFAULT_KITLOG_CATEGORIES;
+      const finalList: string[] = [...DEFAULT_KITLOG_CATEGORIES];
+
+      // Append any custom categories from KitLog (preserve their order).
+      for (const n of uniq) {
+        if (!finalList.includes(n)) finalList.push(n);
+      }
 
       const items: KitPickItem[] = [];
       for (const c of catsRaw) {
@@ -690,10 +695,25 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
           const shade = typeof (it as any)?.shade === 'string' ? (it as any).shade.trim() : '';
           const subcategory = typeof (it as any)?.subcategory === 'string' ? (it as any).subcategory.trim() : '';
           const type = typeof (it as any)?.type === 'string' ? (it as any).type.trim() : '';
+          const subKey = (subcategory || '').trim().toLowerCase();
+          const catLow = String(catName || '').trim().toLowerCase();
+
+          let mappedCategory = catName;
+
+          // Base misfiles: keep list usable even if KitLog hasn’t been opened to migrate yet.
+          if (catLow === 'base') {
+            if (subKey === 'blush' || subKey === 'bronzer') mappedCategory = 'Cheeks';
+            else if (subKey === 'contour' || subKey === 'highlighter') mappedCategory = 'Sculpt';
+          }
+
+          // Cheeks/Sculpt swap
+          if (catLow === 'cheeks' && subKey === 'highlighter') mappedCategory = 'Sculpt';
+          if (catLow === 'sculpt' && subKey === 'bronzer') mappedCategory = 'Cheeks';
+
 
           items.push({
             id,
-            category: catName,
+            category: mappedCategory,
             name,
             brand: brand || undefined,
             shade: shade || undefined,

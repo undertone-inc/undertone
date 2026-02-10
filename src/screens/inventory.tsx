@@ -77,8 +77,8 @@ const TONE_OPTIONS = [
 ] as const;
 
 const BASE_SUBSET_OPTIONS = ['Foundation', 'Concealer', 'Corrector', 'Powder'] as const;
-const CHEEKS_SUBSET_OPTIONS = ['Blush', 'Highlighter'] as const;
-const SCULPT_SUBSET_OPTIONS = ['Contour', 'Bronzer'] as const;
+const CHEEKS_SUBSET_OPTIONS = ['Blush', 'Bronzer'] as const;
+const SCULPT_SUBSET_OPTIONS = ['Contour', 'Highlighter'] as const;
 const LIPS_SUBSET_OPTIONS = ['Lipstick', 'Lipliner', 'Lip gloss', 'Lip balm/treatments'] as const;
 const EYES_SUBSET_OPTIONS = ['Eyeshadow', 'Eyeliner', 'Mascara', 'Lashes'] as const;
 const BROWS_SUBSET_OPTIONS = ['Pencil', 'Powder', 'Gel'] as const;
@@ -487,8 +487,8 @@ function normalizeData(input: any): KitLogData {
 
       baseItems.forEach((it) => {
         const k = lower((it as any)?.subcategory);
-        if (k === 'blush' || k === 'highlighter') toCheeks.push(it);
-        else if (k === 'bronzer' || k === 'contour') toSculpt.push(it);
+        if (k === 'blush' || k === 'bronzer') toCheeks.push(it);
+        else if (k === 'contour' || k === 'highlighter') toSculpt.push(it);
         else keep.push(it);
       });
 
@@ -502,6 +502,44 @@ function normalizeData(input: any): KitLogData {
       }
     }
 
+
+
+    // Migration: Cheeks/Sculpt swap (Highlighter -> Sculpt, Bronzer -> Cheeks)
+    if (cheeksIdx >= 0 && sculptIdx >= 0) {
+      // Move Highlighter out of Cheeks and into Sculpt
+      {
+        const cheeksItems = Array.isArray(nextCats[cheeksIdx]?.items) ? nextCats[cheeksIdx].items : [];
+        const toSculpt: KitItem[] = [];
+        const keep: KitItem[] = [];
+        cheeksItems.forEach((it) => {
+          const k = lower((it as any)?.subcategory);
+          if (k === 'highlighter') toSculpt.push(it);
+          else keep.push(it);
+        });
+
+        if (toSculpt.length) {
+          nextCats[cheeksIdx] = { ...nextCats[cheeksIdx], items: keep };
+          nextCats[sculptIdx] = { ...nextCats[sculptIdx], items: [...nextCats[sculptIdx].items, ...toSculpt] };
+        }
+      }
+
+      // Move Bronzer out of Sculpt and into Cheeks
+      {
+        const sculptItems = Array.isArray(nextCats[sculptIdx]?.items) ? nextCats[sculptIdx].items : [];
+        const toCheeks: KitItem[] = [];
+        const keep: KitItem[] = [];
+        sculptItems.forEach((it) => {
+          const k = lower((it as any)?.subcategory);
+          if (k === 'bronzer') toCheeks.push(it);
+          else keep.push(it);
+        });
+
+        if (toCheeks.length) {
+          nextCats[sculptIdx] = { ...nextCats[sculptIdx], items: keep };
+          nextCats[cheeksIdx] = { ...nextCats[cheeksIdx], items: [...nextCats[cheeksIdx].items, ...toCheeks] };
+        }
+      }
+    }
     return { version: 1, categories: nextCats };
   } catch {
     return base;

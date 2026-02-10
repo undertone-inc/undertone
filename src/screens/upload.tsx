@@ -203,8 +203,8 @@ type DiscoverCategory = 'Base' | 'Sculpt' | 'Cheeks' | 'Eyes' | 'Lips';
 
 const DISCOVER_TYPES_BY_CATEGORY: Record<DiscoverCategory, string[]> = {
   Base: ['Foundation', 'Concealer', 'Corrector', 'Powder'],
-  Sculpt: ['Contour', 'Bronzer'],
-  Cheeks: ['Blush', 'Highlighter'],
+  Sculpt: ['Contour', 'Highlighter'],
+  Cheeks: ['Blush', 'Bronzer'],
   Eyes: ['Eyeshadow', 'Eyeliner', 'Mascara', 'Lashes'],
   Lips: ['Lipstick', 'Lipliner', 'Lip gloss', 'Lip balm/treatments'],
 };
@@ -902,7 +902,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
   const [discoverCategory, setDiscoverCategory] = useState<DiscoverCategory | null>(null);
   const [discoverType, setDiscoverType] = useState<string | null>(null);
   const [discoverLoading, setDiscoverLoading] = useState(false);
-  const [discoverResults, setDiscoverResults] = useState<Array<{ name: string; shade?: string }>>([]);
+  const [discoverResults, setDiscoverResults] = useState<Array<{ name: string; shade?: string; itemType?: string }>>([]);
 
   // When returning from the Camera screen, it passes a `capturedPhoto` param.
   // Consume it once and immediately trigger analysis.
@@ -1242,14 +1242,16 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         }
 
         const list = Array.isArray(json?.products) ? json.products : [];
+        const wantsTwo = type.toLowerCase() === 'eyeshadow';
         const normalized = list
           .map((p: any) => ({
             name: String(p?.name || p?.product_name || '').trim(),
             // Always prefer an explicit shade/variant label; we never show "why" text in Discover results.
             shade: String(p?.shade || p?.color_name || p?.color || p?.variant || '').trim() || undefined,
+            itemType: String(p?.item_type || p?.itemType || '').trim() || undefined,
           }))
           .filter((p: any) => !!p.name)
-          .slice(0, 1);
+          .slice(0, wantsTwo ? 2 : 1);
 
         setDiscoverResults(normalized);
         setDiscoverStep('results');
@@ -1265,7 +1267,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
     }
   };
 
-  const addDiscoverItemToKit = async (productName: string, shade?: string) => {
+  const addDiscoverItemToKit = async (productName: string, shade?: string, itemType?: string) => {
     const name = String(productName || '').trim();
     if (!name) return;
     const category = discoverCategory;
@@ -1314,6 +1316,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
       id: uid('item'),
       name,
       shade: String(shade || '').trim() || undefined,
+      type: String(itemType || '').trim() || undefined,
       subcategory,
       status: 'inKit',
       notes: 'Added from Discover',
@@ -2332,8 +2335,6 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
                   {discoverStep === 'results' ? (
                     <View>
-                      <Text style={styles.discoverSectionTitle}>Recommended for you</Text>
-
                       {discoverResults.length ? (
                         <View style={{ marginTop: 8 }}>
                           {discoverResults.map((p) => (
@@ -2344,7 +2345,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
                               <TouchableOpacity
                                 style={styles.discoverAddBtn}
                                 onPress={() => {
-                                  void addDiscoverItemToKit(p.name, p.shade);
+                                  void addDiscoverItemToKit(p.name, p.shade, p.itemType);
                                 }}
                                 accessibilityRole="button"
                               >
@@ -2796,16 +2797,20 @@ const styles = StyleSheet.create({
   discoverPrimaryBtn: {
     marginTop: 16,
     borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#111111',
-    backgroundColor: '#111111',
+    borderWidth: 0,
+    backgroundColor: '#ffffff',
     paddingVertical: 12,
     paddingHorizontal: 14,
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   discoverPrimaryBtnText: {
-    color: '#ffffff',
+    color: '#111827',
     fontWeight: '600',
     fontSize: 13,
   },
@@ -2857,13 +2862,17 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   discoverResultCard: {
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
+    borderWidth: 0,
     borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 12,
     marginBottom: 10,
     backgroundColor: '#ffffff',
+    shadowColor: '#000',
+    shadowOpacity: 0.06,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   discoverResultName: {
     color: '#111827',
@@ -2879,17 +2888,21 @@ const styles = StyleSheet.create({
   discoverAddBtn: {
     marginTop: 12,
     borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#111111',
-    backgroundColor: '#111111',
+    borderWidth: 0,
+    backgroundColor: '#ffffff',
     paddingVertical: 10,
     paddingHorizontal: 14,
     alignItems: 'center',
     justifyContent: 'center',
     alignSelf: 'flex-start',
+    shadowColor: '#000',
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
   discoverAddBtnText: {
-    color: '#ffffff',
+    color: '#111827',
     fontWeight: '600',
     fontSize: 13,
   },

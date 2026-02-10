@@ -2057,7 +2057,7 @@ function extractSephoraDisplayedColorFromHtml(html) {
   const s = String(html || "");
   if (!s) return "";
 
-  const markers = ["Color:", "Shade:", "Colour:"];
+  const markers = ["Color:", "Shade:", "Colour:", "Style:", "Scent:", "Flavor:", "Flavour:"];
   for (const marker of markers) {
     const idx = s.toLowerCase().indexOf(marker.toLowerCase());
     if (idx < 0) continue;
@@ -2114,10 +2114,10 @@ function extractSephoraColorVariantsFromHtml(html) {
   if (out.length >= 6) return out;
 
   // 2) Extract from aria-label/title attributes (often used on swatches)
-  const reAria = /aria-label\s*=\s*"([^"]*(?:Color|Shade)[^"]*)"/gi;
+  const reAria = /aria-label\s*=\s*"([^"]*(?:Color|Shade|Style|Scent|Flavor|Flavour)[^"]*)"/gi;
   for (const m of s.matchAll(reAria)) {
     const label = compactSpaces(String(m?.[1] || ""));
-    const m2 = /(?:color|shade)\s*:?\s*(.+)/i.exec(label);
+    const m2 = /(?:color|shade|style|scent|flavor|flavour)\s*:?\s*(.+)/i.exec(label);
     if (!m2?.[1]) continue;
     let val = String(m2[1] || "");
     // Trim common trailing tokens.
@@ -2126,10 +2126,10 @@ function extractSephoraColorVariantsFromHtml(html) {
     push(val, "");
   }
 
-  const reTitle = /title\s*=\s*"([^"]*(?:Color|Shade)[^"]*)"/gi;
+  const reTitle = /title\s*=\s*"([^"]*(?:Color|Shade|Style|Scent|Flavor|Flavour)[^"]*)"/gi;
   for (const m of s.matchAll(reTitle)) {
     const label = compactSpaces(String(m?.[1] || ""));
-    const m2 = /(?:color|shade)\s*:?\s*(.+)/i.exec(label);
+    const m2 = /(?:color|shade|style|scent|flavor|flavour)\s*:?\s*(.+)/i.exec(label);
     if (!m2?.[1]) continue;
     let val = String(m2[1] || "");
     val = val.replace(/\bNew\b\s*$/i, "").trim();
@@ -2138,13 +2138,13 @@ function extractSephoraColorVariantsFromHtml(html) {
   }
 
   // 3) Scrape common embedded sku blocks (unescaped)
-  const reColorBlock = /"variationType"\s*:\s*"(?:Color|Shade|Colour)"[\s\S]{0,3000}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,1600}?"variationDesc"\s*:\s*"([^"]+)")?/g;
+  const reColorBlock = /"variationType"\s*:\s*"(?:Color|Shade|Colour|Style|Scent|Flavor|Flavour)"[\s\S]{0,3000}?"variationValue"\s*:\s*"([^"]+)"(?:[\s\S]{0,1600}?"variationDesc"\s*:\s*"([^"]+)")?/g;
   for (const m of s.matchAll(reColorBlock)) {
     push(m?.[1], m?.[2]);
   }
 
   // 4) Scrape escaped JSON blobs (e.g., in attributes)
-  const reColorBlockEsc = /\"variationType\"\s*:\s*\"(?:Color|Shade|Colour)\"[\s\S]{0,3000}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,1600}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
+  const reColorBlockEsc = /\"variationType\"\s*:\s*\"(?:Color|Shade|Colour|Style|Scent|Flavor|Flavour)\"[\s\S]{0,3000}?\"variationValue\"\s*:\s*\"([^\"]+)\"(?:[\s\S]{0,1600}?\"variationDesc\"\s*:\s*\"([^\"]+)\")?/g;
   for (const m of s.matchAll(reColorBlockEsc)) {
     push(m?.[1], m?.[2]);
   }
@@ -2912,13 +2912,22 @@ const HIGHLIGHTER_POOL = [
   "Hourglass Ambient Lighting Powder",
 ];
 
-const EYESHADOW_POOL = [
+const EYESHADOW_PALETTE_POOL = [
   "Natasha Denona Glam Palette",
   "Natasha Denona Bronze Palette",
   "Urban Decay Naked3 Palette",
   "Huda Beauty Nude Obsessions Palette",
   "Dior Backstage Eye Palette",
 ];
+
+// Individual eyeshadows that reliably expose shade options on Sephora.
+const EYESHADOW_SINGLE_POOL = [
+  "Laura Mercier Caviar Stick Cream Eyeshadow",
+  "Bobbi Brown Long-Wear Waterproof Cream Eyeshadow Stick",
+];
+
+// Combined list used for mapping / validation.
+const EYESHADOW_POOL = [...EYESHADOW_PALETTE_POOL, ...EYESHADOW_SINGLE_POOL];
 
 const EYELINER_POOL = [
   "Urban Decay 24/7 Glide-On Waterproof Eyeliner Pencil",
@@ -2974,11 +2983,11 @@ const DISCOVER_POOLS = {
   },
   sculpt: {
     Contour: CONTOUR_POOL,
-    Bronzer: BRONZER_POOL,
+    Highlighter: HIGHLIGHTER_POOL,
   },
   cheeks: {
     Blush: CHEEKS_POOL,
-    Highlighter: HIGHLIGHTER_POOL,
+    Bronzer: BRONZER_POOL,
   },
   eyes: {
     Eyeshadow: EYESHADOW_POOL,
@@ -4650,6 +4659,71 @@ async function handleDiscoverRecommend(req, res) {
       return [];
     };
 
+    
+
+    // Special case: Eyeshadow should return TWO picks:
+    // 1) an eyeshadow PALETTE (name only)
+    // 2) an INDIVIDUAL eyeshadow with a verifiable Sephora shade
+    if (discoverCategoryKey === "eyes" && discoverTypeKey === "eyeshadow") {
+      const seed = `${discoverCategoryKey}|${undertone}|${season || ""}|${String(toneNumber ?? "")}|${String(toneDepth ?? "")}`;
+
+      const paletteCandidates = uniqStringsLower(EYESHADOW_PALETTE_POOL).slice(0, 25);
+      const singleCandidates = uniqStringsLower(EYESHADOW_SINGLE_POOL).slice(0, 25);
+
+      const palettePriority = pickStable(paletteCandidates, Math.max(1, paletteCandidates.length), seed);
+      const singlePriority = pickStable(singleCandidates, Math.max(1, singleCandidates.length), seed);
+
+      const palettePick = await (async () => {
+        const list = palettePriority.length ? palettePriority : paletteCandidates;
+        for (const name0 of list) {
+          const nm = String(name0 || "").trim();
+          if (!nm) continue;
+
+          let url = String(PRODUCT_URLS?.[nm] || "").trim();
+          if (!url) {
+            try {
+              url = await resolveSephoraProductUrlByName(nm);
+            } catch {
+              url = "";
+            }
+          }
+
+          if (url && isAllowedRetailerUrl(url)) {
+            url = normalizeRetailerUrl(url);
+            let title = "";
+            try {
+              title = await getSephoraProductTitle(url);
+            } catch {
+              title = "";
+            }
+            return { name: title || nm, why: "", shade: undefined, product_url: url, item_type: "Palette" };
+          }
+
+          // If we can’t resolve a URL (Sephora search blocked), still return the palette name.
+          return { name: nm, why: "", shade: undefined, product_url: "", item_type: "Palette" };
+        }
+        return null;
+      })();
+
+      // Individual eyeshadow MUST include a real Sephora shade.
+      const singleEnriched = await enrichWithShade(
+        [{ name: singlePriority[0] || singleCandidates[0] || "", why: "" }],
+        { fallbacks: singlePriority }
+      );
+      if (singleEnriched[0]) singleEnriched[0].item_type = "Individual";
+
+      const productsOut = [];
+      if (palettePick) productsOut.push(palettePick);
+      if (singleEnriched[0]) productsOut.push(singleEnriched[0]);
+
+      // Guarantee at least one recommendation.
+      if (!productsOut.length) {
+        const fallbackName = String(paletteCandidates[0] || "").trim();
+        if (fallbackName) productsOut.push({ name: fallbackName, why: "", shade: undefined, product_url: "", item_type: "Palette" });
+      }
+
+      return res.json({ ok: true, products: productsOut, source: "eyes_two" });
+    }
     if (!OPENAI_API_KEY) {
       const enriched = await enrichWithShade(fallbackPicks, { fallbacks: candidateNames });
       return res.json({ ok: true, products: enriched, source: "fallback" });
