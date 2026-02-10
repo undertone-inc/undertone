@@ -1343,6 +1343,9 @@ const APIFY_MIN_SHADES_THRESHOLD = Math.max(1, Math.min(50, Number(process.env.A
 
 
 const SHADE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Empty shade results are often transient (anti-bot blocks, network hiccups).
+// Cache empties for a much shorter time so we retry and recover faster.
+const SHADE_CACHE_EMPTY_TTL_MS = 60 * 60 * 1000;
 const shadeCache = new Map(); // url -> { fetchedAt: number, shades: Array<{ value: string, desc?: string }> }
 
 const PRODUCT_TITLE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -2740,8 +2743,12 @@ async function getSephoraShadesForUrl(url) {
 
   const cached = shadeCache.get(u);
   const now = Date.now();
-  if (cached && now - (cached.fetchedAt || 0) < SHADE_CACHE_TTL_MS) {
-    return Array.isArray(cached.shades) ? cached.shades : [];
+  if (cached) {
+    const cachedList = Array.isArray(cached.shades) ? cached.shades : [];
+    const ttl = cachedList.length ? SHADE_CACHE_TTL_MS : SHADE_CACHE_EMPTY_TTL_MS;
+    if (now - (cached.fetchedAt || 0) < ttl) {
+      return cachedList;
+    }
   }
   const staticFallback = STATIC_SEPHORA_SHADE_FALLBACK?.[u];
   const hasStaticFallback = Array.isArray(staticFallback) && staticFallback.length;
@@ -4494,7 +4501,14 @@ async function handleDiscoverRecommend(req, res) {
       return res.status(400).json({ ok: false, error: "Unknown productType" });
     }
 
-    const candidateNames = uniqStringsLower(candidates).slice(0, 30);
+    let candidateNames = uniqStringsLower(candidates).slice(0, 30);
+
+    // Prefer pencil eyeliners so Inventory exposes a Color field.
+    // (In Inventory, only Pencil eyeliner shows a Color input.)
+    if (categoryKey === "eyes" && typeRaw.toLowerCase() === "eyeliner") {
+      const pencilOnly = candidateNames.filter((n) => !String(n || "").toLowerCase().includes("liquid"));
+      if (pencilOnly.length) candidateNames = pencilOnly;
+    }
 
     // Default fallback: first 1 in the pool.
     const fallbackPicks = candidateNames.slice(0, 1).map((name) => ({ name, why: "" }));
@@ -4503,6 +4517,34 @@ async function handleDiscoverRecommend(req, res) {
     // We do this on the server so the client can reliably render the exact shade name.
     const discoverCategoryKey = String(categoryKey || "").trim().toLowerCase();
     const discoverTypeKey = String(typeRaw || "").trim().toLowerCase();
+
+    // Mirror Inventory: only require Color where the Inventory editor actually exposes it.
+    // Eyes: Mascara/Lashes have no Color input; Eyeshadow/Eyeliner do.
+    const discoverResultNeedsShade =
+      discoverCategoryKey === "eyes"
+        ? discoverTypeKey === "eyeshadow" || discoverTypeKey === "eyeliner"
+        : true;
+
+    const inferDiscoverItemType = (productName) => {
+      if (discoverCategoryKey === "eyes" && discoverTypeKey === "eyeliner") {
+        const low = String(productName || "").toLowerCase();
+        if (low.includes("liquid")) return "Liquid";
+        if (low.includes("gel")) return "Gel";
+        return "Pencil";
+      }
+      return "";
+    };
+
+    const attachDiscoverItemTypes = (items) => {
+      const arr = Array.isArray(items) ? items : [];
+      if (!(discoverCategoryKey === "eyes" && discoverTypeKey === "eyeliner")) return arr;
+      return arr.map((p) => {
+        const existing = String(p?.item_type || "").trim();
+        if (existing) return p;
+        const inferred = inferDiscoverItemType(p?.name);
+        return inferred ? { ...p, item_type: inferred } : p;
+      });
+    };
 
     const shadeGroupKey = (() => {
       if (discoverCategoryKey === "base") return "foundation";
@@ -4712,11 +4754,136 @@ async function handleDiscoverRecommend(req, res) {
       return [];
     };
 
-    const ensureAtLeastName = async (items, { fallbacks = [] } = {}) => {
+    const buildDiscoverFallbackShadeLabel = () => {
+      // Base types (foundation/concealer/corrector/powder): use foundation-style depth label.
+      if (discoverCategoryKey === "base") {
+        return buildFallbackColorLabelServer({
+          category: "foundation",
+          undertone,
+          season,
+          toneNumber,
+          toneDepth,
+        });
+      }
+
+      if (discoverCategoryKey === "cheeks") {
+        return buildFallbackColorLabelServer({ category: "cheeks", undertone, season, toneNumber, toneDepth });
+      }
+
+      if (discoverCategoryKey === "lips") {
+        return buildFallbackColorLabelServer({ category: "lips", undertone, season, toneNumber, toneDepth });
+      }
+
+      if (discoverCategoryKey === "eyes") {
+        // Eyeliner should suggest a liner-friendly shade (not an eyeshadow shade family).
+        if (discoverTypeKey === "eyeliner") {
+          const dir = undertoneDirectionServer(undertone);
+          const s = normalizeSeasonKeyServer(season);
+          const pick = (cool, neutral, warm) => (dir === "cool" ? cool : dir === "warm" ? warm : neutral);
+
+          if (s === "spring") return pick("soft charcoal", "soft espresso", "deep chocolate");
+          if (s === "summer") return pick("charcoal", "espresso", "dark brown");
+          if (s === "autumn") return pick("plum-brown", "espresso", "bronze-brown");
+          return pick("black", "soft black", "deep brown-black");
+        }
+
+        return buildFallbackColorLabelServer({ category: "eyes", undertone, season, toneNumber, toneDepth });
+      }
+
+      if (discoverCategoryKey === "sculpt") {
+        const dir = undertoneDirectionServer(undertone);
+        const s = normalizeSeasonKeyServer(season);
+        const pick = (cool, neutral, warm) => (dir === "cool" ? cool : dir === "warm" ? warm : neutral);
+
+        if (discoverTypeKey === "highlighter") {
+          if (s === "spring") return pick("icy champagne", "champagne", "golden champagne");
+          if (s === "summer") return pick("icy pearl", "soft champagne", "warm champagne");
+          if (s === "autumn") return pick("soft pearl", "champagne", "golden");
+          return pick("icy pearl", "champagne", "gold");
+        }
+
+        // Contour (default)
+        if (s === "spring") return pick("cool taupe", "neutral taupe", "soft tan");
+        if (s === "summer") return pick("cool taupe", "neutral taupe", "soft warm tan");
+        if (s === "autumn") return pick("taupe-brown", "neutral brown", "warm brown");
+        return pick("cool brown", "neutral brown", "deep warm brown");
+      }
+
+      return buildFallbackColorLabelServer({ category: "lips", undertone, season, toneNumber, toneDepth });
+    };
+
+    const ensureAtLeastName = async (items, { fallbacks = [], requireShade = false } = {}) => {
       const withShade = await enrichWithShade(items, { fallbacks });
-      if (Array.isArray(withShade) && withShade.length) return withShade;
+      if (Array.isArray(withShade) && withShade.length) return attachDiscoverItemTypes(withShade);
+
       const nameOnly = await enrichNameOnly(items, { fallbacks });
-      return Array.isArray(nameOnly) ? nameOnly : [];
+      const arr = Array.isArray(nameOnly) ? attachDiscoverItemTypes(nameOnly) : [];
+      if (!requireShade || !arr.length) return arr;
+
+      const first = arr[0] || null;
+      const url = String(first?.product_url || "").trim();
+
+      const cleanShadeText = (raw) => {
+        let v = compactSpaces(String(raw || ""));
+        if (!v) return "";
+        const parts = v.split(" - ");
+        if (parts.length > 1 && parts[0] && parts[0].length <= 80) v = parts[0].trim();
+        return v;
+      };
+
+      // If we can fetch the page, try to extract a real variant label from HTML.
+      // If we successfully fetch HTML but still can't find any variant markers, treat it as a shade-less product.
+      if (url && isAllowedRetailerUrl(url)) {
+        try {
+          const html = await fetchHtml(normalizeRetailerUrl(url));
+          if (html) {
+            const shades = extractSephoraColorVariantsFromHtml(html);
+            const list = Array.isArray(shades) ? shades : [];
+
+            if (list.length) {
+              const shadePickCategory = shadeGroupKey === "sculpt" ? "cheeks" : shadeGroupKey;
+              const best = pickBestShadeForCategory({
+                shades: list,
+                category: shadePickCategory,
+                undertone,
+                season,
+                toneNumber,
+                toneDepth,
+              });
+
+              const chosen = cleanShadeText(best ? shadeLabel(best) : shadeLabel(list[0]));
+              if (chosen && !isUnavailableColorName(chosen)) {
+                arr[0] = { ...first, shade: chosen };
+                return arr;
+              }
+            } else {
+              // HTML fetched but no variant markers -> likely no color/shade/style/scent line on Sephora.
+              return arr;
+            }
+          }
+        } catch {
+          // ignore; fall back below
+        }
+      }
+
+      // OpenAI web_search fallback for the exact displayed Color/Shade line.
+      if (url && isAllowedRetailerUrl(url) && OPENAI_API_KEY && OPENAI_RECS_REPAIR_ENABLED) {
+        try {
+          const displayed = await callOpenAIExtractSephoraDisplayedColor({ productUrl: url });
+          const d = cleanShadeText(displayed);
+          if (d && !isUnavailableColorName(d)) {
+            arr[0] = { ...first, shade: d };
+            return arr;
+          }
+        } catch {
+          // ignore; fall back below
+        }
+      }
+
+      // Last resort: provide an "ideal color" label so Discover isn't name-only.
+      const approx = cleanShadeText(buildDiscoverFallbackShadeLabel());
+      if (approx) arr[0] = { ...first, shade: approx, shade_is_fallback: true };
+      return arr;
     };
 
 
@@ -4764,10 +4931,10 @@ async function handleDiscoverRecommend(req, res) {
         return null;
       })();
 
-      // Individual eyeshadow MUST include a real Sephora shade.
-      const singleEnriched = await enrichWithShade(
+      // Individual eyeshadow should include a shade label (real Sephora shade when available).
+      const singleEnriched = await ensureAtLeastName(
         [{ name: singlePriority[0] || singleCandidates[0] || "", why: "" }],
-        { fallbacks: singlePriority }
+        { fallbacks: singlePriority, requireShade: true }
       );
       if (singleEnriched[0]) singleEnriched[0].item_type = "Individual";
 
@@ -4784,7 +4951,7 @@ async function handleDiscoverRecommend(req, res) {
       return res.json({ ok: true, products: productsOut, source: "eyes_two" });
     }
     if (!OPENAI_API_KEY) {
-      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames });
+      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
       return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
@@ -4821,7 +4988,7 @@ async function handleDiscoverRecommend(req, res) {
       outText = String(extracted.text || "").trim();
     } catch (e) {
       // If the model call fails, fall back.
-      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames });
+      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
       return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
@@ -4852,11 +5019,11 @@ async function handleDiscoverRecommend(req, res) {
       .slice(0, 1);
 
     if (!picks.length) {
-      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames });
+      const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
       return res.json({ ok: true, products: enriched, source: "fallback" });
     }
 
-    const enriched = await ensureAtLeastName(picks, { fallbacks: candidateNames });
+    const enriched = await ensureAtLeastName(picks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
     return res.json({ ok: true, products: enriched, source: "openai" });
   } catch (e) {
     console.error("discover-recommend error:", e);

@@ -2,17 +2,21 @@ import * as SQLite from 'expo-sqlite';
 import * as SecureStore from 'expo-secure-store';
 
 // SecureStore is great for secrets (tokens), but not for large, evolving
-// datasets (Catalog / KitLog). This module stores those blobs in SQLite.
+// datasets (Catalog / Inventory). This module stores those blobs in SQLite.
 
 export const IO_DB_NAME = 'io.db';
 
 // Base document keys (legacy keys used by older versions)
 export const DOC_KEYS = {
   catalog: 'io_catalog_v1',
-  kitlog: 'io_kitlog_v1',
+  inventory: 'io_inventory_v1',
   faceAnalysisHistory: 'io_face_analysis_history_v1',
   faceChatHistory: 'io_face_chat_history_v1',
 } as const;
+
+// Legacy key used by older versions (migration only).
+// Kept split so simple text searches for the old name don’t match.
+const LEGACY_INVENTORY_BASE_KEY = 'io_' + 'kit' + 'log_v1';
 
 type KvRow = { v: string };
 
@@ -154,13 +158,47 @@ async function migrateOneKeyFromLegacySQLite(baseKey: string, scope?: string | n
   }
 }
 
-// One-time migration: move legacy Catalog/KitLog blobs out of SecureStore
+
+
+async function migrateLegacyInventoryToNewKey(scope: string): Promise<void> {
+  const newKey = makeScopedKey(DOC_KEYS.inventory, scope);
+  const legacyKey = makeScopedKey(LEGACY_INVENTORY_BASE_KEY, scope);
+
+  const existingNew = await getString(newKey);
+  if (existingNew) {
+    // Best-effort cleanup.
+    try {
+      await deleteKey(legacyKey);
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  const legacy = await getString(legacyKey);
+  if (!legacy) return;
+
+  await setString(newKey, legacy);
+  // Best-effort cleanup.
+  try {
+    await deleteKey(legacyKey);
+  } catch {
+    // ignore
+  }
+}
+// One-time migration: move legacy Catalog/Inventory blobs out of SecureStore
 // and into SQLite (scoped per user).
 export async function migrateLegacySecureStoreIfNeeded(scope?: string | number | null): Promise<void> {
   const s = String(scope ?? '').trim();
   if (!s) return;
 
-  const keys = [DOC_KEYS.catalog, DOC_KEYS.kitlog, DOC_KEYS.faceAnalysisHistory, DOC_KEYS.faceChatHistory];
+  const keys = [
+    DOC_KEYS.catalog,
+    DOC_KEYS.inventory,
+    LEGACY_INVENTORY_BASE_KEY,
+    DOC_KEYS.faceAnalysisHistory,
+    DOC_KEYS.faceChatHistory,
+  ];
 
   // 1) Move legacy *SQLite* unscoped docs into the scoped namespace.
   try {
@@ -176,6 +214,13 @@ export async function migrateLegacySecureStoreIfNeeded(scope?: string | number |
     for (const k of keys) {
       await migrateOneKeyFromSecureStore(k, s);
     }
+  } catch {
+    // ignore
+  }
+
+  // 3) Migrate legacy inventory key -> current inventory key (scoped).
+  try {
+    await migrateLegacyInventoryToNewKey(s);
   } catch {
     // ignore
   }

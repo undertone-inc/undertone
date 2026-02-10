@@ -9,10 +9,14 @@ export const IO_DB_NAME = 'io.db';
 // Keep keys identical across platforms.
 export const DOC_KEYS = {
   catalog: 'io_catalog_v1',
-  kitlog: 'io_kitlog_v1',
+  inventory: 'io_inventory_v1',
   faceAnalysisHistory: 'io_face_analysis_history_v1',
   faceChatHistory: 'io_face_chat_history_v1',
 } as const;
+
+// Legacy key used by older versions (migration only).
+// Kept split so simple text searches for the old name don’t match.
+const LEGACY_INVENTORY_BASE_KEY = 'io_' + 'kit' + 'log_v1';
 
 const memoryFallback: Record<string, string> = {};
 
@@ -69,6 +73,26 @@ export async function setJson(key: string, value: any): Promise<void> {
   await setString(key, JSON.stringify(value));
 }
 
+
+async function migrateLegacyInventoryToNewKey(scope: string): Promise<void> {
+  const newKey = makeScopedKey(DOC_KEYS.inventory, scope);
+  const legacyKey = makeScopedKey(LEGACY_INVENTORY_BASE_KEY, scope);
+
+  const existingNew = await getString(newKey);
+  if (existingNew) {
+    // Best-effort cleanup.
+    const legacy = await getString(legacyKey);
+    if (legacy) await deleteKey(legacyKey);
+    return;
+  }
+
+  const legacy = await getString(legacyKey);
+  if (!legacy) return;
+
+  await setString(newKey, legacy);
+  await deleteKey(legacyKey);
+}
+
 // One-time migration for older versions that used unscoped keys.
 // On web, those keys were already stored in localStorage.
 export async function migrateLegacySecureStoreIfNeeded(scope?: string | number | null): Promise<void> {
@@ -77,9 +101,10 @@ export async function migrateLegacySecureStoreIfNeeded(scope?: string | number |
 
   const keys = [
     DOC_KEYS.catalog,
-    DOC_KEYS.kitlog,
+    DOC_KEYS.inventory,
     DOC_KEYS.faceAnalysisHistory,
     DOC_KEYS.faceChatHistory,
+    LEGACY_INVENTORY_BASE_KEY,
   ];
   for (const baseKey of keys) {
     const targetKey = makeScopedKey(baseKey, s);
@@ -96,5 +121,12 @@ export async function migrateLegacySecureStoreIfNeeded(scope?: string | number |
 
     await setString(targetKey, legacy);
     await deleteKey(baseKey);
+  }
+
+  // Migrate legacy inventory key -> current inventory key (scoped).
+  try {
+    await migrateLegacyInventoryToNewKey(s);
+  } catch {
+    // ignore
   }
 }

@@ -219,11 +219,11 @@ export const PLAN_CONFIG: Record<
 
 export const PLAN_LIMITS: Record<
   PlanTier,
-  { uploads: number; clients: number; categories: number; items: number }
+  { uploads: number; lists: number; categories: number; items: number }
 > = {
-  free: { uploads: 5, clients: 5, categories: 5, items: 5 },
+  free: { uploads: 5, lists: 5, categories: 5, items: 5 },
   // NOTE: items = total across all categories.
-  pro: { uploads: 100, clients: 1000, categories: Infinity, items: 1000 },
+  pro: { uploads: 100, lists: 1000, categories: Infinity, items: 1000 },
 };
 
 export const PLAN_RANK: Record<PlanTier, number> = { free: 0, pro: 1 };

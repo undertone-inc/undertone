@@ -24,7 +24,7 @@ import { DOC_KEYS, getString, makeScopedKey, setString } from '../localstore';
 import { PlanTier, PLAN_LIMITS } from '../api';
 import { getToken } from '../auth';
 
-type KitLogScreenProps = {
+type InventoryScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
@@ -62,7 +62,7 @@ type KitCategory = {
   items: KitItem[];
 };
 
-type KitLogData = {
+type InventoryData = {
   version: 1;
   categories: KitCategory[];
 };
@@ -90,7 +90,7 @@ const BASE_FORM_OPTIONS = ['Cream', 'Powder', 'Liquid'] as const;
 const EYES_COLOR_ROLE_OPTIONS = ['Base/prime', 'Enhance/crease', 'Smoke', 'Pop (shimmer/glitter)'] as const;
 
 
-const STORAGE_KEY = DOC_KEYS.kitlog;
+const STORAGE_KEY = DOC_KEYS.inventory;
 
 // Category bar fills up as you add items (cap).
 const CATEGORY_BAR_TARGET = 12;
@@ -292,8 +292,8 @@ function itemCountLabel(n: number) {
 }
 
 // Keep storage backwards-compatible with earlier versions.
-function normalizeData(input: any): KitLogData {
-  const base: KitLogData = { version: 1, categories: defaultCategories() };
+function normalizeData(input: any): InventoryData {
+  const base: InventoryData = { version: 1, categories: defaultCategories() };
 
   try {
     const cats = Array.isArray(input?.categories) ? input.categories : null;
@@ -546,12 +546,12 @@ function normalizeData(input: any): KitLogData {
   }
 }
 
-const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, planTier = 'free' }) => {
+const Inventory: React.FC<InventoryScreenProps> = ({ navigation, email, userId, planTier = 'free' }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const storageKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
 
-  const [data, setData] = useState<KitLogData>({ version: 1, categories: defaultCategories() });
+  const [data, setData] = useState<InventoryData>({ version: 1, categories: defaultCategories() });
   const [hydrated, setHydrated] = useState(false);
   const persistTimer = useRef<any>(null);
   const lastHydratedRawRef = useRef<string | null>(null);
@@ -1354,10 +1354,6 @@ const Inventory: React.FC<KitLogScreenProps> = ({ navigation, email, userId, pla
                 </TouchableOpacity>
               )}
             </View>
-
-            <TouchableOpacity style={styles.accountChip} onPress={() => navigation.navigate('Upload')}>
-              <Text style={styles.accountChipText}>Scan</Text>
-            </TouchableOpacity>
           </View>
 
           {/* HOME */}

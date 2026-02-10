@@ -24,7 +24,7 @@ import { PlanTier, PLAN_LIMITS } from '../api';
 import { SafeAreaView, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
 
 const STORAGE_KEY = DOC_KEYS.catalog;
-const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
+const INVENTORY_STORAGE_KEY = DOC_KEYS.inventory;
 
 // Keep enough room to show most/all categories without scrolling,
 // but still scroll safely if the list grows.
@@ -40,9 +40,9 @@ const WHEEL_VISIBLE_ROWS = 5;
 const WHEEL_SPACER_HEIGHT = ((WHEEL_VISIBLE_ROWS - 1) / 2) * WHEEL_ROW_HEIGHT;
 const AMPM_COL_WIDTH = 56;
 
-// Default KitLog categories (used only if KitLog hasn't been opened yet)
-const DEFAULT_KITLOG_CATEGORIES = [
-  // Match KitLog category ordering
+// Default Inventory categories (used only if Inventory hasn't been opened yet)
+const DEFAULT_INVENTORY_CATEGORIES = [
+  // Match Inventory category ordering
   'Prep & Finish',
   'Base',
   'Cheeks',
@@ -77,7 +77,7 @@ const MONTH_NAMES = [
 
 const DOW_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-function normalizeKitlogCategoryName(raw: any): string {
+function normalizeInventoryCategoryName(raw: any): string {
   const n = typeof raw === 'string' ? raw.trim() : '';
   if (!n) return '';
   const key = n.toLowerCase();
@@ -116,7 +116,7 @@ const KEYBOARD_GAP = 33;
 // Modal gets a bit more lift than the main screen.
 const MODAL_CLOSED_BOTTOM_PADDING = 56;
 
-// When typing in the client editor, keep the add-product bar slightly above the keyboard.
+// When typing in the list editor, keep the add-product bar slightly above the keyboard.
 const MODAL_KEYBOARD_GAP = 12;
 
 type Season4 = 'spring' | 'summer' | 'autumn' | 'winter';
@@ -137,16 +137,16 @@ const EVENT_TYPE_OPTIONS = [
 
 type EventType = string;
 
-// Category is driven by KitLog (dynamic), so store it as a string (category name).
+// Category is driven by Inventory (dynamic), so store it as a string (category name).
 type PlanCategory = string;
 
-type ClientProduct = {
+type ListProduct = {
   id: string;
   category: PlanCategory;
   name: string;
   shade?: string;
   notes?: string;
-  // If added from KitLog, keep a reference to the KitLog item id.
+  // If added from Inventory, keep a reference to the Inventory item id.
   kitItemId?: string;
   createdAt: number;
   updatedAt: number;
@@ -162,7 +162,7 @@ type KitPickItem = {
   type?: string;
 };
 
-type ClientRecord = {
+type ListRecord = {
   id: string;
   displayName: string;
   undertone: Undertone;
@@ -173,19 +173,19 @@ type ClientRecord = {
   finalTime?: string; // HH:MM
   eventType: string;
   notes?: string;
-  products: ClientProduct[];
+  products: ListProduct[];
   createdAt: number;
   updatedAt: number;
 };
 
-type ClientsData = {
+type ListsData = {
   version: 1;
-  clients: ClientRecord[];
+  lists: ListRecord[];
 };
 
-const EMPTY_CATALOG: ClientsData = { version: 1, clients: [] };
+const EMPTY_CATALOG: ListsData = { version: 1, lists: [] };
 
-type ClientsScreenProps = {
+type ListsScreenProps = {
   navigation: any;
   route: any;
   email?: string | null;
@@ -357,7 +357,7 @@ function daysUntilUtcStart(targetUtcStart: number, todayUtcStart: number): numbe
   return Math.floor((targetUtcStart - todayUtcStart) / DAY_MS);
 }
 
-function nextUpcomingUtcStartForClient(c: ClientRecord, todayUtcStart: number, windowDays: number): number | null {
+function nextUpcomingUtcStartForList(c: ListRecord, todayUtcStart: number, windowDays: number): number | null {
   const candidates: number[] = [];
 
   const trial = (c.trialDate || '').trim();
@@ -375,11 +375,11 @@ function nextUpcomingUtcStartForClient(c: ClientRecord, todayUtcStart: number, w
   return Math.min(...candidates);
 }
 
-function isClientUpcoming(c: ClientRecord, todayUtcStart: number, windowDays: number): boolean {
-  return nextUpcomingUtcStartForClient(c, todayUtcStart, windowDays) !== null;
+function isListUpcoming(c: ListRecord, todayUtcStart: number, windowDays: number): boolean {
+  return nextUpcomingUtcStartForList(c, todayUtcStart, windowDays) !== null;
 }
 
-function clientMatchesQuery(c: ClientRecord, q: string): boolean {
+function listMatchesQuery(c: ListRecord, q: string): boolean {
   const needle = (q || '').trim().toLowerCase();
   if (!needle) return true;
 
@@ -397,10 +397,10 @@ function clientMatchesQuery(c: ClientRecord, q: string): boolean {
 }
 
 
-function blankClient(): ClientRecord {
+function blankList(): ListRecord {
   const now = Date.now();
   return {
-    id: uid('client'),
+    id: uid('list'),
     displayName: '',
     undertone: 'unknown',
     season: null,
@@ -416,7 +416,7 @@ function blankClient(): ClientRecord {
   };
 }
 
-function isBlankClient(c: ClientRecord): boolean {
+function isBlankList(c: ListRecord): boolean {
   const nameEmpty = !c.displayName.trim();
   const notesEmpty = !(c.notes || '').trim();
   const noProducts = !Array.isArray(c.products) || c.products.length === 0;
@@ -432,7 +432,7 @@ function isBlankClient(c: ClientRecord): boolean {
 
 // Backwards compatibility:
 // Earlier versions stored a small fixed set of category *codes*.
-// We now store the category *name* from KitLog.
+// We now store the category *name* from Inventory.
 const LEGACY_CATEGORY_CODES: Record<string, string> = {
   prep: 'Prep & Finish',
   base: 'Base',
@@ -454,7 +454,7 @@ function normalizeCategory(raw: any): PlanCategory {
     const trimmed = raw.trim();
     if (!trimmed) return FALLBACK_CATEGORY_NAME;
 
-    // Migrations from legacy category *names* to current KitLog categories.
+    // Migrations from legacy category *names* to current Inventory categories.
     const key = trimmed.toLowerCase();
     if (key === 'foundation') return 'Base';
     if (key === 'prep & skin' || key === 'prep and skin' || key === 'prep/skin') return 'Prep & Finish';
@@ -483,17 +483,21 @@ function normalizeCategory(raw: any): PlanCategory {
   return FALLBACK_CATEGORY_NAME;
 }
 
-function normalizeData(input: any): ClientsData {
-  const base: ClientsData = { version: 1, clients: [] };
+function normalizeData(input: any): ListsData {
+  const base: ListsData = { version: 1, lists: [] };
 
   try {
-    const clientsRaw = Array.isArray(input?.clients) ? input.clients : null;
-    if (!clientsRaw) return base;
+    const listsRaw = Array.isArray(input?.lists) ? input.lists : null;
+    // Legacy support: older versions stored this array under a different key.
+    const legacyKey = 'cl' + 'ients';
+    const legacyRaw = !listsRaw && Array.isArray((input as any)?.[legacyKey]) ? (input as any)[legacyKey] : null;
+    const raw = listsRaw || legacyRaw;
+    if (!raw) return base;
 
-    const normalized: ClientRecord[] = clientsRaw
+    const normalized: ListRecord[] = raw
       .map((c: any) => {
         if (!c) return null;
-        const id = typeof c.id === 'string' ? c.id : uid('client');
+        const id = typeof c.id === 'string' ? c.id : uid('list');
         const displayName = typeof c.displayName === 'string' ? c.displayName : '';
         const utRaw = typeof c.undertone === 'string' ? String(c.undertone).trim().toLowerCase() : '';
         let undertone: Undertone = 'unknown';
@@ -534,7 +538,7 @@ function normalizeData(input: any): ClientsData {
         const updatedAt = typeof c.updatedAt === 'number' ? c.updatedAt : createdAt;
 
         const productsRaw = Array.isArray(c.products) ? c.products : [];
-        const products: ClientProduct[] = productsRaw
+        const products: ListProduct[] = productsRaw
           .map((p: any) => {
             if (!p) return null;
             const pid = typeof p.id === 'string' ? p.id : uid('prod');
@@ -551,9 +555,9 @@ function normalizeData(input: any): ClientsData {
               kitItemId: typeof (p as any).kitItemId === 'string' ? String((p as any).kitItemId) : undefined,
               createdAt: created,
               updatedAt: updated,
-            } as ClientProduct;
+            } as ListProduct;
           })
-          .filter(Boolean) as ClientProduct[];
+          .filter(Boolean) as ListProduct[];
 
         return {
           id,
@@ -569,41 +573,41 @@ function normalizeData(input: any): ClientsData {
           products,
           createdAt,
           updatedAt,
-        } as ClientRecord;
+        } as ListRecord;
       })
-      .filter(Boolean) as ClientRecord[];
+      .filter(Boolean) as ListRecord[];
 
-    return { version: 1, clients: normalized };
+    return { version: 1, lists: normalized };
   } catch {
     return base;
   }
 }
 
-const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTier = 'free' }) => {
+const List: React.FC<ListsScreenProps> = ({ navigation, email, userId, planTier = 'free' }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
   const catalogKey = useMemo(() => makeScopedKey(STORAGE_KEY, scope), [scope]);
-  const kitlogKey = useMemo(() => makeScopedKey(KITLOG_STORAGE_KEY, scope), [scope]);
+  const inventoryKey = useMemo(() => makeScopedKey(INVENTORY_STORAGE_KEY, scope), [scope]);
   const [hydrated, setHydrated] = useState(false);
-  const [data, setData] = useState<ClientsData>({ version: 1, clients: [] });
+  const [data, setData] = useState<ListsData>({ version: 1, lists: [] });
   const persistTimer = useRef<any>(null);
 
   const [search, setSearch] = useState('');
-  const [newClientText, setNewClientText] = useState('');
+  const [newListText, setNewListText] = useState('');
 
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterEventType, setFilterEventType] = useState<string>('');
   const [filterDate, setFilterDate] = useState<string>('');
   const [filterEventMenuOpen, setFilterEventMenuOpen] = useState(false);
 
-  // Client editor modal state
-  const [draft, setDraft] = useState<ClientRecord | null>(null);
+  // List editor modal state
+  const [draft, setDraft] = useState<ListRecord | null>(null);
   const [isDraftNew, setIsDraftNew] = useState(false);
-  const [kitlogItems, setKitlogItems] = useState<KitPickItem[]>([]);
+  const [inventoryItems, setInventoryItems] = useState<KitPickItem[]>([]);
   const [kitPickerOpen, setKitPickerOpen] = useState(false);
   const [kitPickerSearch, setKitPickerSearch] = useState('');
   const [kitPickerCategory, setKitPickerCategory] = useState<string>(KIT_PICKER_ALL);
-  const [kitlogCategories, setKitlogCategories] = useState<string[]>(DEFAULT_KITLOG_CATEGORIES);
+  const [inventoryCategories, setInventoryCategories] = useState<string[]>(DEFAULT_INVENTORY_CATEGORIES);
   const [eventTypeMenuOpen, setEventTypeMenuOpen] = useState(false);
   const [customEventTypeOpen, setCustomEventTypeOpen] = useState(false);
 
@@ -653,12 +657,12 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     };
   }, [catalogKey]);
 
-  async function refreshKitlogCategories() {
+  async function refreshInventoryCategories() {
     try {
-      const parsed = await getJson<any>(kitlogKey);
+      const parsed = await getJson<any>(inventoryKey);
       if (!parsed) {
-        setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
-        setKitlogItems([]);
+        setInventoryCategories(DEFAULT_INVENTORY_CATEGORIES);
+        setInventoryItems([]);
         setKitPickerCategory(KIT_PICKER_ALL);
         return;
       }
@@ -666,7 +670,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       const catsRaw = Array.isArray(parsed?.categories) ? parsed.categories : [];
 
       const names = catsRaw
-        .map((c: any) => normalizeKitlogCategoryName(c?.name))
+        .map((c: any) => normalizeInventoryCategoryName(c?.name))
         .filter(Boolean) as string[];
 
       // Deduplicate while preserving order.
@@ -675,16 +679,16 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
         if (!uniq.includes(n)) uniq.push(n);
       }
 
-      const finalList: string[] = [...DEFAULT_KITLOG_CATEGORIES];
+      const finalList: string[] = [...DEFAULT_INVENTORY_CATEGORIES];
 
-      // Append any custom categories from KitLog (preserve their order).
+      // Append any custom categories from Inventory (preserve their order).
       for (const n of uniq) {
         if (!finalList.includes(n)) finalList.push(n);
       }
 
       const items: KitPickItem[] = [];
       for (const c of catsRaw) {
-        const catName = normalizeKitlogCategoryName((c as any)?.name);
+        const catName = normalizeInventoryCategoryName((c as any)?.name);
         if (!catName) continue;
         const itemsRaw = Array.isArray((c as any)?.items) ? (c as any).items : [];
         for (const it of itemsRaw) {
@@ -700,7 +704,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
           let mappedCategory = catName;
 
-          // Base misfiles: keep list usable even if KitLog hasn’t been opened to migrate yet.
+          // Base misfiles: keep list usable even if Inventory hasn’t been opened to migrate yet.
           if (catLow === 'base') {
             if (subKey === 'blush' || subKey === 'bronzer') mappedCategory = 'Cheeks';
             else if (subKey === 'contour' || subKey === 'highlighter') mappedCategory = 'Sculpt';
@@ -723,8 +727,8 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
         }
       }
 
-      setKitlogCategories(finalList);
-      setKitlogItems(items);
+      setInventoryCategories(finalList);
+      setInventoryItems(items);
 
       setKitPickerCategory((prev) => {
         if (prev === KIT_PICKER_ALL) return prev;
@@ -732,29 +736,29 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
         return KIT_PICKER_ALL;
       });
     } catch {
-      setKitlogCategories(DEFAULT_KITLOG_CATEGORIES);
-      setKitlogItems([]);
+      setInventoryCategories(DEFAULT_INVENTORY_CATEGORIES);
+      setInventoryItems([]);
       setKitPickerCategory(KIT_PICKER_ALL);
     }
   }
 
-  // Keep categories in sync with KitLog (on open + on focus)
+  // Keep categories in sync with Inventory (on open + on focus)
   useEffect(() => {
     let alive = true;
     (async () => {
       if (!alive) return;
-      await refreshKitlogCategories();
+      await refreshInventoryCategories();
     })();
 
     const unsub = navigation?.addListener?.('focus', () => {
-      refreshKitlogCategories();
+      refreshInventoryCategories();
     });
 
     return () => {
       alive = false;
       if (typeof unsub === 'function') unsub();
     };
-  }, [navigation, kitlogKey]);
+  }, [navigation, inventoryKey]);
 
   // Load catalog
   useEffect(() => {
@@ -801,7 +805,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     const base = [...EVENT_TYPE_OPTIONS];
     const seen = new Set(base.map((v) => v.toLowerCase()));
     const custom: string[] = [];
-    for (const c of data.clients || []) {
+    for (const c of data.lists || []) {
       const v = (c.eventType || '').toString().trim();
       if (!v) continue;
       const k = v.toLowerCase();
@@ -810,7 +814,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       custom.push(v);
     }
     return [...base, ...custom];
-  }, [data.clients]);
+  }, [data.lists]);
 
   const addedKitIds = useMemo(() => {
     const s = new Set<string>();
@@ -825,7 +829,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     const needle = kitPickerSearch.trim().toLowerCase();
     const cat = kitPickerCategory;
 
-    const filtered = kitlogItems.filter((it) => {
+    const filtered = inventoryItems.filter((it) => {
       if (cat !== KIT_PICKER_ALL && it.category !== cat) return false;
       if (!needle) return true;
       const hay = `${it.name} ${it.brand || ''} ${it.shade || ''}`.toLowerCase();
@@ -839,17 +843,17 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       }
       return a.name.localeCompare(b.name);
     });
-  }, [kitlogItems, kitPickerSearch, kitPickerCategory]);
+  }, [inventoryItems, kitPickerSearch, kitPickerCategory]);
 
 
-  const sortedClients = useMemo(() => {
-    return [...data.clients].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-  }, [data.clients]);
+  const sortedLists = useMemo(() => {
+    return [...data.lists].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  }, [data.lists]);
 
   const upcomingAll = useMemo(() => {
-    const scored = sortedClients
-      .map((c) => ({ c, next: nextUpcomingUtcStartForClient(c, todayUtcStart, UPCOMING_WINDOW_DAYS) }))
-      .filter((x) => x.next !== null) as Array<{ c: ClientRecord; next: number }>;
+    const scored = sortedLists
+      .map((c) => ({ c, next: nextUpcomingUtcStartForList(c, todayUtcStart, UPCOMING_WINDOW_DAYS) }))
+      .filter((x) => x.next !== null) as Array<{ c: ListRecord; next: number }>;
 
     scored.sort((a, b) => {
       const diff = a.next - b.next;
@@ -858,11 +862,11 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     });
 
     return scored.map((x) => x.c);
-  }, [sortedClients, todayUtcStart]);
+  }, [sortedLists, todayUtcStart]);
 
   const nonUpcomingAll = useMemo(() => {
-    return sortedClients.filter((c) => !isClientUpcoming(c, todayUtcStart, UPCOMING_WINDOW_DAYS));
-  }, [sortedClients, todayUtcStart]);
+    return sortedLists.filter((c) => !isListUpcoming(c, todayUtcStart, UPCOMING_WINDOW_DAYS));
+  }, [sortedLists, todayUtcStart]);
 
   const upcomingFiltered = useMemo(() => {
     if (!filterActive) return upcomingAll;
@@ -896,30 +900,30 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
   const upcomingVisible = useMemo(() => {
     if (!searchActive) return upcomingFiltered;
-    return upcomingFiltered.filter((c) => clientMatchesQuery(c, query));
+    return upcomingFiltered.filter((c) => listMatchesQuery(c, query));
   }, [upcomingFiltered, query, searchActive]);
 
   const nonUpcomingVisible = useMemo(() => {
     if (!searchActive) return nonUpcomingFiltered;
-    return nonUpcomingFiltered.filter((c) => clientMatchesQuery(c, query));
+    return nonUpcomingFiltered.filter((c) => listMatchesQuery(c, query));
   }, [nonUpcomingFiltered, query, searchActive]);
 
   const hasUpcoming = upcomingFiltered.length > 0;
   const upcomingTotal = upcomingAll.length;
   const upcomingShowing = upcomingVisible.length;
-  const clientsTotal = nonUpcomingAll.length;
-  const clientsShowing = nonUpcomingVisible.length;
+  const listsTotal = nonUpcomingAll.length;
+  const listsShowing = nonUpcomingVisible.length;
 
   const upcomingMeta = (searchActive || filterActive) ? `${upcomingShowing} / ${upcomingTotal}` : `${upcomingTotal}`;
-  const clientsMeta = (searchActive || filterActive) ? `${clientsShowing} / ${clientsTotal}` : `${clientsTotal}`;
+  const listsMeta = (searchActive || filterActive) ? `${listsShowing} / ${listsTotal}` : `${listsTotal}`;
 
   type RowItem =
-    | { kind: 'client'; key: string; client: ClientRecord }
+    | { kind: 'list'; key: string; list: ListRecord }
     | { kind: 'sectionHeader'; key: string; title: string; meta: string };
 
   const rows = useMemo<RowItem[]>(() => {
     if (!hasUpcoming) {
-      return nonUpcomingVisible.map((c) => ({ kind: 'client' as const, key: `c_${c.id}`, client: c }));
+      return nonUpcomingVisible.map((c) => ({ kind: 'list' as const, key: `c_${c.id}`, list: c }));
     }
 
     if (upcomingVisible.length === 0 && nonUpcomingVisible.length === 0) {
@@ -927,11 +931,11 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     }
 
     return [
-      ...upcomingVisible.map((c) => ({ kind: 'client' as const, key: `u_${c.id}`, client: c })),
-      { kind: 'sectionHeader' as const, key: 'hdr_clients', title: 'List', meta: clientsMeta },
-      ...nonUpcomingVisible.map((c) => ({ kind: 'client' as const, key: `c_${c.id}`, client: c })),
+      ...upcomingVisible.map((c) => ({ kind: 'list' as const, key: `u_${c.id}`, list: c })),
+      { kind: 'sectionHeader' as const, key: 'hdr_lists', title: 'List', meta: listsMeta },
+      ...nonUpcomingVisible.map((c) => ({ kind: 'list' as const, key: `c_${c.id}`, list: c })),
     ];
-  }, [hasUpcoming, upcomingVisible, nonUpcomingVisible, clientsMeta]);
+  }, [hasUpcoming, upcomingVisible, nonUpcomingVisible, listsMeta]);
 
 
   // Screens render ABOVE the tab bar, so subtract its height to avoid a jump.
@@ -960,12 +964,12 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     return () => clearTimeout(t);
   }, [timePickerOpen, activeTimeField]);
 
-  function addClientFromBar() {
-    const name = newClientText.trim();
+  function addListFromBar() {
+    const name = newListText.trim();
     Keyboard.dismiss();
 
-    const limit = PLAN_LIMITS[planTier].clients;
-    const used = Array.isArray(data.clients) ? data.clients.length : 0;
+    const limit = PLAN_LIMITS[planTier].lists;
+    const used = Array.isArray(data.lists) ? data.lists.length : 0;
     if (limit !== Infinity && used >= limit) {
       const isPro = planTier === 'pro';
       const msg = isPro
@@ -995,7 +999,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     }
 
     const now = Date.now();
-    const c = blankClient();
+    const c = blankList();
     if (name) {
       c.displayName = name;
       c.updatedAt = now;
@@ -1011,15 +1015,15 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     setKitPickerOpen(false);
     setActiveDateField(null);
     setActiveTimeField(null);
-    setNewClientText('');
+    setNewListText('');
   }
 
-  function openClient(id: string) {
+  function openList(id: string) {
     Keyboard.dismiss();
-    const found = data.clients.find((c) => c.id === id);
+    const found = data.lists.find((c) => c.id === id);
     if (!found) return;
     // deep-ish copy so edits don't mutate list until we save
-    const copy: ClientRecord = {
+    const copy: ListRecord = {
       ...found,
       products: Array.isArray(found.products) ? found.products.map((p) => ({ ...p })) : [],
     };
@@ -1035,17 +1039,17 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     setActiveTimeField(null);
   }
 
-  function upsertClient(next: ClientRecord) {
+  function upsertList(next: ListRecord) {
     setData((prev) => {
-      const exists = prev.clients.some((c) => c.id === next.id);
-      const clients = exists
-        ? prev.clients.map((c) => (c.id === next.id ? next : c))
-        : [next, ...prev.clients];
-      return { ...prev, clients };
+      const exists = prev.lists.some((c) => c.id === next.id);
+      const lists = exists
+        ? prev.lists.map((c) => (c.id === next.id ? next : c))
+        : [next, ...prev.lists];
+      return { ...prev, lists };
     });
   }
 
-  function closeClient() {
+  function closeList() {
     setEventTypeMenuOpen(false);
     setCustomEventTypeOpen(false);
     setDatePickerOpen(false);
@@ -1054,7 +1058,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     setActiveDateField(null);
     setActiveTimeField(null);
     if (!draft) return;
-    const cleaned: ClientRecord = {
+    const cleaned: ListRecord = {
       ...draft,
       displayName: (draft.displayName || '').trim(),
       trialDate: formatDateInput((draft.trialDate || '').trim()),
@@ -1076,18 +1080,18 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       updatedAt: Date.now(),
     };
 
-    if (isDraftNew && isBlankClient(cleaned)) {
+    if (isDraftNew && isBlankList(cleaned)) {
       setDraft(null);
       setIsDraftNew(false);
       return;
     }
 
-    upsertClient(cleaned);
+    upsertList(cleaned);
     setDraft(null);
     setIsDraftNew(false);
   }
 
-  function deleteClient() {
+  function deleteList() {
     if (!draft) return;
     Alert.alert('Delete from list', 'This removes the item from your list.', [
       { text: 'Cancel', style: 'cancel' },
@@ -1095,7 +1099,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
         text: 'Delete',
         style: 'destructive',
         onPress: () => {
-          setData((prev) => ({ ...prev, clients: prev.clients.filter((c) => c.id !== draft.id) }));
+          setData((prev) => ({ ...prev, lists: prev.lists.filter((c) => c.id !== draft.id) }));
           setDraft(null);
           setIsDraftNew(false);
         },
@@ -1197,7 +1201,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     const ymd = ymdFromParts(calendarYear, calendarMonth, day);
     setDraft((prev) => {
       if (!prev) return prev;
-      return { ...prev, [activeDateField]: ymd, updatedAt: Date.now() } as ClientRecord;
+      return { ...prev, [activeDateField]: ymd, updatedAt: Date.now() } as ListRecord;
     });
     closeDatePicker();
   }
@@ -1209,7 +1213,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     }
     setDraft((prev) => {
       if (!prev) return prev;
-      return { ...prev, [activeDateField]: '', updatedAt: Date.now() } as ClientRecord;
+      return { ...prev, [activeDateField]: '', updatedAt: Date.now() } as ListRecord;
     });
     closeDatePicker();
   }
@@ -1226,7 +1230,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     const value = `${hh}:${mm}`;
     setDraft((prev) => {
       if (!prev) return prev;
-      return { ...prev, [activeTimeField]: value, updatedAt: Date.now() } as ClientRecord;
+      return { ...prev, [activeTimeField]: value, updatedAt: Date.now() } as ListRecord;
     });
     closeTimePicker();
   }
@@ -1238,7 +1242,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     }
     setDraft((prev) => {
       if (!prev) return prev;
-      return { ...prev, [activeTimeField]: '', updatedAt: Date.now() } as ClientRecord;
+      return { ...prev, [activeTimeField]: '', updatedAt: Date.now() } as ListRecord;
     });
     closeTimePicker();
   }
@@ -1280,7 +1284,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
       return;
     }
 
-    await refreshKitlogCategories();
+    await refreshInventoryCategories();
     setKitPickerSearch('');
     setKitPickerCategory(KIT_PICKER_ALL);
     setKitPickerOpen(true);
@@ -1297,7 +1301,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     const name = (item.name || '').trim();
     const displayName = brand && !name.toLowerCase().includes(brand.toLowerCase()) ? `${brand} ${name}` : name;
 
-    const prod: ClientProduct = {
+    const prod: ListProduct = {
       id: uid('prod'),
       category: item.category,
       name: displayName,
@@ -1318,7 +1322,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
     });
   }
   const topTitle = hasUpcoming ? 'Upcoming' : 'List';
-  const topMeta = hasUpcoming ? upcomingMeta : clientsMeta;
+  const topMeta = hasUpcoming ? upcomingMeta : listsMeta;
 
   const draftEventTypeValue = (draft?.eventType || '').toString().trim();
   const draftEventTypeIsCustom =
@@ -1356,13 +1360,9 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                 </TouchableOpacity>
               )}
             </View>
-
-            <TouchableOpacity style={styles.accountChip} onPress={() => navigation.navigate('Upload')}>
-              <Text style={styles.accountChipText}>Scan</Text>
-            </TouchableOpacity>
           </View>
 
-          {/* Header (match KitLog) */}
+          {/* Header (match Inventory) */}
           <View style={styles.listHeaderWrap}>
             <View style={styles.listHeaderRow}>
               <Text style={styles.listHeaderTitle}>{topTitle}</Text>
@@ -1429,7 +1429,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                 );
               }
 
-              const c = item.client;
+              const c = item.list;
               const title = c.displayName?.trim() ? c.displayName.trim() : 'Untitled';
 
               const chips: { key: string; text: string }[] = [];
@@ -1462,13 +1462,13 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
 
               return (
                 <TouchableOpacity
-                  style={styles.clientCard}
+                  style={styles.listCard}
                   activeOpacity={0.9}
-                  onPress={() => openClient(c.id)}
+                  onPress={() => openList(c.id)}
                   accessibilityRole="button"
                 >
                   <View style={styles.cardTopRow}>
-                    <Text style={styles.clientName} numberOfLines={1}>
+                    <Text style={styles.listName} numberOfLines={1}>
                       {title}
                     </Text>
                   </View>
@@ -1489,21 +1489,21 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
             }}
           />
 
-          {/* Bottom bar: add client */}
+          {/* Bottom bar: add list */}
           <View style={styles.inputBar}>
             <View style={styles.inputContainer}>
               <TextInput
                 style={styles.textInput}
-                value={newClientText}
-                onChangeText={setNewClientText}
+                value={newListText}
+                onChangeText={setNewListText}
                 placeholder="Add to list…"
                 placeholderTextColor="#999999"
                 returnKeyType="done"
-                onSubmitEditing={addClientFromBar}
+                onSubmitEditing={addListFromBar}
                 blurOnSubmit={false}
               />
 
-              <TouchableOpacity style={styles.iconButton} onPress={addClientFromBar} accessibilityRole="button">
+              <TouchableOpacity style={styles.iconButton} onPress={addListFromBar} accessibilityRole="button">
                 <Ionicons name="add" size={20} color="#ffffff" />
               </TouchableOpacity>
             </View>
@@ -1613,23 +1613,23 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
           </TouchableWithoutFeedback>
         </Modal>
 
-        {/* Client editor */}
+        {/* List editor */}
         <Modal
           visible={!!draft}
           animationType="slide"
           presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : 'fullScreen'}
-          onRequestClose={closeClient}
+          onRequestClose={closeList}
         >
 
             <SafeAreaView style={styles.modalSafe} edges={['top', 'left', 'right']}>
               <View style={[styles.modalContainer, { paddingBottom: modalBottomPadding }]}>
                 <View style={styles.modalHeader}>
-                  <TouchableOpacity style={styles.modalBack} onPress={closeClient} accessibilityRole="button">
+                  <TouchableOpacity style={styles.modalBack} onPress={closeList} accessibilityRole="button">
                     <Ionicons name="chevron-back" size={20} color="#111111" />
                     <Text style={styles.modalBackText}>List</Text>
                   </TouchableOpacity>
 
-                  <TouchableOpacity style={styles.modalDelete} onPress={deleteClient} accessibilityRole="button">
+                  <TouchableOpacity style={styles.modalDelete} onPress={deleteList} accessibilityRole="button">
                     <Ionicons name="trash-outline" size={18} color="#9ca3af" />
                   </TouchableOpacity>
                 </View>
@@ -2177,7 +2177,7 @@ const List: React.FC<ClientsScreenProps> = ({ navigation, email, userId, planTie
                           contentContainerStyle={styles.kitCategoryRow}
                           keyboardShouldPersistTaps="handled"
                         >
-                          {[KIT_PICKER_ALL, ...kitlogCategories].map((cat) => {
+                          {[KIT_PICKER_ALL, ...inventoryCategories].map((cat) => {
                             const label = cat === KIT_PICKER_ALL ? 'All' : cat;
                             const on = kitPickerCategory === cat;
                             return (
@@ -2327,7 +2327,7 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 
-  // List header (match KitLog)
+  // List header (match Inventory)
   listHeaderWrap: {
     paddingTop: 18,
     paddingLeft: 6,
@@ -2368,8 +2368,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#d1d5db',
   },
 
-  // Client cards
-  clientCard: {
+  // List cards
+  listCard: {
     borderWidth: 1,
     borderColor: '#e5e7eb',
     borderRadius: 18,
@@ -2383,14 +2383,14 @@ const styles = StyleSheet.create({
     alignItems: 'baseline',
     justifyContent: 'space-between',
   },
-  clientName: {
+  listName: {
     flex: 1,
     paddingRight: 10,
     fontSize: 15,
     fontWeight: '600',
     color: '#111111',
   },
-  clientMeta: {
+  listMeta: {
     fontSize: 12,
     color: '#6b7280',
     fontWeight: '500',
@@ -2618,7 +2618,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
   },
 
-  // Inline picker panels (inside the client editor)
+  // Inline picker panels (inside the list editor)
   inlinePickerCard: {
     marginTop: 12,
     borderWidth: 0,

@@ -27,7 +27,7 @@ import { useRevenueCat } from '../revenuecat/revenuecatprovider';
 
 import { SafeAreaView, initialWindowMetrics, useSafeAreaInsets } from 'react-native-safe-area-context';
 
-const KITLOG_STORAGE_KEY = DOC_KEYS.kitlog;
+const INVENTORY_STORAGE_KEY = DOC_KEYS.inventory;
 
 
 function formatPercent(used: number, limit: number): string {
@@ -158,7 +158,7 @@ const Account: React.FC<AccountScreenProps> = ({
 }) => {
   // Scope local data per user (stable id preferred; fall back to email).
   const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
-  const kitlogKey = makeScopedKey(KITLOG_STORAGE_KEY, scope);
+  const inventoryKey = makeScopedKey(INVENTORY_STORAGE_KEY, scope);
   const emailTrimmed = (email || '').trim();
   const tokenTrimmed = (token || '').trim();
 
@@ -366,7 +366,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
     const refresh = async () => {
       try {
-        const raw = await getString(kitlogKey);
+        const raw = await getString(inventoryKey);
         const usage = countKitUsageFromRaw(raw);
         if (alive) {
           setKitCategoryCount(usage.categories);
@@ -391,7 +391,7 @@ const Account: React.FC<AccountScreenProps> = ({
       alive = false;
       if (typeof unsubscribe === 'function') unsubscribe();
     };
-  }, [navigation, tokenTrimmed, kitlogKey]);
+  }, [navigation, tokenTrimmed, inventoryKey]);
 
   const handleLogoutPress = async () => {
     Keyboard.dismiss();
@@ -1390,7 +1390,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const usagePercentValue = formatPercent(uploadsUsedThisMonth, limits.uploads);
 
-  const catalogPercentValue = formatPercent(clientsUsedThisMonth, limits.clients);
+  const catalogPercentValue = formatPercent(clientsUsedThisMonth, limits.lists);
 
   const kitPercentValue = formatPercent(kitItemCount, limits.items);
 
@@ -1429,19 +1429,6 @@ const Account: React.FC<AccountScreenProps> = ({
               </TouchableOpacity>
             )}
           </View>
-
-          <TouchableOpacity
-            style={styles.accountChip}
-            onPress={() => {
-              Keyboard.dismiss();
-              navigation.navigate('Upload');
-            }}
-            activeOpacity={0.85}
-            accessibilityRole="button"
-            accessibilityLabel="Scan"
-          >
-            <Text style={styles.accountChipText}>Scan</Text>
-          </TouchableOpacity>
         </View>
 
         {/* Middle area */}
