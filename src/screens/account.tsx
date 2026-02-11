@@ -177,7 +177,7 @@ const Account: React.FC<AccountScreenProps> = ({
   const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
   const [emailUpdatesEnabled, setEmailUpdatesEnabled] = useState(true);
   const [uploadsUsedThisMonth, setUploadsUsedThisMonth] = useState(0);
-  const [clientsUsedThisMonth, setClientsUsedThisMonth] = useState(0);
+  const [listsUsedThisMonth, setListsUsedThisMonth] = useState(0);
   const [kitCategoryCount, setKitCategoryCount] = useState(0);
   const [kitItemCount, setKitItemCount] = useState(0);
   const [settingsQuery, setSettingsQuery] = useState('');
@@ -319,20 +319,20 @@ const Account: React.FC<AccountScreenProps> = ({
       );
       if (Number.isFinite(nextUploads)) setUploadsUsedThisMonth(nextUploads);
 
-      const nextClients = Number(
-        usage?.clientsThisMonth ??
-          usage?.clients_this_month ??
-          usage?.clientsMonth ??
-          usage?.clients_month ??
-          usage?.clients_used ??
-          usage?.clientsUsed ??
-          usage?.clients ??
-          usage?.clientCount ??
-          usage?.clientsCount ??
-          usage?.client_count ??
+      const nextLists = Number(
+        usage?.listsThisMonth ??
+          usage?.lists_this_month ??
+          usage?.listsMonth ??
+          usage?.lists_month ??
+          usage?.lists_used ??
+          usage?.listsUsed ??
+          usage?.lists ??
+          usage?.listCount ??
+          usage?.listsCount ??
+          usage?.list_count ??
           0
       );
-      if (Number.isFinite(nextClients)) setClientsUsedThisMonth(nextClients);
+      if (Number.isFinite(nextLists)) setListsUsedThisMonth(nextLists);
 
       const nextCats = Number(
         usage?.categories ??
@@ -981,7 +981,7 @@ const Account: React.FC<AccountScreenProps> = ({
                         if (swapped) return f;
                         if (/scans/i.test(String(f))) {
                           swapped = true;
-                          return 'Up to 1,200 scans per year';
+                          return 'Up to 250 scans per year';
                         }
                         return f;
                       });
@@ -1390,7 +1390,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const usagePercentValue = formatPercent(uploadsUsedThisMonth, limits.uploads);
 
-  const catalogPercentValue = formatPercent(clientsUsedThisMonth, limits.lists);
+  const catalogPercentValue = formatPercent(listsUsedThisMonth, limits.lists);
 
   const kitPercentValue = formatPercent(kitItemCount, limits.items);
 
@@ -1671,21 +1671,6 @@ const Account: React.FC<AccountScreenProps> = ({
                         </View>
                       )}
 
-                      {showRestorePurchases && (
-                        <View style={styles.row}>
-                          <Text style={styles.rowLabel}>Restore plan</Text>
-                          <TouchableOpacity
-                            activeOpacity={0.8}
-                            onPress={restorePurchases}
-                            disabled={saving}
-                            accessibilityRole="button"
-                            accessibilityLabel="Restore purchases"
-                          >
-                            <Text style={[styles.rowRightAction, saving && { opacity: 0.6 }]}>Restore</Text>
-                          </TouchableOpacity>
-                        </View>
-                      )}
-
                       {showBilling && (
                         <TouchableOpacity
                           style={styles.row}
@@ -1699,6 +1684,25 @@ const Account: React.FC<AccountScreenProps> = ({
                           <View style={styles.rowRightWrap}>
                             <Text style={[styles.rowRightAction, saving && { opacity: 0.6 }]}>Update</Text>
                           </View>
+                        </TouchableOpacity>
+                      )}
+
+                      {showRestorePurchases && (
+                        <TouchableOpacity
+                          style={styles.row}
+                          activeOpacity={0.8}
+                          onPress={restorePurchases}
+                          disabled={saving}
+                          accessibilityRole="button"
+                          accessibilityLabel="Restore purchases"
+                        >
+                          <Text style={styles.rowLabel}>Restore</Text>
+                          <Ionicons
+                            name="chevron-forward"
+                            size={16}
+                            color="#9ca3af"
+                            style={saving ? { opacity: 0.6 } : undefined}
+                          />
                         </TouchableOpacity>
                       )}
                     </View>

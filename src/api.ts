@@ -203,14 +203,22 @@ export const PLAN_CONFIG: Record<
   free: {
     label: 'Free',
     priceLabel: '$0',
-    features: ['Up to 5 scans / mo', 'Up to 5 names on your list', 'Up to 5 custom categories', 'Up to 5 kit items'],
+    features: [
+      'Up to 5 scans / mo',
+      'Up to 1 product discovery / mo',
+      'Up to 5 names on your list',
+      'Up to 5 custom categories',
+      'Up to 5 kit items',
+    ],
   },
   pro: {
     label: 'Undertone Pro',
     priceLabel: '$20 / mo',
     features: [
-      'Up to 100 scans per month',
+      'Up to 20 scans per month',
+      'Up to 10 product discoveries / month',
       'Up to 1,000 names on your list',
+      'Up to 1,000 custom categories',
       'Up to 1,000 items in your kit',
       'Undertone e-mail support',
     ],
@@ -219,11 +227,11 @@ export const PLAN_CONFIG: Record<
 
 export const PLAN_LIMITS: Record<
   PlanTier,
-  { uploads: number; lists: number; categories: number; items: number }
+  { uploads: number; discoveries: number; lists: number; categories: number; items: number }
 > = {
-  free: { uploads: 5, lists: 5, categories: 5, items: 5 },
+  free: { uploads: 5, discoveries: 1, lists: 5, categories: 5, items: 5 },
   // NOTE: items = total across all categories.
-  pro: { uploads: 100, lists: 1000, categories: Infinity, items: 1000 },
+  pro: { uploads: 20, discoveries: 10, lists: 1000, categories: 1000, items: 1000 },
 };
 
 export const PLAN_RANK: Record<PlanTier, number> = { free: 0, pro: 1 };

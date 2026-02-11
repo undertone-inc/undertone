@@ -108,3 +108,17 @@ CREATE TABLE IF NOT EXISTS face_analyses (
 
 CREATE INDEX IF NOT EXISTS idx_face_analyses_user_id_created_at
   ON face_analyses(user_id, created_at DESC);
+
+-- --- Product discoveries (for /discover-recommend usage limits) ---
+CREATE TABLE IF NOT EXISTS product_discoveries (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  category TEXT,
+  product_type TEXT,
+  undertone TEXT,
+  season TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_discoveries_user_id_created_at
+  ON product_discoveries(user_id, created_at DESC);

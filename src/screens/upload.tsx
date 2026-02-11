@@ -1261,6 +1261,7 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         }
 
         const errMsg = String(json?.error || json?.message || `HTTP ${resp.status}`);
+        const errCode = String(json?.code || '').trim();
 
         // Token expired / invalid: force re-login.
         if (maybeHandleUnauthorized(resp.status, errMsg)) {
@@ -1271,6 +1272,19 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         if (resp.status === 404) {
           lastErr = new Error(`HTTP 404`);
           continue;
+        }
+
+        // Plan/usage limits
+        if (resp.status === 402 && errCode === 'DISCOVERY_LIMIT_REACHED') {
+          const used = Number(json?.used ?? NaN);
+          const limit = Number(json?.limit ?? NaN);
+          const details = Number.isFinite(used) && Number.isFinite(limit) ? ` (${used}/${limit})` : '';
+          Alert.alert(
+            'Discovery limit reached',
+            `You’ve reached your product discovery limit${details}.` +
+              `\n\nUpgrade to Pro for up to 10 product discoveries per month.`,
+          );
+          return;
         }
 
         if (!resp.ok || !json?.ok) {
@@ -2957,14 +2971,19 @@ const styles = StyleSheet.create({
   },
   discoverSecondaryBtn: {
     marginTop: 14,
+    width: '100%',
     borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
+    borderWidth: 0,
     backgroundColor: '#ffffff',
     paddingVertical: 12,
     paddingHorizontal: 14,
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 1,
   },
   discoverSecondaryBtnText: {
     color: '#111827',

@@ -507,8 +507,31 @@ async function getUploadsUsedThisMonth(userId) {
 //   UPLOAD_LIMIT_PRO=9999
 const PLAN_UPLOAD_LIMITS = {
   free: Number(process.env.UPLOAD_LIMIT_FREE || 5),
-  pro: Number(process.env.UPLOAD_LIMIT_PRO || 100),
+  pro: Number(process.env.UPLOAD_LIMIT_PRO || 20),
 };
+
+// Product discovery limits (/discover-recommend)
+//
+// For local testing, you can bump these in .env.server without touching code:
+//   DISCOVER_LIMIT_FREE=9999
+//   DISCOVER_LIMIT_PRO=9999
+const PLAN_DISCOVER_LIMITS = {
+  free: Number(process.env.DISCOVER_LIMIT_FREE || process.env.DISCOVERY_LIMIT_FREE || 1),
+  pro: Number(process.env.DISCOVER_LIMIT_PRO || process.env.DISCOVERY_LIMIT_PRO || 10),
+};
+
+// Dev/testing escape hatch
+// Set DISABLE_DISCOVER_LIMITS=true to bypass discovery caps.
+const DISABLE_DISCOVER_LIMITS = (() => {
+  const v = String(process.env.DISABLE_DISCOVER_LIMITS || '').trim().toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes';
+})();
+
+function discoverLimitForPlan(planTier) {
+  const t = String(planTier || 'free').toLowerCase();
+  if (t === 'plus') return PLAN_DISCOVER_LIMITS.pro;
+  return PLAN_DISCOVER_LIMITS[t] ?? PLAN_DISCOVER_LIMITS.free;
+}
 
 // Dev/testing escape hatch
 // Set DISABLE_UPLOAD_LIMITS=true to bypass monthly caps (useful while testing).
@@ -524,7 +547,7 @@ function uploadLimitForPlan(planTier) {
 }
 
 
-const UPLOAD_LIMIT_PRO_YEAR = Number(process.env.UPLOAD_LIMIT_PRO_YEAR || process.env.UPLOAD_LIMIT_PRO_YEARLY || 1200);
+const UPLOAD_LIMIT_PRO_YEAR = Number(process.env.UPLOAD_LIMIT_PRO_YEAR || process.env.UPLOAD_LIMIT_PRO_YEARLY || 250);
 
 // RevenueCat (server-side subscription verification)
 // NOTE: This requires a Secret API key (sk_...) stored on the SERVER only.
@@ -574,6 +597,85 @@ function parseIsoDateOrNull(value) {
   if (!s) return null;
   const d = new Date(s);
   return Number.isFinite(d.getTime()) ? d : null;
+}
+
+// ----------------------------
+// Product discovery usage
+// ----------------------------
+
+// In-memory fallback when the DB table/migration isn't present.
+// Keyed by `${userId}|YYYY-MM`.
+const _memDiscoverCounts = new Map();
+
+function _discoverKey(userId, from) {
+  try {
+    const d = from instanceof Date ? from : new Date(from);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+    return `${userId}|${y}-${m}`;
+  } catch {
+    return `${userId}|unknown`;
+  }
+}
+
+function _memGetDiscoveriesUsedSince(userId, from) {
+  const k = _discoverKey(userId, from);
+  return Number(_memDiscoverCounts.get(k) || 0);
+}
+
+function _memIncDiscoveriesUsedSince(userId, from) {
+  const k = _discoverKey(userId, from);
+  const next = Number(_memDiscoverCounts.get(k) || 0) + 1;
+  _memDiscoverCounts.set(k, next);
+
+  // Best-effort cleanup: keep only a few recent months.
+  try {
+    const cutoff = new Date();
+    cutoff.setUTCMonth(cutoff.getUTCMonth() - 6);
+    const cy = cutoff.getUTCFullYear();
+    const cm = String(cutoff.getUTCMonth() + 1).padStart(2, "0");
+    const cutoffKeySuffix = `${cy}-${cm}`;
+    for (const key of _memDiscoverCounts.keys()) {
+      const parts = String(key).split("|");
+      const ym = parts[1] || "";
+      if (ym && ym < cutoffKeySuffix) {
+        _memDiscoverCounts.delete(key);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return next;
+}
+
+async function getDiscoveriesUsedSince(userId, from, to = null) {
+  try {
+    const params = [userId, from];
+    let sql = "SELECT COUNT(*)::int AS c FROM product_discoveries WHERE user_id = $1 AND created_at >= $2";
+    if (to) {
+      params.push(to);
+      sql += " AND created_at < $3";
+    }
+    const { rows } = await pool.query(sql, params);
+    return Number(rows?.[0]?.c || 0);
+  } catch {
+    return _memGetDiscoveriesUsedSince(userId, from);
+  }
+}
+
+async function insertProductDiscoveryRow({ userId, category, productType, undertone, season }) {
+  try {
+    const { rows } = await pool.query(
+      "INSERT INTO product_discoveries (user_id, category, product_type, undertone, season) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+      [userId, category || null, productType || null, undertone || null, season || null]
+    );
+    return rows?.[0]?.id ?? null;
+  } catch {
+    // If the DB table isn't ready, still track in memory so limits work.
+    _memIncDiscoveriesUsedSince(userId, startOfMonthUtc());
+    return null;
+  }
 }
 
 async function getUploadsUsedSince(userId, from, to = null) {
@@ -1139,6 +1241,8 @@ app.get("/me", authRequired, async (req, res) => {
     const window = usageWindowForUser(user);
     const usedThisMonth = await getUploadsUsedThisMonth(user.id);
     const usedThisPeriod = await getUploadsUsedSince(user.id, window.start, window.end);
+    const discoversThisMonth = await getDiscoveriesUsedSince(user.id, startOfMonthUtc(), null);
+    const discoverLimit = discoverLimitForPlan(window.tier);
 
     return res.json({
       ok: true,
@@ -1159,7 +1263,8 @@ app.get("/me", authRequired, async (req, res) => {
         uploadsPeriod: window.period,
         uploadsPeriodStart: window.start?.toISOString?.() || null,
         uploadsPeriodEnd: window.end?.toISOString?.() || null,
-        clientsThisMonth: 0,
+        discoveriesThisMonth: discoversThisMonth,
+        listsThisMonth: 0,
       },
       limits: {
         uploadsPerMonth: window.period === "month" ? window.limit : null,
@@ -1167,6 +1272,8 @@ app.get("/me", authRequired, async (req, res) => {
         uploadsPerPeriod: window.limit,
         uploadsPeriod: window.period,
         uploadLimitsDisabled: DISABLE_UPLOAD_LIMITS,
+        discoveriesPerMonth: discoverLimit,
+        discoverLimitsDisabled: DISABLE_DISCOVER_LIMITS,
       },
     });
   } catch (e) {
@@ -4501,6 +4608,49 @@ async function handleDiscoverRecommend(req, res) {
       return res.status(400).json({ ok: false, error: "Unknown productType" });
     }
 
+    // Enforce discover limits based on the user's actual plan (synced from RevenueCat).
+    let userForLimits = req?.auth?.user;
+    const userId = userForLimits?.id;
+    userForLimits = await syncUserPlanFromRevenueCat(userForLimits, { force: false });
+    if (req.auth) req.auth.user = userForLimits;
+
+    const tier = normalizePlanTier(userForLimits?.plan_tier ?? userForLimits?.planTier);
+    const discoverLimit = discoverLimitForPlan(tier);
+    const discoverWindowStart = startOfMonthUtc();
+    const discoversUsedThisMonth = await getDiscoveriesUsedSince(userId, discoverWindowStart, null);
+
+    if (!DISABLE_DISCOVER_LIMITS && discoversUsedThisMonth >= discoverLimit) {
+      return res.status(402).json({
+        ok: false,
+        code: "DISCOVERY_LIMIT_REACHED",
+        error: "monthly discovery limit reached",
+        used: discoversUsedThisMonth,
+        limit: discoverLimit,
+        period: "month",
+        periodStart: discoverWindowStart?.toISOString?.() || null,
+      });
+    }
+
+    const recordDiscoveryUsage = async () => {
+      if (!userId) return null;
+      return await insertProductDiscoveryRow({
+        userId,
+        category: String(categoryKey || "").trim() || null,
+        productType: String(typeRaw || "").trim() || null,
+        undertone,
+        season,
+      });
+    };
+
+    const respondOk = async (payload) => {
+      try {
+        await recordDiscoveryUsage();
+      } catch {
+        // ignore usage logging failures
+      }
+      return res.json(payload);
+    };
+
     let candidateNames = uniqStringsLower(candidates).slice(0, 30);
 
     // Prefer pencil eyeliners so Inventory exposes a Color field.
@@ -4948,11 +5098,11 @@ async function handleDiscoverRecommend(req, res) {
         if (fallbackName) productsOut.push({ name: fallbackName, why: "", shade: undefined, product_url: "", item_type: "Palette" });
       }
 
-      return res.json({ ok: true, products: productsOut, source: "eyes_two" });
+      return respondOk({ ok: true, products: productsOut, source: "eyes_two" });
     }
     if (!OPENAI_API_KEY) {
       const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
-      return res.json({ ok: true, products: enriched, source: "fallback" });
+      return respondOk({ ok: true, products: enriched, source: "fallback" });
     }
 
     const systemPrompt =
@@ -4989,7 +5139,7 @@ async function handleDiscoverRecommend(req, res) {
     } catch (e) {
       // If the model call fails, fall back.
       const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
-      return res.json({ ok: true, products: enriched, source: "fallback" });
+      return respondOk({ ok: true, products: enriched, source: "fallback" });
     }
 
     let parsed = null;
@@ -5020,11 +5170,11 @@ async function handleDiscoverRecommend(req, res) {
 
     if (!picks.length) {
       const enriched = await ensureAtLeastName(fallbackPicks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
-      return res.json({ ok: true, products: enriched, source: "fallback" });
+      return respondOk({ ok: true, products: enriched, source: "fallback" });
     }
 
     const enriched = await ensureAtLeastName(picks, { fallbacks: candidateNames, requireShade: discoverResultNeedsShade });
-    return res.json({ ok: true, products: enriched, source: "openai" });
+    return respondOk({ ok: true, products: enriched, source: "openai" });
   } catch (e) {
     console.error("discover-recommend error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });

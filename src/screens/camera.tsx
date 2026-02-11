@@ -569,9 +569,14 @@ export default function CameraScreen({ navigation, route }: any) {
                 state: {
                   index: 0,
                   routes: [
-                    { name: 'Upload', params: draftChatId ? { capturedPhoto: picked, draftChatId } : { capturedPhoto: picked } },
-                    { name: 'Clients' },
-						{ name: 'YourKit' },
+                    {
+                      name: 'Upload',
+                      params: draftChatId
+                        ? { capturedPhoto: picked, draftChatId }
+                        : { capturedPhoto: picked },
+                    },
+                    { name: 'List' },
+                    { name: 'YourKit' },
                     { name: 'Account' },
                   ],
                 },

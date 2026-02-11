@@ -26,7 +26,7 @@ export type AuthStackParamList = {
 
 export type AppTabParamList = {
   Upload: undefined;
-  Clients: undefined;
+  List: undefined;
   YourKit: undefined;
   Account: undefined;
 };
@@ -267,7 +267,7 @@ function AppTabsShell({
       </Tabs.Screen>
 
       <Tabs.Screen
-        name="Clients"
+        name="List"
         options={{
           tabBarLabel: 'your list',
           tabBarIcon: ({ color, size }) => {
