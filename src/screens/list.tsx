@@ -973,16 +973,18 @@ const List: React.FC<ListsScreenProps> = ({ navigation, email, userId, planTier 
     if (limit !== Infinity && used >= limit) {
       const isPro = planTier === 'pro';
       const msg = isPro
-        ? `You’ve reached the Pro plan limit of ${limit.toLocaleString()} list items.`
-        : `Free plan allows up to ${limit.toLocaleString()} list items. Upgrade to Pro to add more.`;
+        ? `You've reached your limit of ${limit.toLocaleString()} list items.`
+        : `You've reached your limit of ${limit.toLocaleString()} list items. Upgrade to Pro to add more.`;
+
+      const title = isPro ? 'Limit reached' : 'Upgrade to Pro';
 
       Alert.alert(
-        'List limit reached',
+        title,
         msg,
         isPro
           ? [{ text: 'OK' }]
           : [
-              { text: 'Not now', style: 'cancel' },
+              { text: 'Later', style: 'cancel' },
               {
                 text: 'Upgrade',
                 onPress: () => {

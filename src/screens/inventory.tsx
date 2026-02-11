@@ -92,8 +92,8 @@ const EYES_COLOR_ROLE_OPTIONS = ['Base/prime', 'Enhance/crease', 'Smoke', 'Pop (
 
 const STORAGE_KEY = DOC_KEYS.inventory;
 
-// Category bar fills up as you add items (cap).
-const CATEGORY_BAR_TARGET = 12;
+// Category bar fills up as you add items; reaches 100% at 100 items.
+const CATEGORY_BAR_TARGET = 100;
 
 
 // Where the bottom input bar rests when the keyboard is CLOSED.
@@ -1002,22 +1002,31 @@ const Inventory: React.FC<InventoryScreenProps> = ({ navigation, email, userId, 
       ? data.categories.filter((c) => !isCoreCategoryName(c.name)).length
       : 0;
     if (limit !== Infinity && used >= limit) {
+      const isPro = planTier === 'pro';
+      const msg = isPro
+        ? `You've reached your limit of ${limit.toLocaleString()} custom categories.`
+        : `You've reached your limit of ${limit.toLocaleString()} custom categories. Upgrade to Pro to add more.`;
+
+      const title = isPro ? 'Limit reached' : 'Upgrade to Pro';
+
       Alert.alert(
-        'Category limit reached',
-        `Free plan allows up to ${limit.toLocaleString()} custom categories. Upgrade to Pro to add more.`,
-        [
-          { text: 'Not now', style: 'cancel' },
-          {
-            text: 'Upgrade',
-            onPress: () => {
-              try {
-                navigation.navigate('Account', { openUpgrade: true });
-              } catch {
-                navigation.navigate('Account');
-              }
-            },
-          },
-        ]
+        title,
+        msg,
+        isPro
+          ? [{ text: 'OK' }]
+          : [
+              { text: 'Later', style: 'cancel' },
+              {
+                text: 'Upgrade',
+                onPress: () => {
+                  try {
+                    navigation.navigate('Account', { openUpgrade: true });
+                  } catch {
+                    navigation.navigate('Account');
+                  }
+                },
+              },
+            ]
       );
       return;
     }
@@ -1085,16 +1094,18 @@ const Inventory: React.FC<InventoryScreenProps> = ({ navigation, email, userId, 
     if (limit !== Infinity && used >= limit) {
       const isPro = planTier === 'pro';
       const msg = isPro
-        ? `You’ve reached the Pro plan limit of ${limit.toLocaleString()} kit items.`
-        : `Free plan allows up to ${limit.toLocaleString()} kit items. Upgrade to Pro to add more.`;
+        ? `You've reached your limit of ${limit.toLocaleString()} kit items.`
+        : `You've reached your limit of ${limit.toLocaleString()} kit items. Upgrade to Pro to add more.`;
+
+      const title = isPro ? 'Limit reached' : 'Upgrade to Pro';
 
       Alert.alert(
-        'Kit item limit reached',
+        title,
         msg,
         isPro
           ? [{ text: 'OK' }]
           : [
-              { text: 'Not now', style: 'cancel' },
+              { text: 'Later', style: 'cancel' },
               {
                 text: 'Upgrade',
                 onPress: () => {

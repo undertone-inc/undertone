@@ -976,13 +976,23 @@ const Account: React.FC<AccountScreenProps> = ({
 
                     const features = (() => {
                       if (billingCycle !== 'yearly') return cfg.features;
-                      let swapped = false;
+
+                      let swappedScans = false;
+                      let swappedDiscoveries = false;
+
                       return cfg.features.map((f) => {
-                        if (swapped) return f;
-                        if (/scans/i.test(String(f))) {
-                          swapped = true;
+                        const s = String(f);
+
+                        if (!swappedScans && /scan/i.test(s)) {
+                          swappedScans = true;
                           return 'Up to 250 scans per year';
                         }
+
+                        if (!swappedDiscoveries && /product\s+discover/i.test(s)) {
+                          swappedDiscoveries = true;
+                          return 'Up to 120 product discoveries per year';
+                        }
+
                         return f;
                       });
                     })();

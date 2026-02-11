@@ -206,9 +206,9 @@ export const PLAN_CONFIG: Record<
     features: [
       'Up to 5 scans / mo',
       'Up to 1 product discovery / mo',
-      'Up to 5 names on your list',
-      'Up to 5 custom categories',
-      'Up to 5 kit items',
+      'Up to 10 names on your list',
+      'Up to 10 custom categories',
+      'Up to 10 kit items',
     ],
   },
   pro: {
@@ -216,9 +216,8 @@ export const PLAN_CONFIG: Record<
     priceLabel: '$20 / mo',
     features: [
       'Up to 20 scans per month',
-      'Up to 10 product discoveries / month',
+      'Up to 10 product discoveries per month',
       'Up to 1,000 names on your list',
-      'Up to 1,000 custom categories',
       'Up to 1,000 items in your kit',
       'Undertone e-mail support',
     ],
@@ -229,7 +228,7 @@ export const PLAN_LIMITS: Record<
   PlanTier,
   { uploads: number; discoveries: number; lists: number; categories: number; items: number }
 > = {
-  free: { uploads: 5, discoveries: 1, lists: 5, categories: 5, items: 5 },
+  free: { uploads: 5, discoveries: 1, lists: 10, categories: 10, items: 10 },
   // NOTE: items = total across all categories.
   pro: { uploads: 20, discoveries: 10, lists: 1000, categories: 1000, items: 1000 },
 };

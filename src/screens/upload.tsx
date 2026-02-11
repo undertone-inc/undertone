@@ -1276,13 +1276,39 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
 
         // Plan/usage limits
         if (resp.status === 402 && errCode === 'DISCOVERY_LIMIT_REACHED') {
-          const used = Number(json?.used ?? NaN);
           const limit = Number(json?.limit ?? NaN);
-          const details = Number.isFinite(used) && Number.isFinite(limit) ? ` (${used}/${limit})` : '';
+          const hasLimit = Number.isFinite(limit);
+          const isPro = hasLimit ? limit > 1 : false;
+          const period = String(json?.period || '').trim();
+          const periodLabel = period === 'year' ? ' this year' : period === 'month' ? ' this month' : '';
+
+          const unit = hasLimit && limit === 1 ? 'product discovery' : 'product discoveries';
+          const base = hasLimit
+            ? `You've reached your limit of ${limit.toLocaleString()} ${unit}${isPro ? periodLabel : ''}.`
+            : `You've reached your ${unit} limit${isPro ? periodLabel : ''}.`;
+
+          const message = isPro ? base : `${base} Upgrade to Pro to add more.`;
+
+          const title = isPro ? 'Limit reached' : 'Upgrade to Pro';
+
           Alert.alert(
-            'Discovery limit reached',
-            `You’ve reached your product discovery limit${details}.` +
-              `\n\nUpgrade to Pro for up to 10 product discoveries per month.`,
+            title,
+            message,
+            isPro
+              ? [{ text: 'OK' }]
+              : [
+                  { text: 'Later', style: 'cancel' },
+                  {
+                    text: 'Upgrade',
+                    onPress: () => {
+                      try {
+                        navigation.navigate('Account', { openUpgrade: true });
+                      } catch {
+                        navigation.navigate('Account');
+                      }
+                    },
+                  },
+                ]
           );
           return;
         }
@@ -1662,6 +1688,44 @@ const Upload: React.FC<UploadScreenProps> = ({ navigation, route, email, userId,
         const msg = String(data?.error || `HTTP ${res.status}`);
 
         if (maybeHandleUnauthorized(res.status, msg)) {
+          return;
+        }
+
+        if (res.status === 402 && code === 'UPLOAD_LIMIT_REACHED') {
+          const limit = Number(data?.limit ?? NaN);
+          const period = String(data?.period || '').trim();
+          const hasLimit = Number.isFinite(limit);
+          const isPro = hasLimit ? limit > 5 : false;
+          const unit = hasLimit && limit === 1 ? 'scan' : 'scans';
+          const periodLabel = period === 'year' ? ' this year' : period === 'month' ? ' this month' : '';
+
+          const base = hasLimit
+            ? `You've reached your limit of ${limit.toLocaleString()} ${unit}${isPro ? periodLabel : ''}.`
+            : `You've reached your ${unit} limit${isPro ? periodLabel : ''}.`;
+
+          const message = isPro ? base : `${base} Upgrade to Pro to add more.`;
+
+          const title = isPro ? 'Limit reached' : 'Upgrade to Pro';
+
+          Alert.alert(
+            title,
+            message,
+            isPro
+              ? [{ text: 'OK' }]
+              : [
+                  { text: 'Later', style: 'cancel' },
+                  {
+                    text: 'Upgrade',
+                    onPress: () => {
+                      try {
+                        navigation.navigate('Account', { openUpgrade: true });
+                      } catch {
+                        navigation.navigate('Account');
+                      }
+                    },
+                  },
+                ]
+          );
           return;
         }
 
