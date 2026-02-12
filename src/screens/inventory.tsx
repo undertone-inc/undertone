@@ -109,11 +109,11 @@ const FOOTER_BAR_HEIGHT = 62;
 // (Raised to make the lift clearly noticeable)
 const KEYBOARD_GAP = 33;
 
-// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
+// Read API base (env overrides app.json extra)
 // IMPORTANT: Strip trailing slashes so we never generate URLs like "//infer-undertone".
 const RAW_API_BASE =
-  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
+  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 

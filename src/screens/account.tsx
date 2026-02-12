@@ -21,6 +21,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { openInAppBrowser } from '../in-app-browser';
 import { getAuthProfile, saveAuthProfile } from '../auth';
 import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
+import { copyToClipboard } from '../invites';
 import Constants from 'expo-constants';
 import { PlanTier, PLAN_CONFIG, PLAN_LIMITS, PLAN_RANK, normalizePlanTier } from '../api';
 import { useRevenueCat } from '../revenuecat/revenuecatprovider';
@@ -45,11 +46,11 @@ function formatPercent(used: number, limit: number): string {
 
 // normalizePlanTier is imported from ../api
 
-// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
+// Read API base (env overrides app.json extra)
 // IMPORTANT: Strip trailing slashes so we never generate URLs like "//billing/sync".
 const RAW_API_BASE =
-  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
+  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
@@ -223,7 +224,7 @@ const Account: React.FC<AccountScreenProps> = ({
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
 
   const [supportMessage, setSupportMessage] = useState('');
-  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteLink, setInviteLink] = useState('');
 
   useEffect(() => {
     const showEvent = Platform.OS === 'android' ? 'keyboardDidShow' : 'keyboardWillShow';
@@ -503,7 +504,7 @@ const Account: React.FC<AccountScreenProps> = ({
     setNewPassword('');
     setConfirmNewPassword('');
     setSupportMessage('');
-    setInviteEmail('');
+    setInviteLink('');
   };
 
   const openNameModal = () => {
@@ -538,7 +539,7 @@ const Account: React.FC<AccountScreenProps> = ({
   const openReferModal = () => {
     if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
-    setInviteEmail('');
+    setInviteLink('');
     setActiveModal('refer');
   };
 
@@ -687,28 +688,15 @@ const Account: React.FC<AccountScreenProps> = ({
     }
   };
 
-  const sendReferralInvite = async () => {
+  const generateInviteLink = async () => {
     if (!requireAuthOrAlert()) return;
-
-    const toEmail = inviteEmail.trim();
-    if (!toEmail) {
-      Alert.alert('Refer user', 'Please enter an email address.');
-      return;
-    }
-
-    const looksValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail);
-    if (!looksValid) {
-      Alert.alert('Refer user', 'Please enter a valid email address.');
-      return;
-    }
 
     try {
       setSaving(true);
 
-      await postJson(
-        '/referrals/invite',
+      const data = await postJson(
+        '/invites/link',
         {
-          email: toEmail,
           meta: {
             fromEmail: emailTrimmed || null,
             userId: userId ?? null,
@@ -718,18 +706,30 @@ const Account: React.FC<AccountScreenProps> = ({
         tokenTrimmed
       );
 
-      setInviteEmail('');
-      Alert.alert('Invite sent', `Invite sent to ${toEmail}.`);
+      const link = String(data?.inviteLink || data?.link || '').trim();
+      if (!link) {
+        throw new Error('Server did not return an invite link.');
+      }
+
+      setInviteLink(link);
     } catch (e: any) {
       const msg = String(e?.message || e);
       if (/404|not found/i.test(msg)) {
-        Alert.alert('Refer user', 'Referral invites are not configured yet.');
+        Alert.alert('Refer user', 'Invite links are not configured yet.');
       } else {
-        Alert.alert('Could not send invite', msg);
+        Alert.alert('Could not generate link', msg);
       }
     } finally {
       setSaving(false);
     }
+  };
+
+  const copyInviteLink = async () => {
+    const link = (inviteLink || '').trim();
+    if (!link) return;
+    const ok = await copyToClipboard(link);
+    if (ok) Alert.alert('Copied', 'Invite link copied.');
+    else Alert.alert('Copy failed', 'Could not copy invite link.');
   };
 
   const syncServerBilling = async () => {
@@ -1114,6 +1114,10 @@ const Account: React.FC<AccountScreenProps> = ({
                             <View style={styles.planActionDivider} />
                             <View style={styles.planFootRow}>
                               <View style={styles.planFootLeft}>
+                                <Text style={styles.planCancelAnytime}>
+                                  {billingCycle === 'yearly' ? 'Auto-renews yearly' : 'Auto-renews monthly'}
+                                </Text>
+                                <Text style={styles.planFootSep}> · </Text>
                                 <Text style={styles.planCancelAnytime}>Cancel anytime</Text>
                               </View>
 
@@ -1131,9 +1135,9 @@ const Account: React.FC<AccountScreenProps> = ({
       onPress={() => openInAppBrowser(PRIVACY_URL)}
       activeOpacity={0.8}
       accessibilityRole="link"
-      accessibilityLabel="Privacy Policy"
+      accessibilityLabel="Privacy"
     >
-      <Text style={[styles.planCancelAnytime, styles.planFootLink]}>Privacy Policy</Text>
+      <Text style={[styles.planCancelAnytime, styles.planFootLink]}>Privacy</Text>
     </TouchableOpacity>
   </View>
 </View>
@@ -1541,32 +1545,37 @@ const Account: React.FC<AccountScreenProps> = ({
                   <Text style={styles.supportPanelTitle}>Refer user</Text>
                 </View>
 
-<View style={styles.referInviteRow}>
-                  <TextInput
-                    value={inviteEmail}
-                    onChangeText={setInviteEmail}
-                    placeholder="Email address"
-                    placeholderTextColor="#9ca3af"
-                    style={styles.referEmailInput}
-                    keyboardType="email-address"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    returnKeyType="send"
-                    onSubmitEditing={sendReferralInvite}
-                  />
+                <View style={styles.referInviteRow}>
+                  <Pressable
+                    style={styles.referLinkBox}
+                    onPress={copyInviteLink}
+                    disabled={!inviteLink}
+                    accessibilityRole="button"
+                    accessibilityLabel="Invite link"
+                  >
+                    <Text
+                      style={[
+                        styles.referLinkText,
+                        !inviteLink && styles.referLinkPlaceholder,
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {inviteLink ? inviteLink : '...'}
+                    </Text>
+                  </Pressable>
 
                   <TouchableOpacity
                     style={[styles.referSendButton, saving && { opacity: 0.7 }]}
-                    onPress={sendReferralInvite}
+                    onPress={generateInviteLink}
                     activeOpacity={0.85}
                     disabled={saving}
                     accessibilityRole="button"
-                    accessibilityLabel="Send invite"
+                    accessibilityLabel="Generate invite link"
                   >
                     {saving ? (
                       <ActivityIndicator size="small" color="#111827" />
                     ) : (
-                      <Text style={styles.referSendText}>Send</Text>
+                      <Text style={styles.referSendText}>Link</Text>
                     )}
                   </TouchableOpacity>
                 </View>
@@ -2266,18 +2275,24 @@ const styles = StyleSheet.create({
     marginTop: 6,
     marginBottom: 22,
   },
-  referEmailInput: {
+  referLinkBox: {
     flex: 1,
     borderWidth: 1,
     borderColor: '#e5e7eb',
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    fontSize: 13,
-    color: '#111827',
     backgroundColor: '#ffffff',
     minHeight: 42,
     marginRight: 14,
+    justifyContent: 'center',
+  },
+  referLinkText: {
+    fontSize: 13,
+    color: '#111827',
+  },
+  referLinkPlaceholder: {
+    color: '#9ca3af',
   },
   referSendButton: {
     borderRadius: 12,
@@ -2403,7 +2418,7 @@ const styles = StyleSheet.create({
   },
   planCancelAnytime: {
     fontSize: 11,
-    color: '#6b7280',
+    color: '#c2c8d3',
     fontWeight: '400',
   },
   planFootRow: {
@@ -2422,11 +2437,11 @@ const styles = StyleSheet.create({
   },
   planFootSep: {
     fontSize: 11,
-    color: '#6b7280',
+    color: '#c2c8d3',
     fontWeight: '400',
   },
   planFootLink: {
-    textDecorationLine: 'underline',
+    textDecorationLine: 'none',
   },
 
   planNameRow: {

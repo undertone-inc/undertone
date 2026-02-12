@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -6,10 +6,12 @@ import {
   TouchableOpacity,
   StyleSheet,
   Alert,
+  Linking,
 } from 'react-native';
 import Constants from 'expo-constants';
 import { saveAuthProfile, saveToken } from '../auth';
 import { openInAppBrowser } from '../in-app-browser';
+import { captureInviteCodeFromUrl, clearInviteCode, getInviteCode } from '../invites';
 
 type LoginProps = {
   navigation: any;
@@ -18,11 +20,11 @@ type LoginProps = {
 
 type Mode = 'login' | 'signup' | 'reset';
 
-// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
+// Read API base (env overrides app.json extra)
 // IMPORTANT: Strip trailing slashes so we never generate URLs like "//login".
 const RAW_API_BASE =
-  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
+  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
@@ -35,6 +37,10 @@ const PLACEHOLDER_COLOR = '#999999';
 const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
   const [mode, setMode] = useState<Mode>('login');
 
+  const [inviteCode, setInviteCode] = useState<string | null>(null);
+  const [username, setUsername] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState('');
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
@@ -44,6 +50,36 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
   const [resetCode, setResetCode] = useState('');
 
   const [loading, setLoading] = useState(false);
+
+  // Load any stored invite code and keep it updated when a deep link arrives.
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      const code = await getInviteCode();
+      if (!alive) return;
+      setInviteCode(code);
+    })().catch(() => {});
+
+    const sub = Linking.addEventListener('url', (event) => {
+      const url = event?.url;
+      captureInviteCodeFromUrl(url)
+        .then((code) => {
+          if (!alive) return;
+          if (code) setInviteCode(code);
+        })
+        .catch(() => {});
+    });
+
+    return () => {
+      alive = false;
+      try {
+        (sub as any)?.remove?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
 
   const trimmedEmail = email.trim();
 
@@ -74,6 +110,8 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
     setNewPassword('');
     setResetSent(false);
     setResetCode('');
+    setUsername('');
+    setPhoneNumber('');
   };
 
   const switchToSignup = () => {
@@ -82,6 +120,8 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
     setNewPassword('');
     setResetSent(false);
     setResetCode('');
+    setUsername('');
+    setPhoneNumber('');
   };
 
   const switchToReset = () => {
@@ -90,6 +130,8 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
     setNewPassword('');
     setResetSent(false);
     setResetCode('');
+    setUsername('');
+    setPhoneNumber('');
   };
 
   const handleLogin = async () => {
@@ -160,13 +202,33 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
       return;
     }
 
+    const inviteActive = Boolean(inviteCode);
+    if (inviteActive) {
+      const u = username.trim();
+      const p = phoneNumber.trim();
+      if (!u) {
+        Alert.alert('Missing info', 'Please enter a username.');
+        return;
+      }
+      if (!p) {
+        Alert.alert('Missing info', 'Please enter your phone number.');
+        return;
+      }
+    }
+
     try {
       setLoading(true);
 
       const response = await fetch(`${API_BASE}/signup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmedEmail, password }),
+        body: JSON.stringify({
+          email: trimmedEmail,
+          password,
+          inviteCode: inviteCode || undefined,
+          phoneNumber: inviteCode ? phoneNumber.trim() : undefined,
+          accountName: inviteCode ? username.trim() : undefined,
+        }),
       });
 
       const data = await response.json().catch(() => ({}));
@@ -179,6 +241,12 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
             : 'Something went wrong while creating your account.');
         Alert.alert('Sign up failed', message);
         return;
+      }
+
+      // Invite-only fields are only required for the first sign-up. Clear the code after success.
+      if (inviteCode) {
+        clearInviteCode().catch(() => {});
+        setInviteCode(null);
       }
 
       const token = String(data?.token || '').trim();
@@ -357,6 +425,38 @@ const Login: React.FC<LoginProps> = ({ navigation, onAuthSuccess }) => {
         ) : isSignup ? (
           <>
             {/* SIGNUP MODE */}
+            {inviteCode ? (
+              <>
+                <View style={[styles.fieldGroup, { marginBottom: 12 }]}> 
+                  <TextInput
+                    style={styles.input}
+                    value={username}
+                    onChangeText={setUsername}
+                    placeholder="Username"
+                    placeholderTextColor={PLACEHOLDER_COLOR}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType="next"
+                  />
+                </View>
+
+                <View style={[styles.fieldGroup, { marginBottom: 12 }]}> 
+                  <TextInput
+                    style={styles.input}
+                    value={phoneNumber}
+                    onChangeText={setPhoneNumber}
+                    placeholder="Phone number"
+                    placeholderTextColor={PLACEHOLDER_COLOR}
+                    keyboardType="phone-pad"
+                    textContentType="telephoneNumber"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType="next"
+                  />
+                </View>
+              </>
+            ) : null}
+
             <View style={[styles.fieldGroup, { marginBottom: 16 }]}>
               <TextInput
                 style={styles.input}

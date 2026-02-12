@@ -57,6 +57,12 @@ const EMAIL_FROM = String(process.env.EMAIL_FROM || "").trim();
 const APP_NAME = String(process.env.APP_NAME || "Undertone").trim();
 const EMAIL_ENABLED = Boolean(RESEND_API_KEY && EMAIL_FROM);
 
+// Invite / deep link settings
+// - PUBLIC_BASE_URL: used to build the https invite link (defaults to request host)
+// - APP_DEEPLINK_SCHEME: used for redirects like undertone://invite?code=...
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").trim();
+const APP_DEEPLINK_SCHEME = String(process.env.APP_DEEPLINK_SCHEME || "undertone").trim() || "undertone";
+
 if (NODE_ENV === "production" && !EMAIL_ENABLED) {
   console.warn("WARN: Email delivery is not configured. Password reset will not email codes.");
 }
@@ -262,6 +268,44 @@ function isValidEmail(email) {
 function normalizeEmail(email) {
   const trimmed = String(email || "").trim();
   return { trimmed, norm: trimmed.toLowerCase() };
+}
+
+function normalizeInviteCode(code) {
+  return String(code || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function generateInviteCode(length = 10) {
+  const n = Number(length);
+  const len = Number.isFinite(n) && n >= 6 && n <= 24 ? Math.floor(n) : 10;
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid 0/O and 1/I
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    const idx = crypto.randomInt(0, alphabet.length);
+    out += alphabet[idx];
+  }
+  return out;
+}
+
+function getRequestBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  const proto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim() || "http";
+  const host = String(req?.headers?.["x-forwarded-host"] || req?.headers?.host || "").split(",")[0].trim();
+  if (!host) return "";
+  return `${proto}://${host}`;
+}
+
+function buildInviteLink(req, code) {
+  const base = getRequestBaseUrl(req);
+  if (!base) return "";
+  return `${base}/invites/${encodeURIComponent(String(code || "").trim())}`;
+}
+
+function buildInviteDeepLink(code) {
+  const c = normalizeInviteCode(code);
+  return `${APP_DEEPLINK_SCHEME}://invite?code=${encodeURIComponent(c)}`;
 }
 
 function requireDb(res) {
@@ -984,12 +1028,89 @@ app.get("/healthz", async (req, res) => {
   }
 });
 
+// --- Invites ---
+// Authenticated users can generate a shareable invite link.
+// The invite link is an https URL that redirects to the app deep link.
+app.post("/invites/link", authRequired, async (req, res) => {
+  const userId = req?.auth?.user?.id;
+  if (!userId) return res.status(400).json({ ok: false, error: "Missing user" });
+
+  try {
+    // If the user already has a code, reuse it.
+    const existing = await pool.query("SELECT invite_code FROM users WHERE id = $1 LIMIT 1", [userId]);
+    let code = normalizeInviteCode(existing?.rows?.[0]?.invite_code);
+
+    if (!code) {
+      // Generate a code and set it once. Retry on collisions.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const next = generateInviteCode(10);
+        try {
+          const updated = await pool.query(
+            "UPDATE users SET invite_code = $1, updated_at = NOW() WHERE id = $2 AND (invite_code IS NULL OR invite_code = '') RETURNING invite_code",
+            [next, userId]
+          );
+
+          if (updated?.rows?.[0]?.invite_code) {
+            code = normalizeInviteCode(updated.rows[0].invite_code);
+            break;
+          }
+
+          // Another request may have set it concurrently.
+          const again = await pool.query("SELECT invite_code FROM users WHERE id = $1 LIMIT 1", [userId]);
+          code = normalizeInviteCode(again?.rows?.[0]?.invite_code);
+          if (code) break;
+        } catch (e) {
+          // Unique violation on invite_code
+          if (String(e?.code || "") === "23505") continue;
+          throw e;
+        }
+      }
+    }
+
+    if (!code) {
+      return res.status(500).json({ ok: false, error: "Could not generate invite link" });
+    }
+
+    const inviteLink = buildInviteLink(req, code);
+    return res.json({ ok: true, inviteCode: code, inviteLink });
+  } catch (e) {
+    console.error("invites/link error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// Public invite link endpoint. Validates the code then redirects to a deep link.
+app.get("/invites/:code", async (req, res) => {
+  if (!requireDb(res)) return;
+
+  const code = normalizeInviteCode(req?.params?.code);
+  if (!code) return res.status(400).json({ ok: false, error: "Invalid invite code" });
+
+  try {
+    const { rows } = await pool.query("SELECT id FROM users WHERE invite_code = $1 LIMIT 1", [code]);
+    const inviter = rows?.[0]?.id;
+    if (!inviter) return res.status(404).json({ ok: false, error: "Invite not found" });
+
+    const deep = buildInviteDeepLink(code);
+    res.setHeader("Cache-Control", "no-store");
+    return res.redirect(302, deep);
+  } catch (e) {
+    console.error("invites/:code error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 // Signup
 app.post("/signup", async (req, res) => {
   if (!requireDb(res)) return;
 
-  const { email, password } = req.body || {};
+  const { email, password, inviteCode, phoneNumber, accountName, username } = req.body || {};
   const { trimmed, norm } = normalizeEmail(email);
+
+  const invite = normalizeInviteCode(inviteCode);
+  const desiredName = String(accountName || username || "").trim();
+  const desiredNameNorm = desiredName ? desiredName.toLowerCase() : "";
+  const phone = String(phoneNumber || "").trim();
 
   if (!isValidEmail(trimmed)) {
     return res.status(400).json({ ok: false, error: "Invalid email" });
@@ -998,13 +1119,51 @@ app.post("/signup", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Password must be at least 6 characters" });
   }
 
+  // Invite-only requirements
+  if (invite) {
+    if (!desiredName) {
+      return res.status(400).json({ ok: false, error: "Username is required for invite sign-ups" });
+    }
+    if (!phone) {
+      return res.status(400).json({ ok: false, error: "Phone number is required for invite sign-ups" });
+    }
+  }
+
+  // Enforce unique username (account_name) when provided.
+  // Allow empty account_name for legacy/normal sign-ups.
+  if (desiredName) {
+    try {
+      const exists = await pool.query(
+        "SELECT 1 FROM users WHERE LOWER(TRIM(account_name)) = $1 AND TRIM(account_name) <> '' LIMIT 1",
+        [desiredNameNorm]
+      );
+      if (exists?.rows?.length) {
+        return res.status(409).json({ ok: false, error: "Username already in use" });
+      }
+    } catch {
+      // If this pre-check fails, the unique index will still protect us during INSERT.
+    }
+  }
+
+  // Resolve inviter from invite code (if provided).
+  let referredById = null;
+  if (invite) {
+    const r = await pool.query("SELECT id FROM users WHERE invite_code = $1 LIMIT 1", [invite]);
+    const inviterId = r?.rows?.[0]?.id;
+    if (!inviterId) {
+      return res.status(400).json({ ok: false, error: "Invalid invite code" });
+    }
+    referredById = inviterId;
+  }
+
   try {
     const passwordHash = await bcrypt.hash(password, 12);
-    const accountName = "";
+    const finalName = desiredName || "";
+    const finalPhone = invite ? phone : phone || null;
 
     const { rows } = await pool.query(
-      "INSERT INTO users (email, email_norm, password_hash, account_name) VALUES ($1, $2, $3, $4) RETURNING id, email, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at, plan_tier, plan_interval, plan_product_id, plan_expires_at",
-      [trimmed, norm, passwordHash, accountName]
+      "INSERT INTO users (email, email_norm, password_hash, account_name, phone_number, referred_by_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at, plan_tier, plan_interval, plan_product_id, plan_expires_at",
+      [trimmed, norm, passwordHash, finalName, finalPhone, referredById]
     );
 
     const user = rows[0];
@@ -1012,9 +1171,12 @@ app.post("/signup", async (req, res) => {
 
     return res.status(201).json({ ok: true, token: session.token, user: publicUserRow(user) });
   } catch (e) {
-    // Unique violation on email_norm
-    const msg = String(e?.message || e);
-    if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("duplicate")) {
+    // Unique violations on email_norm, invite_code, or username.
+    if (String(e?.code || "") === "23505") {
+      const constraint = String(e?.constraint || "");
+      if (constraint.includes("users_account_name_norm_unique")) {
+        return res.status(409).json({ ok: false, error: "Username already in use" });
+      }
       return res.status(409).json({ ok: false, error: "Email already in use" });
     }
     console.error("signup error:", e);
@@ -1289,6 +1451,20 @@ app.post("/update-account-name", authRequired, async (req, res) => {
 
   if (!name) return res.status(400).json({ ok: false, error: "Account name cannot be empty" });
 
+  // Enforce uniqueness (case-insensitive) when a name is set.
+  try {
+    const nameNorm = name.toLowerCase();
+    const exists = await pool.query(
+      "SELECT 1 FROM users WHERE LOWER(TRIM(account_name)) = $1 AND id <> $2 AND TRIM(account_name) <> '' LIMIT 1",
+      [nameNorm, userId]
+    );
+    if (exists?.rows?.length) {
+      return res.status(409).json({ ok: false, error: "Username already in use" });
+    }
+  } catch {
+    // If this check fails, the unique index will still protect the UPDATE.
+  }
+
   try {
     const { rows } = await pool.query(
       "UPDATE users SET account_name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email, account_name, plan_tier, plan_interval, plan_product_id, plan_started_at, plan_expires_at, rc_last_synced_at, plan_tier, plan_interval, plan_product_id, plan_expires_at",
@@ -1297,6 +1473,12 @@ app.post("/update-account-name", authRequired, async (req, res) => {
 
     return res.json({ ok: true, user: publicUserRow(rows[0]) });
   } catch (e) {
+    if (String(e?.code || "") === "23505") {
+      const constraint = String(e?.constraint || "");
+      if (constraint.includes("users_account_name_norm_unique")) {
+        return res.status(409).json({ ok: false, error: "Username already in use" });
+      }
+    }
     console.error("update-account-name error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
   }

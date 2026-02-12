@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { StatusBar, View, StyleSheet } from 'react-native';
+import { StatusBar, View, StyleSheet, Linking } from 'react-native';
 import Constants from 'expo-constants';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import Svg, { Line, Rect, Path } from 'react-native-svg';
@@ -12,6 +12,7 @@ import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-c
 import { clearToken, getAuthProfile, saveAuthProfile, getToken } from './src/auth';
 import { migrateLegacySecureStoreIfNeeded } from './src/localstore';
 import { PlanTier, normalizePlanTier } from './src/api';
+import { captureInviteCodeFromUrl } from './src/invites';
 import Login from './src/screens/login';
 import Upload from './src/screens/upload';
 import Account from './src/screens/account';
@@ -151,11 +152,11 @@ function FolderCleanOutlineIcon({
   );
 }
 
-// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
+// Read API base (env overrides app.json extra)
 // IMPORTANT: Strip trailing slashes so we never generate URLs like "//me".
 const RAW_API_BASE =
-  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   process.env.EXPO_PUBLIC_API_BASE ??
+  (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
@@ -228,10 +229,10 @@ function AppTabsShell({
           paddingBottom: 6,
         },
         tabBarLabelStyle: {
-          fontSize: 11,
+          fontSize: 10.27,
           fontWeight: '400',
           textTransform: 'lowercase',
-          lineHeight: 14,
+          lineHeight: 13,
         },
         tabBarStyle: {
           backgroundColor: '#ffffff',
@@ -248,9 +249,9 @@ function AppTabsShell({
       <Tabs.Screen
         name="Upload"
         options={{
-          tabBarLabel: 'home',
+          tabBarLabel: 'scan',
           tabBarIcon: ({ color, size }) => {
-            const iconSize = Math.max(18, (size ?? 24) - 2);
+            const iconSize = Math.max(18, (size ?? 24) - 4);
             return <Ionicons name="scan-outline" size={iconSize} color={color} />;
           },
         }}
@@ -271,7 +272,7 @@ function AppTabsShell({
         options={{
           tabBarLabel: 'your list',
           tabBarIcon: ({ color, size }) => {
-            const iconSize = Math.max(18, (size ?? 24) - 1);
+            const iconSize = Math.max(18, (size ?? 24) - 2);
             return <FolderCleanOutlineIcon size={iconSize} color={color} />;
           },
         }}
@@ -284,7 +285,7 @@ function AppTabsShell({
         options={{
           tabBarLabel: 'your kit',
           tabBarIcon: ({ color, size }) => {
-            const iconSize = Math.max(18, (size ?? 24) - 1);
+            const iconSize = Math.max(18, (size ?? 24) - 3);
             return <Ionicons name="briefcase-outline" size={iconSize} color={color} />;
           },
         }}
@@ -296,9 +297,10 @@ function AppTabsShell({
         name="Account"
         options={{
           tabBarLabel: 'account',
-          tabBarIcon: ({ color, size }) => (
-            <IdCardOutlineIcon size={size ?? 24} color={color} />
-          ),
+          tabBarIcon: ({ color, size }) => {
+            const iconSize = Math.max(18, (size ?? 24) - 1);
+            return <IdCardOutlineIcon size={iconSize} color={color} />;
+          },
         }}
       >
         {(props: any) => (
@@ -336,6 +338,35 @@ export default function App() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [planTier, setPlanTier] = useState<PlanTier>('free');
+
+  // Capture invite links (deep link or https redirect) and persist the invite code
+  // so the Login screen can require phone number on invite sign-ups.
+  useEffect(() => {
+    let alive = true;
+
+    const handleUrl = (url?: string | null) => {
+      if (!alive) return;
+      captureInviteCodeFromUrl(url).catch(() => {});
+    };
+
+    Linking.getInitialURL()
+      .then((url) => handleUrl(url))
+      .catch(() => {});
+
+    const sub = Linking.addEventListener('url', (event) => {
+      handleUrl(event?.url);
+    });
+
+    return () => {
+      alive = false;
+      try {
+        // RN 0.65+ returns an EmitterSubscription with remove()
+        (sub as any)?.remove?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;

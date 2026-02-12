@@ -207,7 +207,6 @@ export const PLAN_CONFIG: Record<
       'Up to 5 scans / mo',
       'Up to 1 product discovery / mo',
       'Up to 10 names on your list',
-      'Up to 10 custom categories',
       'Up to 10 kit items',
     ],
   },
@@ -219,7 +218,6 @@ export const PLAN_CONFIG: Record<
       'Up to 10 product discoveries per month',
       'Up to 1,000 names on your list',
       'Up to 1,000 items in your kit',
-      'Undertone e-mail support',
     ],
   },
 };

@@ -54,6 +54,41 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS rc_last_synced_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_users_plan_tier ON users(plan_tier);
 
+-- --- Invites / referrals ---
+-- Users can generate an invite link. Invited sign-ups must provide phone number + unique username.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invite_code TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_id BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number TEXT;
+
+-- Invite codes must be unique (allow NULL/empty).
+CREATE UNIQUE INDEX IF NOT EXISTS users_invite_code_key
+  ON users(invite_code)
+  WHERE invite_code IS NOT NULL AND invite_code <> '';
+
+-- Usernames (account_name) should be unique, case-insensitive, when set.
+-- Allow empty strings for legacy users.
+CREATE UNIQUE INDEX IF NOT EXISTS users_account_name_norm_unique
+  ON users(LOWER(TRIM(account_name)))
+  WHERE TRIM(account_name) <> '';
+
+CREATE INDEX IF NOT EXISTS idx_users_referred_by_id ON users(referred_by_id);
+
+-- Add FK constraint idempotently.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'users_referred_by_id_fkey'
+  ) THEN
+    ALTER TABLE users
+    ADD CONSTRAINT users_referred_by_id_fkey
+    FOREIGN KEY (referred_by_id)
+    REFERENCES users(id)
+    ON DELETE SET NULL;
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS user_docs (
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   doc_key TEXT NOT NULL,
