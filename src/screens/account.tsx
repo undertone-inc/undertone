@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -46,11 +46,11 @@ function formatPercent(used: number, limit: number): string {
 
 // normalizePlanTier is imported from ../api
 
-// Read API base (env overrides app.json extra)
+// Read API base from app.json -> expo.extra.EXPO_PUBLIC_API_BASE
 // IMPORTANT: Strip trailing slashes so we never generate URLs like "//billing/sync".
 const RAW_API_BASE =
-  process.env.EXPO_PUBLIC_API_BASE ??
   (Constants as any).expoConfig?.extra?.EXPO_PUBLIC_API_BASE ??
+  process.env.EXPO_PUBLIC_API_BASE ??
   'http://localhost:3000';
 const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
@@ -225,6 +225,9 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const [supportMessage, setSupportMessage] = useState('');
   const [inviteLink, setInviteLink] = useState('');
+  const [inviteLinkStatus, setInviteLinkStatus] = useState<'copied' | 'failed' | null>(null);
+  const inviteLinkStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
 
   useEffect(() => {
     const showEvent = Platform.OS === 'android' ? 'keyboardDidShow' : 'keyboardWillShow';
@@ -242,6 +245,16 @@ const Account: React.FC<AccountScreenProps> = ({
     return () => {
       showListener.remove();
       hideListener.remove();
+    };
+  }, []);
+
+  // Prevent setState on unmounted component when showing short-lived invite feedback.
+  useEffect(() => {
+    return () => {
+      if (inviteLinkStatusTimer.current) {
+        clearTimeout(inviteLinkStatusTimer.current);
+        inviteLinkStatusTimer.current = null;
+      }
     };
   }, []);
 
@@ -494,6 +507,11 @@ const Account: React.FC<AccountScreenProps> = ({
   };
 
   const closeModal = () => {
+    if (inviteLinkStatusTimer.current) {
+      clearTimeout(inviteLinkStatusTimer.current);
+      inviteLinkStatusTimer.current = null;
+    }
+    setInviteLinkStatus(null);
     setActiveModal(null);
     setPendingPlanTier(null);
     setBillingCycle('monthly');
@@ -539,6 +557,11 @@ const Account: React.FC<AccountScreenProps> = ({
   const openReferModal = () => {
     if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
+    if (inviteLinkStatusTimer.current) {
+      clearTimeout(inviteLinkStatusTimer.current);
+      inviteLinkStatusTimer.current = null;
+    }
+    setInviteLinkStatus(null);
     setInviteLink('');
     setActiveModal('refer');
   };
@@ -712,6 +735,7 @@ const Account: React.FC<AccountScreenProps> = ({
       }
 
       setInviteLink(link);
+      setInviteLinkStatus(null);
     } catch (e: any) {
       const msg = String(e?.message || e);
       if (/404|not found/i.test(msg)) {
@@ -727,9 +751,21 @@ const Account: React.FC<AccountScreenProps> = ({
   const copyInviteLink = async () => {
     const link = (inviteLink || '').trim();
     if (!link) return;
+
+    // Copy first, then show inline feedback.
     const ok = await copyToClipboard(link);
-    if (ok) Alert.alert('Copied', 'Invite link copied.');
-    else Alert.alert('Copy failed', 'Could not copy invite link.');
+    setInviteLinkStatus(ok ? 'copied' : 'failed');
+
+    if (inviteLinkStatusTimer.current) {
+      clearTimeout(inviteLinkStatusTimer.current);
+      inviteLinkStatusTimer.current = null;
+    }
+
+    inviteLinkStatusTimer.current = setTimeout(() => {
+      setInviteLinkStatus(null);
+      setInviteLink('');
+      inviteLinkStatusTimer.current = null;
+    }, 1000);
   };
 
   const syncServerBilling = async () => {
@@ -1549,7 +1585,7 @@ const Account: React.FC<AccountScreenProps> = ({
                   <Pressable
                     style={styles.referLinkBox}
                     onPress={copyInviteLink}
-                    disabled={!inviteLink}
+                    disabled={!inviteLink || saving || !!inviteLinkStatus}
                     accessibilityRole="button"
                     accessibilityLabel="Invite link"
                   >
@@ -1560,7 +1596,13 @@ const Account: React.FC<AccountScreenProps> = ({
                       ]}
                       numberOfLines={1}
                     >
-                      {inviteLink ? inviteLink : '...'}
+                      {inviteLinkStatus === 'copied'
+                        ? 'copied'
+                        : inviteLinkStatus === 'failed'
+                        ? 'copy failed'
+                        : inviteLink
+                        ? inviteLink
+                        : ''}
                     </Text>
                   </Pressable>
 

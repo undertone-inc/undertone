@@ -63,9 +63,18 @@ const EMAIL_ENABLED = Boolean(RESEND_API_KEY && EMAIL_FROM);
 // - PUBLIC_BASE_URL: legacy fallback (kept for backwards compatibility)
 // - APP_DEEPLINK_SCHEME: used for redirects like undertone://invite?code=...
 function normalizeBaseUrl(base) {
-  return String(base || "")
-    .trim()
-    .replace(/\/+$/, "");
+  let b = String(base || "").trim();
+  if (!b) return "";
+
+  // Trim trailing slashes.
+  b = b.replace(/\/+$/, "");
+
+  // Allow env var values like 'invite.undertoneapp.io' (auto-prefix https://).
+  if (!/^https?:\/\//i.test(b)) {
+    b = `https://${b}`;
+  }
+
+  return b;
 }
 
 const INVITE_BASE_URL = normalizeBaseUrl(process.env.INVITE_BASE_URL);
