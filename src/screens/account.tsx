@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -20,29 +20,12 @@ import {
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { openInAppBrowser } from '../in-app-browser';
 import { getAuthProfile, saveAuthProfile } from '../auth';
-import { DOC_KEYS, getString, makeScopedKey } from '../localstore';
 import { copyToClipboard } from '../invites';
 import Constants from 'expo-constants';
-import { PlanTier, PLAN_CONFIG, PLAN_LIMITS, PLAN_RANK, normalizePlanTier } from '../api';
+import { PlanTier, PLAN_CONFIG, PLAN_RANK, normalizePlanTier } from '../api';
 import { useRevenueCat } from '../revenuecat/revenuecatprovider';
 
 import { SafeAreaView, initialWindowMetrics, useSafeAreaInsets } from 'react-native-safe-area-context';
-
-const INVENTORY_STORAGE_KEY = DOC_KEYS.inventory;
-
-
-function formatPercent(used: number, limit: number): string {
-  const safeUsed = Number.isFinite(used) && used > 0 ? used : 0;
-
-  // Unlimited limits (Infinity) don't have a meaningful percent.
-  if (limit === Infinity) return 'Unlimited';
-
-  const safeLimit = Number.isFinite(limit) && limit > 0 ? limit : 0;
-  if (safeLimit <= 0) return '0%';
-
-  const pct = Math.round((safeUsed / safeLimit) * 100);
-  return `${Math.max(0, pct)}%`;
-}
 
 // normalizePlanTier is imported from ../api
 
@@ -56,24 +39,6 @@ const API_BASE = String(RAW_API_BASE || '').replace(/\/+$/, '');
 
 const TERMS_URL = 'https://undertoneapp.io/undertone-legal/terms/index.html';
 const PRIVACY_URL = 'https://undertoneapp.io/undertone-legal/privacy/index.html';
-
-function countKitUsageFromRaw(raw: string | null): { categories: number; items: number } {
-  if (!raw) return { categories: 0, items: 0 };
-  try {
-    const parsed = JSON.parse(raw);
-    const cats = Array.isArray(parsed?.categories) ? parsed.categories : [];
-
-    let items = 0;
-    cats.forEach((c: any) => {
-      const its = Array.isArray(c?.items) ? c.items : [];
-      items += its.length;
-    });
-
-    return { categories: cats.length, items };
-  } catch {
-    return { categories: 0, items: 0 };
-  }
-}
 
 type AccountScreenProps = {
   navigation: any;
@@ -103,7 +68,7 @@ type ModalKind =
   | 'delete'
   | 'updates'
   | 'support'
-  | 'refer';
+  | 'invite';
 
 type BillingCycle = 'monthly' | 'yearly';
 
@@ -157,9 +122,6 @@ const Account: React.FC<AccountScreenProps> = ({
   onPlanTierChanged,
   onLogout,
 }) => {
-  // Scope local data per user (stable id preferred; fall back to email).
-  const scope = userId ?? (email ? String(email).trim().toLowerCase() : null);
-  const inventoryKey = makeScopedKey(INVENTORY_STORAGE_KEY, scope);
   const emailTrimmed = (email || '').trim();
   const tokenTrimmed = (token || '').trim();
 
@@ -177,10 +139,6 @@ const Account: React.FC<AccountScreenProps> = ({
   const fallbackTop = Platform.OS === 'android' ? androidStatusBar : iosStatusBar;
   const stableTopInset = isLandscape ? safeTop : Math.max(safeTop, initialTop, fallbackTop);
   const [emailUpdatesEnabled, setEmailUpdatesEnabled] = useState(true);
-  const [uploadsUsedThisMonth, setUploadsUsedThisMonth] = useState(0);
-  const [listsUsedThisMonth, setListsUsedThisMonth] = useState(0);
-  const [kitCategoryCount, setKitCategoryCount] = useState(0);
-  const [kitItemCount, setKitItemCount] = useState(0);
   const [settingsQuery, setSettingsQuery] = useState('');
 
   const [accountName, setAccountName] = useState('');
@@ -226,7 +184,6 @@ const Account: React.FC<AccountScreenProps> = ({
   const [supportMessage, setSupportMessage] = useState('');
   const [inviteLink, setInviteLink] = useState('');
   const [inviteLinkStatus, setInviteLinkStatus] = useState<'copied' | 'failed' | null>(null);
-  const inviteLinkStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 
   useEffect(() => {
@@ -245,16 +202,6 @@ const Account: React.FC<AccountScreenProps> = ({
     return () => {
       showListener.remove();
       hideListener.remove();
-    };
-  }, []);
-
-  // Prevent setState on unmounted component when showing short-lived invite feedback.
-  useEffect(() => {
-    return () => {
-      if (inviteLinkStatusTimer.current) {
-        clearTimeout(inviteLinkStatusTimer.current);
-        inviteLinkStatusTimer.current = null;
-      }
     };
   }, []);
 
@@ -318,84 +265,19 @@ const Account: React.FC<AccountScreenProps> = ({
         accountName: nextName || null,
         planTier: nextTier || null,
       }).catch(() => {});
-
-      // Optional usage fields from the server (fallbacks to local/defaults when absent).
-      const usage = data?.usage ?? data?.limitsUsage ?? data?.counters ?? data?.stats ?? {};
-
-      const nextUploads = Number(
-        usage?.uploadsThisMonth ??
-          usage?.uploads_this_month ??
-          usage?.uploadsMonth ??
-          usage?.uploads_used ??
-          usage?.uploadsUsed ??
-          usage?.uploads ??
-          0
-      );
-      if (Number.isFinite(nextUploads)) setUploadsUsedThisMonth(nextUploads);
-
-      const nextLists = Number(
-        usage?.listsThisMonth ??
-          usage?.lists_this_month ??
-          usage?.listsMonth ??
-          usage?.lists_month ??
-          usage?.lists_used ??
-          usage?.listsUsed ??
-          usage?.lists ??
-          usage?.listCount ??
-          usage?.listsCount ??
-          usage?.list_count ??
-          0
-      );
-      if (Number.isFinite(nextLists)) setListsUsedThisMonth(nextLists);
-
-      const nextCats = Number(
-        usage?.categories ??
-          usage?.categoriesCount ??
-          usage?.categoryCount ??
-          usage?.catalogCategories ??
-          usage?.catalog_categories ??
-          NaN
-      );
-      if (Number.isFinite(nextCats)) setKitCategoryCount(nextCats);
-
-      const nextItems = Number(
-        usage?.items ??
-          usage?.itemsCount ??
-          usage?.itemCount ??
-          usage?.catalogItems ??
-          usage?.catalog_items ??
-          NaN
-      );
-      if (Number.isFinite(nextItems)) setKitItemCount(nextItems);
-
     } catch {
       // If the server isn't reachable (or user not found), keep UI usable.
       // (Account name can still be set; save will surface errors.)
     }
   };
 
-  // Keep the kit count + account profile in sync when returning to this screen.
+  // Keep the account profile in sync when returning to this screen.
   useEffect(() => {
     let alive = true;
 
     const refresh = async () => {
-      try {
-        const raw = await getString(inventoryKey);
-        const usage = countKitUsageFromRaw(raw);
-        if (alive) {
-          setKitCategoryCount(usage.categories);
-          setKitItemCount(usage.items);
-        }
-      } catch {
-        if (alive) {
-          setKitCategoryCount(0);
-          setKitItemCount(0);
-        }
-      }
-
-      if (alive) {
-        await refreshAccount();
-      }
+      if (!alive) return;
+      await refreshAccount();
     };
 
     refresh();
@@ -405,7 +287,7 @@ const Account: React.FC<AccountScreenProps> = ({
       alive = false;
       if (typeof unsubscribe === 'function') unsubscribe();
     };
-  }, [navigation, tokenTrimmed, inventoryKey]);
+  }, [navigation, tokenTrimmed]);
 
   const handleLogoutPress = async () => {
     Keyboard.dismiss();
@@ -469,14 +351,12 @@ const Account: React.FC<AccountScreenProps> = ({
   const showRestorePurchases = matchesQuery('Restore', 'Restore purchases', 'Restore purchase', 'Purchases');
 
   const showUpdates = matchesQuery('Updates', 'Update', 'Location', 'Locations');
-  const showReferUser = matchesQuery(
-    'Refer user',
-    'Refer a friend',
-    'Refer friend',
-    'Referral',
+  const showInviteUser = matchesQuery(
+    'Invite user',
+    'Invite a friend',
+    'Invite friend',
     'Invite',
     'Invites',
-    'Refer',
     'Affiliate center',
     'Affiliate',
     'Affiliates',
@@ -493,7 +373,7 @@ const Account: React.FC<AccountScreenProps> = ({
 
   const profileRowsVisible = showAccountName || showEmailRow || showPassword;
   const planRowsVisible = showPlan || showBilling || showRestorePurchases;
-  const catalogRowsVisible = showUpdates || showReferUser || showSupport;
+  const catalogRowsVisible = showUpdates || showInviteUser || showSupport;
   const commRowsVisible = showEmailUpdates || showPrivacyPolicy;
   const actionRowsVisible = showDeleteAccount || showLogout;
 
@@ -507,10 +387,6 @@ const Account: React.FC<AccountScreenProps> = ({
   };
 
   const closeModal = () => {
-    if (inviteLinkStatusTimer.current) {
-      clearTimeout(inviteLinkStatusTimer.current);
-      inviteLinkStatusTimer.current = null;
-    }
     setInviteLinkStatus(null);
     setActiveModal(null);
     setPendingPlanTier(null);
@@ -554,16 +430,12 @@ const Account: React.FC<AccountScreenProps> = ({
     setActiveModal('updates');
   };
 
-  const openReferModal = () => {
+  const openInviteModal = () => {
     if (!requireAuthOrAlert()) return;
     Keyboard.dismiss();
-    if (inviteLinkStatusTimer.current) {
-      clearTimeout(inviteLinkStatusTimer.current);
-      inviteLinkStatusTimer.current = null;
-    }
     setInviteLinkStatus(null);
     setInviteLink('');
-    setActiveModal('refer');
+    setActiveModal('invite');
   };
 
   const openSupportModal = () => {
@@ -739,7 +611,7 @@ const Account: React.FC<AccountScreenProps> = ({
     } catch (e: any) {
       const msg = String(e?.message || e);
       if (/404|not found/i.test(msg)) {
-        Alert.alert('Refer user', 'Invite links are not configured yet.');
+        Alert.alert('Invite user', 'Invite links are not configured yet.');
       } else {
         Alert.alert('Could not generate link', msg);
       }
@@ -752,20 +624,8 @@ const Account: React.FC<AccountScreenProps> = ({
     const link = (inviteLink || '').trim();
     if (!link) return;
 
-    // Copy first, then show inline feedback.
     const ok = await copyToClipboard(link);
     setInviteLinkStatus(ok ? 'copied' : 'failed');
-
-    if (inviteLinkStatusTimer.current) {
-      clearTimeout(inviteLinkStatusTimer.current);
-      inviteLinkStatusTimer.current = null;
-    }
-
-    inviteLinkStatusTimer.current = setTimeout(() => {
-      setInviteLinkStatus(null);
-      setInviteLink('');
-      inviteLinkStatusTimer.current = null;
-    }, 1000);
   };
 
   const syncServerBilling = async () => {
@@ -968,9 +828,9 @@ const Account: React.FC<AccountScreenProps> = ({
   };
 
   const renderModal = () => {
-    // Support/Updates/Refer are rendered as in-screen full-white panels (not overlay modals)
+    // Support/Updates/Invite are rendered as in-screen full-white panels (not overlay modals)
     // so they visually replace the settings list area.
-    if (activeModal === 'support' || activeModal === 'updates' || activeModal === 'refer') {
+    if (activeModal === 'support' || activeModal === 'updates' || activeModal === 'invite') {
       return null;
     }
     if (!activeModal) return null;
@@ -1093,9 +953,6 @@ const Account: React.FC<AccountScreenProps> = ({
                                   </TouchableOpacity>
 
                                   <View style={styles.planBillingToggleYearlyWrap}>
-                                    {billingCycle === 'yearly' && (
-                                      <Text style={styles.planSavePct}>Save 20%</Text>
-                                    )}
                                     <TouchableOpacity
                                       style={[
                                         styles.planBillingToggleOption,
@@ -1436,15 +1293,6 @@ const Account: React.FC<AccountScreenProps> = ({
   const planValue = tokenTrimmed ? PLAN_CONFIG[effectivePlanTier].label : 'Not set';
   const planActionLabel = effectivePlanTier === 'pro' ? 'Manage' : 'Upgrade';
 
-  const limits = PLAN_LIMITS[effectivePlanTier];
-
-  const usagePercentValue = formatPercent(uploadsUsedThisMonth, limits.uploads);
-
-  const catalogPercentValue = formatPercent(listsUsedThisMonth, limits.lists);
-
-  const kitPercentValue = formatPercent(kitItemCount, limits.items);
-
-
   return (
     <SafeAreaView
       style={[styles.safeArea, { paddingTop: stableTopInset }]}
@@ -1558,7 +1406,7 @@ const Account: React.FC<AccountScreenProps> = ({
                 <Text style={[styles.modalInfoText, styles.updatesEmptyText]}>No updates yet</Text>
               </View>
             </View>
-          ) : activeModal === 'refer' ? (
+          ) : activeModal === 'invite' ? (
             <KeyboardAvoidingView
               behavior={Platform.OS === 'ios' ? 'padding' : undefined}
               style={styles.supportScreen}
@@ -1578,21 +1426,21 @@ const Account: React.FC<AccountScreenProps> = ({
                     <Ionicons name="chevron-back" size={20} color="#111827" />
                   </TouchableOpacity>
 
-                  <Text style={styles.supportPanelTitle}>Refer user</Text>
+                  <Text style={styles.supportPanelTitle}>Invite user</Text>
                 </View>
 
-                <View style={styles.referInviteRow}>
+                <View style={styles.inviteRow}>
                   <Pressable
-                    style={styles.referLinkBox}
+                    style={styles.inviteLinkBox}
                     onPress={copyInviteLink}
-                    disabled={!inviteLink || saving || !!inviteLinkStatus}
+                    disabled={!inviteLink || saving}
                     accessibilityRole="button"
                     accessibilityLabel="Invite link"
                   >
                     <Text
                       style={[
-                        styles.referLinkText,
-                        !inviteLink && styles.referLinkPlaceholder,
+                        styles.inviteLinkText,
+                        !inviteLink && styles.inviteLinkPlaceholder,
                       ]}
                       numberOfLines={1}
                     >
@@ -1607,7 +1455,7 @@ const Account: React.FC<AccountScreenProps> = ({
                   </Pressable>
 
                   <TouchableOpacity
-                    style={[styles.referSendButton, saving && { opacity: 0.7 }]}
+                    style={[styles.inviteLinkButton, saving && { opacity: 0.7 }]}
                     onPress={generateInviteLink}
                     activeOpacity={0.85}
                     disabled={saving}
@@ -1617,7 +1465,7 @@ const Account: React.FC<AccountScreenProps> = ({
                     {saving ? (
                       <ActivityIndicator size="small" color="#111827" />
                     ) : (
-                      <Text style={styles.referSendText}>Link</Text>
+                      <Text style={styles.inviteLinkButtonText}>Link</Text>
                     )}
                   </TouchableOpacity>
                 </View>
@@ -1788,15 +1636,15 @@ const Account: React.FC<AccountScreenProps> = ({
                         </TouchableOpacity>
                       )}
 
-                      {showReferUser && (
+                      {showInviteUser && (
                         <TouchableOpacity
                           style={styles.row}
                           activeOpacity={0.85}
-                          onPress={openReferModal}
+                          onPress={openInviteModal}
                           accessibilityRole="button"
-                          accessibilityLabel="Refer user"
+                          accessibilityLabel="Invite user"
                         >
-                          <Text style={styles.rowLabel}>Refer user</Text>
+                          <Text style={styles.rowLabel}>Invite user</Text>
                           <Text style={styles.rowValue}>0</Text>
                         </TouchableOpacity>
                       )}
@@ -2299,25 +2147,25 @@ const styles = StyleSheet.create({
   },
 
 
-  // Refer a friend
-  referInfoButton: {
+  // Invite user
+  inviteInfoButton: {
     paddingVertical: 6,
     paddingHorizontal: 6,
   },
-  referInfoText: {
+  inviteInfoText: {
     fontSize: 12,
     color: '#9ca3af',
     fontWeight: '400',
   },
 
 
-  referInviteRow: {
+  inviteRow: {
     flexDirection: 'row',
     alignItems: 'center',
     marginTop: 6,
     marginBottom: 22,
   },
-  referLinkBox: {
+  inviteLinkBox: {
     flex: 1,
     borderWidth: 1,
     borderColor: '#e5e7eb',
@@ -2329,14 +2177,14 @@ const styles = StyleSheet.create({
     marginRight: 14,
     justifyContent: 'center',
   },
-  referLinkText: {
+  inviteLinkText: {
     fontSize: 13,
     color: '#111827',
   },
-  referLinkPlaceholder: {
+  inviteLinkPlaceholder: {
     color: '#9ca3af',
   },
-  referSendButton: {
+  inviteLinkButton: {
     borderRadius: 12,
     paddingHorizontal: 14,
     paddingVertical: 10,
@@ -2348,15 +2196,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  referSendText: {
+  inviteLinkButtonText: {
     fontSize: 13,
     color: '#111827',
     fontWeight: '500',
   },
-  referRewardBlock: {
+  inviteRewardBlock: {
     marginTop: 14,
   },
-  referRewardText: {
+  inviteRewardText: {
     fontSize: 12,
     color: '#6b7280',
     lineHeight: 16,

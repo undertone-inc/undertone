@@ -612,6 +612,15 @@ function uploadLimitForPlan(planTier) {
 
 const UPLOAD_LIMIT_PRO_YEAR = Number(process.env.UPLOAD_LIMIT_PRO_YEAR || process.env.UPLOAD_LIMIT_PRO_YEARLY || 250);
 
+const DISCOVER_LIMIT_PRO_YEAR = Number(
+  process.env.DISCOVER_LIMIT_PRO_YEAR ||
+  process.env.DISCOVER_LIMIT_PRO_YEARLY ||
+  process.env.DISCOVERY_LIMIT_PRO_YEAR ||
+  process.env.DISCOVERY_LIMIT_PRO_YEARLY ||
+  120
+);
+
+
 // RevenueCat (server-side subscription verification)
 // NOTE: This requires a Secret API key (sk_...) stored on the SERVER only.
 const REVENUECAT_API_KEY = String(
@@ -667,15 +676,14 @@ function parseIsoDateOrNull(value) {
 // ----------------------------
 
 // In-memory fallback when the DB table/migration isn't present.
-// Keyed by `${userId}|YYYY-MM`.
+// Keyed by `${userId}|<periodStartISO>` (fallback only).
 const _memDiscoverCounts = new Map();
 
 function _discoverKey(userId, from) {
   try {
     const d = from instanceof Date ? from : new Date(from);
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-    return `${userId}|${y}-${m}`;
+    const iso = Number.isFinite(d.getTime()) ? d.toISOString() : String(from || "unknown");
+    return `${userId}|${iso}`;
   } catch {
     return `${userId}|unknown`;
   }
@@ -691,17 +699,14 @@ function _memIncDiscoveriesUsedSince(userId, from) {
   const next = Number(_memDiscoverCounts.get(k) || 0) + 1;
   _memDiscoverCounts.set(k, next);
 
-  // Best-effort cleanup: keep only a few recent months.
+  // Best-effort cleanup: keep only recent periods (fallback only).
   try {
-    const cutoff = new Date();
-    cutoff.setUTCMonth(cutoff.getUTCMonth() - 6);
-    const cy = cutoff.getUTCFullYear();
-    const cm = String(cutoff.getUTCMonth() + 1).padStart(2, "0");
-    const cutoffKeySuffix = `${cy}-${cm}`;
+    const cutoff = new Date(Date.now() - 730 * 24 * 60 * 60 * 1000); // ~24 months
     for (const key of _memDiscoverCounts.keys()) {
       const parts = String(key).split("|");
-      const ym = parts[1] || "";
-      if (ym && ym < cutoffKeySuffix) {
+      const iso = parts[1] || "";
+      const d = iso ? new Date(iso) : null;
+      if (d && Number.isFinite(d.getTime()) && d.getTime() < cutoff.getTime()) {
         _memDiscoverCounts.delete(key);
       }
     }
@@ -727,7 +732,7 @@ async function getDiscoveriesUsedSince(userId, from, to = null) {
   }
 }
 
-async function insertProductDiscoveryRow({ userId, category, productType, undertone, season }) {
+async function insertProductDiscoveryRow({ userId, category, productType, undertone, season, periodStart }) {
   try {
     const { rows } = await pool.query(
       "INSERT INTO product_discoveries (user_id, category, product_type, undertone, season) VALUES ($1, $2, $3, $4, $5) RETURNING id",
@@ -736,7 +741,7 @@ async function insertProductDiscoveryRow({ userId, category, productType, undert
     return rows?.[0]?.id ?? null;
   } catch {
     // If the DB table isn't ready, still track in memory so limits work.
-    _memIncDiscoveriesUsedSince(userId, startOfMonthUtc());
+    _memIncDiscoveriesUsedSince(userId, periodStart || startOfMonthUtc());
     return null;
   }
 }
@@ -784,6 +789,35 @@ function usageWindowForUser(user) {
     limit: tier === "pro" ? PLAN_UPLOAD_LIMITS.pro : PLAN_UPLOAD_LIMITS.free,
   };
 }
+
+function discoveryWindowForUser(user) {
+  const tier = normalizePlanTier(user?.plan_tier ?? user?.planTier);
+  const interval = normalizePlanInterval(user?.plan_interval, user?.plan_product_id);
+
+  if (tier === "pro" && interval === "year") {
+    const started = user?.plan_started_at instanceof Date
+      ? user.plan_started_at
+      : (user?.plan_started_at ? new Date(user.plan_started_at) : null);
+    const start = started && Number.isFinite(started.getTime()) ? started : startOfYearUtc();
+
+    const expires = user?.plan_expires_at instanceof Date
+      ? user.plan_expires_at
+      : (user?.plan_expires_at ? new Date(user.plan_expires_at) : null);
+    const end = expires && Number.isFinite(expires.getTime()) ? expires : null;
+
+    return { tier, interval, period: "year", start, end, limit: DISCOVER_LIMIT_PRO_YEAR };
+  }
+
+  return {
+    tier,
+    interval,
+    period: "month",
+    start: startOfMonthUtc(),
+    end: null,
+    limit: tier === "pro" ? PLAN_DISCOVER_LIMITS.pro : PLAN_DISCOVER_LIMITS.free,
+  };
+}
+
 
 async function fetchRevenueCatSubscriber(appUserId) {
   if (!REVENUECAT_API_KEY) {
@@ -1422,8 +1456,9 @@ app.get("/me", authRequired, async (req, res) => {
     const window = usageWindowForUser(user);
     const usedThisMonth = await getUploadsUsedThisMonth(user.id);
     const usedThisPeriod = await getUploadsUsedSince(user.id, window.start, window.end);
+    const discoverWindow = discoveryWindowForUser(user);
+    const discoversUsedThisPeriod = await getDiscoveriesUsedSince(user.id, discoverWindow.start, discoverWindow.end);
     const discoversThisMonth = await getDiscoveriesUsedSince(user.id, startOfMonthUtc(), null);
-    const discoverLimit = discoverLimitForPlan(window.tier);
 
     return res.json({
       ok: true,
@@ -1445,7 +1480,10 @@ app.get("/me", authRequired, async (req, res) => {
         uploadsPeriodStart: window.start?.toISOString?.() || null,
         uploadsPeriodEnd: window.end?.toISOString?.() || null,
         discoveriesThisMonth: discoversThisMonth,
-        listsThisMonth: 0,
+        discoveriesUsedThisPeriod: discoversUsedThisPeriod,
+        discoveriesPeriod: discoverWindow.period,
+        discoveriesPeriodStart: discoverWindow.start?.toISOString?.() || null,
+        discoveriesPeriodEnd: discoverWindow.end?.toISOString?.() || null,
       },
       limits: {
         uploadsPerMonth: window.period === "month" ? window.limit : null,
@@ -1453,7 +1491,10 @@ app.get("/me", authRequired, async (req, res) => {
         uploadsPerPeriod: window.limit,
         uploadsPeriod: window.period,
         uploadLimitsDisabled: DISABLE_UPLOAD_LIMITS,
-        discoveriesPerMonth: discoverLimit,
+        discoveriesPerMonth: discoverWindow.period === "month" ? discoverWindow.limit : null,
+        discoveriesPerYear: discoverWindow.period === "year" ? discoverWindow.limit : null,
+        discoveriesPerPeriod: discoverWindow.limit,
+        discoveriesPeriod: discoverWindow.period,
         discoverLimitsDisabled: DISABLE_DISCOVER_LIMITS,
       },
     });
@@ -4815,20 +4856,20 @@ async function handleDiscoverRecommend(req, res) {
     userForLimits = await syncUserPlanFromRevenueCat(userForLimits, { force: false });
     if (req.auth) req.auth.user = userForLimits;
 
-    const tier = normalizePlanTier(userForLimits?.plan_tier ?? userForLimits?.planTier);
-    const discoverLimit = discoverLimitForPlan(tier);
-    const discoverWindowStart = startOfMonthUtc();
-    const discoversUsedThisMonth = await getDiscoveriesUsedSince(userId, discoverWindowStart, null);
+    const discoverWindow = discoveryWindowForUser(userForLimits);
+    const discoversUsedThisPeriod = await getDiscoveriesUsedSince(userId, discoverWindow.start, discoverWindow.end);
 
-    if (!DISABLE_DISCOVER_LIMITS && discoversUsedThisMonth >= discoverLimit) {
+    if (!DISABLE_DISCOVER_LIMITS && discoversUsedThisPeriod >= discoverWindow.limit) {
+      const periodLabel = discoverWindow.period === "year" ? "yearly" : "monthly";
       return res.status(402).json({
         ok: false,
         code: "DISCOVERY_LIMIT_REACHED",
-        error: "monthly discovery limit reached",
-        used: discoversUsedThisMonth,
-        limit: discoverLimit,
-        period: "month",
-        periodStart: discoverWindowStart?.toISOString?.() || null,
+        error: `${periodLabel} discovery limit reached`,
+        used: discoversUsedThisPeriod,
+        limit: discoverWindow.limit,
+        period: discoverWindow.period,
+        periodStart: discoverWindow.start?.toISOString?.() || null,
+        periodEnd: discoverWindow.end?.toISOString?.() || null,
       });
     }
 
@@ -4840,6 +4881,7 @@ async function handleDiscoverRecommend(req, res) {
         productType: String(typeRaw || "").trim() || null,
         undertone,
         season,
+        periodStart: discoverWindow.start,
       });
     };
 
@@ -6184,6 +6226,8 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
         used: usedThisPeriod,
         limit: window.limit,
         period: window.period,
+        periodStart: window.start?.toISOString?.() || null,
+        periodEnd: window.end?.toISOString?.() || null,
       });
     }
 
@@ -6297,17 +6341,42 @@ app.post("/analyze-face", authRequired, upload.single("image"), async (req, res)
         ? pickBestRepresentative(combined, stability.undertone)
         : null;
 
+    const didRecord = analysisId !== null && analysisId !== undefined;
+    const uploadsUsedThisPeriod = usedThisPeriod + (didRecord ? 1 : 0);
+
+    // For yearly plans, also expose a "this month" counter (useful for UI),
+    // but never mislabel the yearly count as a monthly one.
+    let uploadsThisMonth = null;
+    if (window.period === "month") {
+      uploadsThisMonth = uploadsUsedThisPeriod;
+    } else {
+      try {
+        uploadsThisMonth = await getUploadsUsedThisMonth(userId);
+      } catch {
+        uploadsThisMonth = null;
+      }
+    }
+
     return res.json({
       ok: true,
       analysisId,
       analysis,
       analysisStable,
       stability,
-      // NOTE: `used` and `limit` were previously referenced here, but they
-      // are not defined in this scope. That caused a ReferenceError and a 500.
-      // We already computed these values above as `usedThisPeriod` and `window.limit`.
-      usage: { uploadsThisMonth: usedThisPeriod + 1 },
-      limits: { uploadsPerMonth: window.period === "month" ? window.limit : null },
+      usage: {
+        uploadsThisMonth,
+        uploadsUsedThisPeriod,
+        uploadsPeriod: window.period,
+        uploadsPeriodStart: window.start?.toISOString?.() || null,
+        uploadsPeriodEnd: window.end?.toISOString?.() || null,
+      },
+      limits: {
+        uploadsPerMonth: window.period === "month" ? window.limit : null,
+        uploadsPerYear: window.period === "year" ? window.limit : null,
+        uploadsPerPeriod: window.limit,
+        uploadsPeriod: window.period,
+        uploadLimitsDisabled: DISABLE_UPLOAD_LIMITS,
+      },
     });
   } catch (e) {
     console.error("analyze-face error:", e);
