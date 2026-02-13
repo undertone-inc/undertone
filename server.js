@@ -58,9 +58,18 @@ const APP_NAME = String(process.env.APP_NAME || "Undertone").trim();
 const EMAIL_ENABLED = Boolean(RESEND_API_KEY && EMAIL_FROM);
 
 // Invite / deep link settings
-// - PUBLIC_BASE_URL: used to build the https invite link (defaults to request host)
+// - INVITE_BASE_URL: preferred public origin used to build the https invite link.
+//   Example: https://undertoneapp.io (or https://invite.undertoneapp.io)
+// - PUBLIC_BASE_URL: legacy fallback (kept for backwards compatibility)
 // - APP_DEEPLINK_SCHEME: used for redirects like undertone://invite?code=...
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").trim();
+function normalizeBaseUrl(base) {
+  return String(base || "")
+    .trim()
+    .replace(/\/+$/, "");
+}
+
+const INVITE_BASE_URL = normalizeBaseUrl(process.env.INVITE_BASE_URL);
+const PUBLIC_BASE_URL = normalizeBaseUrl(process.env.PUBLIC_BASE_URL);
 const APP_DEEPLINK_SCHEME = String(process.env.APP_DEEPLINK_SCHEME || "undertone").trim() || "undertone";
 
 if (NODE_ENV === "production" && !EMAIL_ENABLED) {
@@ -290,6 +299,7 @@ function generateInviteCode(length = 10) {
 }
 
 function getRequestBaseUrl(req) {
+  if (INVITE_BASE_URL) return INVITE_BASE_URL;
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
   const proto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim() || "http";
   const host = String(req?.headers?.["x-forwarded-host"] || req?.headers?.host || "").split(",")[0].trim();
